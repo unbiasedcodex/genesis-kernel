@@ -14,8 +14,17 @@ A microkernel for Genesis OS, written in [Genesis Lang](https://github.com/unbia
 ## Requirements
 
 - `glc` (Genesis Lang compiler) in PATH
+- `nasm` (Netwide Assembler)
 - `ld` (GNU linker)
+- `objcopy` (from binutils)
+- `grub-mkrescue` and `xorriso` (for ISO creation)
 - QEMU (for testing)
+
+### Installing Dependencies (Ubuntu/Debian)
+
+```bash
+sudo apt install nasm grub-pc-bin xorriso qemu-system-x86
+```
 
 ### Installing glc
 
@@ -29,40 +38,58 @@ sudo cp target/release/glc /usr/local/bin/
 ## Building
 
 ```bash
-make            # Build kernel.elf
-make run        # Run in QEMU
+make iso        # Build bootable ISO
+make run        # Run in QEMU (serial output)
+make run-vga    # Run in QEMU (VGA display)
+make debug      # Run with interrupt logging
 make clean      # Remove build artifacts
 ```
+
+### Boot Verification
+
+When running `make run`, you should see:
+
+```
+BOOT
+64
+KERNEL
+```
+
+- `BOOT` - 32-bit Multiboot entry reached
+- `64` - Long mode transition successful
+- `KERNEL` - Genesis kernel running
 
 ## Project Structure
 
 ```
 genesis-kernel/
 ├── src/
-│   └── main.gl         # Kernel entry point
+│   └── main.gl              # Kernel entry point (_start)
+├── arch/
+│   └── x86_64/
+│       └── boot.asm         # Multiboot + 32→64 bit transition
 ├── linker/
-│   └── kernel.ld       # Linker script
+│   └── kernel.ld            # Linker script
+├── iso/
+│   └── boot/grub/
+│       └── grub.cfg         # GRUB configuration
 ├── Makefile
 └── README.md
 ```
 
 ## Development Status
 
-- [x] Phase 0: Project setup
-- [ ] Phase 1: Minimal boot (requires 32-to-64-bit bootloader)
+- [x] Phase 1: Minimal boot
+  - [x] Multiboot1 header
+  - [x] 32-bit to 64-bit transition
+  - [x] Identity paging (8MB)
+  - [x] VGA text output
+  - [x] Serial debug output
+  - [x] Bootable ISO with GRUB
 - [ ] Phase 2: Memory management
 - [ ] Phase 3: Interrupts
 - [ ] Phase 4: Processes
 - [ ] Phase 5: IPC
-
-### Current Status
-
-The kernel compiles to a valid ELF64 executable. Booting requires a bootloader that:
-1. Loads in 32-bit protected mode (Multiboot)
-2. Sets up long mode (64-bit)
-3. Jumps to the Genesis kernel entry point
-
-This will be implemented in Phase 1.
 
 ## License
 

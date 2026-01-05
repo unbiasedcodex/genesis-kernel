@@ -2,10 +2,15 @@
 
 # Compiler
 GLC = glc
-GLCFLAGS = --freestanding --linker-script=linker/kernel.ld
+LD = ld
+
+# Flags
+GLCFLAGS = --freestanding --emit-obj
+LDFLAGS = -T linker/kernel.ld --nostdlib -e _start
 
 # Output
 KERNEL = kernel.elf
+OBJ = kernel.o
 
 # Source files
 SRC = src/main.gl
@@ -13,9 +18,13 @@ SRC = src/main.gl
 # Default target
 all: $(KERNEL)
 
-# Build kernel
-$(KERNEL): $(SRC) linker/kernel.ld
-	$(GLC) build $(SRC) $(GLCFLAGS) -o $(KERNEL)
+# Build kernel (compile + link)
+$(KERNEL): $(OBJ)
+	$(LD) $(LDFLAGS) -o $(KERNEL) $(OBJ)
+
+# Compile to object file
+$(OBJ): $(SRC)
+	$(GLC) build $(SRC) $(GLCFLAGS) -o $(OBJ)
 
 # Run in QEMU
 run: $(KERNEL)
@@ -27,7 +36,7 @@ debug: $(KERNEL)
 
 # Clean build artifacts
 clean:
-	rm -f $(KERNEL) *.o *.bin
+	rm -f $(KERNEL) $(OBJ) *.bin
 
 # Check if glc is available
 check:

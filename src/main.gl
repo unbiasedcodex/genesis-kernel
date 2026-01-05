@@ -53,6 +53,14 @@ fn hlt() {
     unsafe { asm!("hlt", options(nomem, nostack)); }
 }
 
+// Serial port output (COM1 = 0x3F8)
+fn serial_write(ch: u8) {
+    let port: u16 = 0x3F8;
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") ch, options(nomem, nostack));
+    }
+}
+
 // ============================================================
 // Kernel Entry Point
 // ============================================================
@@ -60,6 +68,15 @@ fn hlt() {
 fn _start() {
     // Disable interrupts
     cli();
+
+    // Debug: write "KERNEL\n" to serial
+    serial_write(75);  // K
+    serial_write(69);  // E
+    serial_write(82);  // R
+    serial_write(78);  // N
+    serial_write(69);  // E
+    serial_write(76);  // L
+    serial_write(10);  // newline
 
     // Clear screen
     vga_clear();

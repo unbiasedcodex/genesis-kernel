@@ -3,36 +3,74 @@
 # Tools
 GLC = glc
 LD = ld
+NASM = nasm
+OBJCOPY = objcopy
 
 # Flags
 GLCFLAGS = --freestanding --emit-obj
-LDFLAGS = -T linker/kernel.ld --nostdlib -e _start
+NASMFLAGS = -f elf64
+LDFLAGS = -T linker/kernel.ld -m elf_x86_64 --nostdlib
 
 # Output
 KERNEL = kernel.elf
+ISO = genesis.iso
+
+# Object files
+OBJ_BOOT = arch/x86_64/boot.o
 OBJ_KERNEL = kernel.o
+OBJS = $(OBJ_BOOT) $(OBJ_KERNEL)
 
 # Source files
-SRC = src/main.gl
+SRC_BOOT = arch/x86_64/boot.asm
+SRC_KERNEL = src/main.gl
 
 # Default target
 all: $(KERNEL)
 
-# Build kernel
-$(KERNEL): $(OBJ_KERNEL) linker/kernel.ld
-	$(LD) $(LDFLAGS) -o $(KERNEL) $(OBJ_KERNEL)
+# Link kernel (ELF64, then convert to ELF32 for multiboot)
+$(KERNEL): kernel64.elf
+	$(OBJCOPY) -O elf32-i386 $< $@
 
-# Compile Genesis code
-$(OBJ_KERNEL): $(SRC)
-	$(GLC) build $(SRC) $(GLCFLAGS) -o $(OBJ_KERNEL)
+kernel64.elf: $(OBJS) linker/kernel.ld
+	$(LD) -T linker/kernel.ld -m elf_x86_64 --nostdlib -o $@ $(OBJS)
+
+# Compile boot stub (32-bit entry + 64-bit transition)
+$(OBJ_BOOT): $(SRC_BOOT)
+	$(NASM) $(NASMFLAGS) $< -o $@
+
+# Compile Genesis kernel (64-bit)
+$(OBJ_KERNEL): $(SRC_KERNEL)
+	$(GLC) build $< $(GLCFLAGS) -o $@
+
+# Create bootable ISO with GRUB
+iso: $(KERNEL)
+	@mkdir -p iso/boot/grub
+	cp $(KERNEL) iso/boot/kernel.elf
+	cp iso/boot/grub/grub.cfg iso/boot/grub/grub.cfg 2>/dev/null || true
+	grub-mkrescue -o $(ISO) iso 2>/dev/null
+
+# Run in QEMU (text mode via serial)
+run: iso
+	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none
+
+# Run in QEMU with VGA display
+run-vga: iso
+	qemu-system-x86_64 -cdrom $(ISO)
+
+# Run with debug output
+debug: iso
+	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -d int -no-reboot
 
 # Clean build artifacts
 clean:
-	rm -f $(KERNEL) $(OBJ_KERNEL)
+	rm -f $(KERNEL) kernel64.elf $(OBJS) $(ISO)
+	rm -rf iso/boot/kernel.elf
 
-# Check if tools are available
+# Check tools
 check:
 	@which $(GLC) > /dev/null || (echo "Error: glc not found in PATH" && exit 1)
-	@echo "glc found: $$(which $(GLC))"
+	@which $(NASM) > /dev/null || (echo "Error: nasm not found" && exit 1)
+	@which grub-mkrescue > /dev/null || (echo "Error: grub-mkrescue not found" && exit 1)
+	@echo "All tools found"
 
-.PHONY: all clean check
+.PHONY: all iso run run-vga debug clean check

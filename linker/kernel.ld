@@ -1,19 +1,31 @@
-/* Genesis Kernel Linker Script - x86_64 */
+/* Genesis Kernel Linker Script
+ * ELF64 format with 32-bit boot entry
+ */
 
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_start)
+ENTRY(_start_asm)
 
 SECTIONS {
-    /* Start at 1MB - standard kernel load address */
+    /* Load at 1MB */
     . = 1M;
 
-    /* Code section */
+    /* Multiboot header - must be in first 8KB */
+    .multiboot BLOCK(4K) : ALIGN(4K) {
+        *(.multiboot)
+    }
+
+    /* 32-bit boot code */
+    .text.boot BLOCK(4K) : ALIGN(4K) {
+        *(.text.boot)
+    }
+
+    /* 64-bit code */
     .text BLOCK(4K) : ALIGN(4K) {
         *(.text .text.*)
     }
 
-    /* Read-only data */
+    /* Read-only data (GDT, etc) */
     .rodata BLOCK(4K) : ALIGN(4K) {
         *(.rodata .rodata.*)
     }
@@ -23,7 +35,7 @@ SECTIONS {
         *(.data .data.*)
     }
 
-    /* BSS - uninitialized data */
+    /* Uninitialized data */
     .bss BLOCK(4K) : ALIGN(4K) {
         __bss_start = .;
         *(.bss .bss.*)
@@ -31,13 +43,11 @@ SECTIONS {
         __bss_end = .;
     }
 
-    /* End of kernel */
     __kernel_end = .;
 
-    /* Discard unwanted sections */
     /DISCARD/ : {
         *(.comment)
-        *(.note*)
+        *(.note.gnu.property)
         *(.eh_frame*)
     }
 }

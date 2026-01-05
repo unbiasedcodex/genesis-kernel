@@ -10,7 +10,6 @@ SECTIONS {
 
     /* Code section */
     .text BLOCK(4K) : ALIGN(4K) {
-        *(.text.boot)    /* Boot code first */
         *(.text .text.*)
     }
 

@@ -53,10 +53,6 @@ genesis-kernel/
 - [ ] Phase 4: Processes
 - [ ] Phase 5: IPC
 
-## Documentation
-
-See `../docs/000 - Kernel.md` for detailed architecture and development plan.
-
 ## License
 
 MIT

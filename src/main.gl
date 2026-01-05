@@ -1,0 +1,128 @@
+// Genesis Kernel - Entry Point
+// Microkernel for Genesis OS
+
+// ============================================================
+// VGA Text Mode
+// ============================================================
+
+const VGA_BUFFER: i64 = 0xB8000;
+const VGA_WIDTH: i64 = 80;
+const VGA_HEIGHT: i64 = 25;
+
+// VGA colors
+const COLOR_BLACK: i64 = 0;
+const COLOR_GREEN: i64 = 10;
+const COLOR_WHITE: i64 = 15;
+
+fn vga_color(fg: i64, bg: i64) -> u8 {
+    let mut result: u8 = (bg * 16) as u8;
+    result |= fg as u8;
+    result
+}
+
+fn vga_write_char(x: i64, y: i64, ch: i64, color: u8) {
+    let offset = (y * VGA_WIDTH + x) * 2;
+    let addr = VGA_BUFFER + offset;
+    let ptr = addr as *mut u8;
+
+    unsafe {
+        volatile_write_u8(ptr, ch as u8);
+        let color_ptr = (addr + 1) as *mut u8;
+        volatile_write_u8(color_ptr, color);
+    }
+}
+
+fn vga_clear() {
+    let color = vga_color(COLOR_WHITE, COLOR_BLACK);
+    let mut i: i64 = 0;
+    while i < VGA_WIDTH * VGA_HEIGHT {
+        vga_write_char(i % VGA_WIDTH, i / VGA_WIDTH, 32, color);
+        i = i + 1;
+    }
+}
+
+// Write a string at position (ASCII codes)
+fn vga_write_string(x: i64, y: i64, chars: *i64, len: i64, color: u8) {
+    let mut i: i64 = 0;
+    while i < len {
+        unsafe {
+            let offset = i * 8; // sizeof(i64) = 8
+            let char_ptr = (chars as i64 + offset) as *i64;
+            let ch = volatile_read_i64(char_ptr);
+            vga_write_char(x + i, y, ch, color);
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// CPU Control
+// ============================================================
+
+fn cli() {
+    unsafe { asm!("cli", options(nomem, nostack)); }
+}
+
+fn hlt() {
+    unsafe { asm!("hlt", options(nomem, nostack)); }
+}
+
+// ============================================================
+// Kernel Entry Point
+// ============================================================
+
+fn _start() {
+    // Disable interrupts
+    cli();
+
+    // Clear screen
+    vga_clear();
+
+    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
+    let white = vga_color(COLOR_WHITE, COLOR_BLACK);
+
+    // "Genesis Kernel" - manual ASCII output
+    // G=71 e=101 n=110 e=101 s=115 i=105 s=115
+    // K=75 e=101 r=114 n=110 e=101 l=108
+    vga_write_char(0, 0, 71, green);   // G
+    vga_write_char(1, 0, 101, green);  // e
+    vga_write_char(2, 0, 110, green);  // n
+    vga_write_char(3, 0, 101, green);  // e
+    vga_write_char(4, 0, 115, green);  // s
+    vga_write_char(5, 0, 105, green);  // i
+    vga_write_char(6, 0, 115, green);  // s
+    vga_write_char(7, 0, 32, white);   // space
+    vga_write_char(8, 0, 75, green);   // K
+    vga_write_char(9, 0, 101, green);  // e
+    vga_write_char(10, 0, 114, green); // r
+    vga_write_char(11, 0, 110, green); // n
+    vga_write_char(12, 0, 101, green); // e
+    vga_write_char(13, 0, 108, green); // l
+
+    // "v0.1.0" version
+    // v=118 0=48 .=46 1=49
+    vga_write_char(15, 0, 118, white); // v
+    vga_write_char(16, 0, 48, white);  // 0
+    vga_write_char(17, 0, 46, white);  // .
+    vga_write_char(18, 0, 49, white);  // 1
+    vga_write_char(19, 0, 46, white);  // .
+    vga_write_char(20, 0, 48, white);  // 0
+
+    // "Booting..." on line 2
+    // B=66 o=111 t=116 i=105 n=110 g=103 .=46
+    vga_write_char(0, 2, 66, white);   // B
+    vga_write_char(1, 2, 111, white);  // o
+    vga_write_char(2, 2, 111, white);  // o
+    vga_write_char(3, 2, 116, white);  // t
+    vga_write_char(4, 2, 105, white);  // i
+    vga_write_char(5, 2, 110, white);  // n
+    vga_write_char(6, 2, 103, white);  // g
+    vga_write_char(7, 2, 46, white);   // .
+    vga_write_char(8, 2, 46, white);   // .
+    vga_write_char(9, 2, 46, white);   // .
+
+    // Halt loop
+    loop {
+        hlt();
+    }
+}

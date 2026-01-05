@@ -41,20 +41,6 @@ fn vga_clear() {
     }
 }
 
-// Write a string at position (ASCII codes)
-fn vga_write_string(x: i64, y: i64, chars: *i64, len: i64, color: u8) {
-    let mut i: i64 = 0;
-    while i < len {
-        unsafe {
-            let offset = i * 8; // sizeof(i64) = 8
-            let char_ptr = (chars as i64 + offset) as *i64;
-            let ch = volatile_read_i64(char_ptr);
-            vga_write_char(x + i, y, ch, color);
-        }
-        i = i + 1;
-    }
-}
-
 // ============================================================
 // CPU Control
 // ============================================================

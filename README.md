@@ -1,6 +1,8 @@
 # Genesis Kernel
 
-A microkernel for Genesis OS, written in Genesis Lang.
+A microkernel for Genesis OS, written in [Genesis Lang](https://github.com/unbiasedcodex/genesis-lang).
+
+> **Note**: This project requires `glc` (Genesis Lang compiler) in your PATH. See [Requirements](#requirements) for installation instructions.
 
 ## Features
 

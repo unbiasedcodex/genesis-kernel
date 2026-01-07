@@ -1,0 +1,7 @@
+// Memory Management Module
+// Re-exports submodules for convenient access
+
+pub mod multiboot;
+pub mod pmm;
+pub mod vmm;
+pub mod heap;

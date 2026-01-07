@@ -59,6 +59,7 @@ stack_bottom:
     resb 65536
 stack_top:
 
+
 ; ============================================================
 ; 32-bit Entry Point
 ; ============================================================
@@ -69,6 +70,12 @@ extern _start
 
 _start_asm:
     cli
+
+    ; Save Multiboot info pointer (ebx) to fixed memory address
+    ; Multiboot: eax = magic (0x2BADB002), ebx = multiboot_info*
+    ; Store at 0x500 (safe low memory location) for kernel to read
+    mov dword [0x500], ebx
+
     mov esp, stack_top
 
     ; Debug: write '32' to VGA to confirm we started
@@ -162,12 +169,12 @@ realm64:
     mov rsp, stack_top
 
     ; Debug: write 'OK 64' to VGA to confirm 64-bit mode works
-    mov rdi, 0xB8000
-    mov word [rdi], 0x0F4F      ; 'O' white on black
-    mov word [rdi+2], 0x0F4B    ; 'K' white on black
-    mov word [rdi+4], 0x0F20    ; ' ' white on black
-    mov word [rdi+6], 0x0F36    ; '6' white on black
-    mov word [rdi+8], 0x0F34    ; '4' white on black
+    mov rax, 0xB8000
+    mov word [rax], 0x0F4F      ; 'O' white on black
+    mov word [rax+2], 0x0F4B    ; 'K' white on black
+    mov word [rax+4], 0x0F20    ; ' ' white on black
+    mov word [rax+6], 0x0F36    ; '6' white on black
+    mov word [rax+8], 0x0F34    ; '4' white on black
 
     ; Debug: write '64\n' to serial to confirm 64-bit mode
     mov dx, 0x3F8
@@ -178,7 +185,8 @@ realm64:
     mov al, 10
     out dx, al
 
-    ; Call kernel
+    ; Multiboot info pointer is stored at 0x500 for kernel to read
+    ; No parameters needed - kernel reads from fixed address
     call _start
 
 .halt:

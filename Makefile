@@ -1,7 +1,7 @@
 # Genesis Kernel Makefile
 
 # Tools
-GLC = glc
+GLC = /root/genesisos/genesis-lang/target/release/glc
 LD = ld
 NASM = nasm
 OBJCOPY = objcopy

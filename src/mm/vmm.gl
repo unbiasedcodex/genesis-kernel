@@ -1,0 +1,346 @@
+// Virtual Memory Manager (VMM)
+// 4-level paging for x86-64
+
+// ============================================================
+// Page Table Constants
+// ============================================================
+
+const PAGE_SIZE: u64 = 4096;
+const ENTRIES_PER_TABLE: u64 = 512;
+
+// Page flags
+pub const PAGE_PRESENT: u64 = 1;           // Page is present
+pub const PAGE_WRITE: u64 = 2;             // Page is writable
+pub const PAGE_USER: u64 = 4;              // User-accessible
+pub const PAGE_WRITETHROUGH: u64 = 8;      // Write-through caching
+pub const PAGE_NOCACHE: u64 = 16;          // Disable caching
+pub const PAGE_ACCESSED: u64 = 32;         // Page was accessed
+pub const PAGE_DIRTY: u64 = 64;            // Page was written
+pub const PAGE_HUGE: u64 = 128;            // 2MB/1GB page
+pub const PAGE_GLOBAL: u64 = 256;          // Global page (not flushed on CR3 reload)
+pub const PAGE_NX: u64 = 0x8000000000000000;  // No execute
+
+// Address masks
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000;  // Physical address in PTE
+const INDEX_MASK: u64 = 0x1FF;              // 9 bits for each level
+
+// ============================================================
+// State
+// ============================================================
+
+static mut PML4_ADDR: u64 = 0;  // Physical address of PML4 table
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Initialize VMM with existing PML4 from boot
+pub fn init() {
+    unsafe {
+        // Read current CR3 to get PML4 address
+        let cr3: u64;
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        PML4_ADDR = cr3 & ADDR_MASK;
+    }
+}
+
+// Get current PML4 address
+pub fn get_pml4() -> u64 {
+    unsafe { PML4_ADDR }
+}
+
+// ============================================================
+// Address Manipulation
+// ============================================================
+
+// Extract PML4 index from virtual address (bits 47:39)
+fn pml4_index(vaddr: u64) -> u64 {
+    (vaddr >> 39) & INDEX_MASK
+}
+
+// Extract PDPT index from virtual address (bits 38:30)
+fn pdpt_index(vaddr: u64) -> u64 {
+    (vaddr >> 30) & INDEX_MASK
+}
+
+// Extract PD index from virtual address (bits 29:21)
+fn pd_index(vaddr: u64) -> u64 {
+    (vaddr >> 21) & INDEX_MASK
+}
+
+// Extract PT index from virtual address (bits 20:12)
+fn pt_index(vaddr: u64) -> u64 {
+    (vaddr >> 12) & INDEX_MASK
+}
+
+// Extract page offset from virtual address (bits 11:0)
+fn page_offset(vaddr: u64) -> u64 {
+    vaddr & 0xFFF
+}
+
+// ============================================================
+// Page Table Entry Operations
+// ============================================================
+
+// Read a page table entry
+fn read_pte(table_addr: u64, index: u64) -> u64 {
+    unsafe {
+        let ptr = (table_addr + index * 8) as *u64;
+        volatile_read_u64(ptr)
+    }
+}
+
+// Write a page table entry
+fn write_pte(table_addr: u64, index: u64, value: u64) {
+    unsafe {
+        let ptr = (table_addr + index * 8) as *mut u64;
+        volatile_write_u64(ptr, value);
+    }
+}
+
+// Get physical address from PTE
+fn pte_addr(pte: u64) -> u64 {
+    pte & ADDR_MASK
+}
+
+// Check if PTE is present
+fn pte_present(pte: u64) -> bool {
+    (pte & PAGE_PRESENT) != 0
+}
+
+// Check if PTE is a huge page (2MB or 1GB)
+fn pte_huge(pte: u64) -> bool {
+    (pte & PAGE_HUGE) != 0
+}
+
+// ============================================================
+// Page Table Walking
+// ============================================================
+
+// Walk page tables and return physical address for virtual address
+// Returns 0 if not mapped
+pub fn virt_to_phys(vaddr: u64) -> u64 {
+    unsafe {
+        let pml4 = PML4_ADDR;
+
+        // Level 4: PML4
+        let pml4e = read_pte(pml4, pml4_index(vaddr));
+        if !pte_present(pml4e) {
+            return 0;
+        }
+
+        // Level 3: PDPT
+        let pdpt = pte_addr(pml4e);
+        let pdpte = read_pte(pdpt, pdpt_index(vaddr));
+        if !pte_present(pdpte) {
+            return 0;
+        }
+        // Check for 1GB huge page
+        if pte_huge(pdpte) {
+            let base = pte_addr(pdpte) & 0xFFFFFFC0000000;
+            return base + (vaddr & 0x3FFFFFFF);
+        }
+
+        // Level 2: PD
+        let pd = pte_addr(pdpte);
+        let pde = read_pte(pd, pd_index(vaddr));
+        if !pte_present(pde) {
+            return 0;
+        }
+        // Check for 2MB huge page
+        if pte_huge(pde) {
+            let base = pte_addr(pde) & 0xFFFFFFFFE00000;
+            return base + (vaddr & 0x1FFFFF);
+        }
+
+        // Level 1: PT
+        let pt = pte_addr(pde);
+        let pte = read_pte(pt, pt_index(vaddr));
+        if !pte_present(pte) {
+            return 0;
+        }
+
+        pte_addr(pte) + page_offset(vaddr)
+    }
+}
+
+// ============================================================
+// Page Mapping
+// ============================================================
+
+// Ensure a page table exists at the given level
+// Returns physical address of the table (new or existing)
+// alloc_page is a function pointer to PMM allocator
+fn ensure_table(parent_addr: u64, index: u64, alloc_fn: fn() -> u64) -> u64 {
+    let pte = read_pte(parent_addr, index);
+
+    if pte_present(pte) {
+        return pte_addr(pte);
+    }
+
+    // Allocate new table
+    let new_table = alloc_fn();
+    if new_table == 0 {
+        return 0;  // Out of memory
+    }
+
+    // Zero the new table
+    let mut i: u64 = 0;
+    while i < ENTRIES_PER_TABLE {
+        write_pte(new_table, i, 0);
+        i = i + 1;
+    }
+
+    // Install in parent
+    let entry = new_table | PAGE_PRESENT | PAGE_WRITE;
+    write_pte(parent_addr, index, entry);
+
+    new_table
+}
+
+// Map a virtual page to a physical page
+// alloc_fn: function to allocate physical pages for page tables
+pub fn map_page(vaddr: u64, paddr: u64, flags: u64, alloc_fn: fn() -> u64) -> bool {
+    unsafe {
+        let pml4 = PML4_ADDR;
+
+        // Ensure PDPT exists
+        let pdpt = ensure_table(pml4, pml4_index(vaddr), alloc_fn);
+        if pdpt == 0 {
+            return false;
+        }
+
+        // Ensure PD exists
+        let pd = ensure_table(pdpt, pdpt_index(vaddr), alloc_fn);
+        if pd == 0 {
+            return false;
+        }
+
+        // Ensure PT exists
+        let pt = ensure_table(pd, pd_index(vaddr), alloc_fn);
+        if pt == 0 {
+            return false;
+        }
+
+        // Map the page
+        let entry = (paddr & ADDR_MASK) | flags | PAGE_PRESENT;
+        write_pte(pt, pt_index(vaddr), entry);
+
+        // Invalidate TLB for this address
+        asm!("invlpg [{}]", in(reg) vaddr, options(nostack));
+
+        true
+    }
+}
+
+// Unmap a virtual page
+pub fn unmap_page(vaddr: u64) {
+    unsafe {
+        let pml4 = PML4_ADDR;
+
+        // Walk to PT
+        let pml4e = read_pte(pml4, pml4_index(vaddr));
+        if !pte_present(pml4e) {
+            return;
+        }
+
+        let pdpt = pte_addr(pml4e);
+        let pdpte = read_pte(pdpt, pdpt_index(vaddr));
+        if !pte_present(pdpte) || pte_huge(pdpte) {
+            return;
+        }
+
+        let pd = pte_addr(pdpte);
+        let pde = read_pte(pd, pd_index(vaddr));
+        if !pte_present(pde) || pte_huge(pde) {
+            return;
+        }
+
+        let pt = pte_addr(pde);
+
+        // Clear the PTE
+        write_pte(pt, pt_index(vaddr), 0);
+
+        // Invalidate TLB
+        asm!("invlpg [{}]", in(reg) vaddr, options(nostack));
+    }
+}
+
+// Map a 2MB huge page (for efficiency with large regions)
+pub fn map_huge_page(vaddr: u64, paddr: u64, flags: u64, alloc_fn: fn() -> u64) -> bool {
+    unsafe {
+        let pml4 = PML4_ADDR;
+
+        // Ensure PDPT exists
+        let pdpt = ensure_table(pml4, pml4_index(vaddr), alloc_fn);
+        if pdpt == 0 {
+            return false;
+        }
+
+        // Ensure PD exists
+        let pd = ensure_table(pdpt, pdpt_index(vaddr), alloc_fn);
+        if pd == 0 {
+            return false;
+        }
+
+        // Map as 2MB page directly in PD
+        let entry = (paddr & 0xFFFFFFFFE00000) | flags | PAGE_PRESENT | PAGE_HUGE;
+        write_pte(pd, pd_index(vaddr), entry);
+
+        // Invalidate TLB
+        asm!("invlpg [{}]", in(reg) vaddr, options(nostack));
+
+        true
+    }
+}
+
+// ============================================================
+// Identity Mapping Helpers
+// ============================================================
+
+// Identity map a range of physical memory
+pub fn identity_map_range(start: u64, size: u64, flags: u64, alloc_fn: fn() -> u64) -> bool {
+    let end = start + size;
+    let mut addr = start & 0xFFFFFFFFFFFFF000;  // Page-align
+
+    // Use 2MB pages for large regions (>=2MB and aligned)
+    let use_huge = (size >= 0x200000) && ((start & 0x1FFFFF) == 0);
+
+    if use_huge {
+        while addr < end {
+            if !map_huge_page(addr, addr, flags, alloc_fn) {
+                return false;
+            }
+            addr = addr + 0x200000;  // 2MB
+        }
+    } else {
+        while addr < end {
+            if !map_page(addr, addr, flags, alloc_fn) {
+                return false;
+            }
+            addr = addr + PAGE_SIZE;
+        }
+    }
+
+    true
+}
+
+// ============================================================
+// TLB Control
+// ============================================================
+
+// Flush entire TLB by reloading CR3
+pub fn flush_tlb() {
+    unsafe {
+        let cr3: u64;
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+    }
+}
+
+// Flush TLB entry for specific address
+pub fn flush_tlb_page(vaddr: u64) {
+    unsafe {
+        asm!("invlpg [{}]", in(reg) vaddr, options(nostack));
+    }
+}

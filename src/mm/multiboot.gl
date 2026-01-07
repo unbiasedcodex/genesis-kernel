@@ -1,0 +1,238 @@
+// Multiboot1 Info Parsing
+// Reference: https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
+
+// ============================================================
+// Multiboot Flag Bits
+// ============================================================
+
+const MB_FLAG_MEM: u32 = 1;          // mem_lower/mem_upper valid
+const MB_FLAG_BOOTDEV: u32 = 2;      // boot_device valid
+const MB_FLAG_CMDLINE: u32 = 4;      // cmdline valid
+const MB_FLAG_MODS: u32 = 8;         // mods_count/mods_addr valid
+const MB_FLAG_MMAP: u32 = 64;        // mmap_length/mmap_addr valid
+
+// Memory map entry types
+pub const MMAP_TYPE_AVAILABLE: u32 = 1;
+pub const MMAP_TYPE_RESERVED: u32 = 2;
+pub const MMAP_TYPE_ACPI_RECLAIMABLE: u32 = 3;
+pub const MMAP_TYPE_ACPI_NVS: u32 = 4;
+pub const MMAP_TYPE_BAD: u32 = 5;
+
+// ============================================================
+// Multiboot Structures
+// ============================================================
+
+// Main Multiboot info structure (passed from bootloader)
+#[repr(C, packed)]
+pub struct MultibootInfo {
+    pub flags: u32,
+    pub mem_lower: u32,       // KB of lower memory (< 1MB)
+    pub mem_upper: u32,       // KB of upper memory (> 1MB)
+    pub boot_device: u32,
+    pub cmdline: u32,
+    pub mods_count: u32,
+    pub mods_addr: u32,
+    pub syms: [u32; 4],
+    pub mmap_length: u32,     // Size of memory map in bytes
+    pub mmap_addr: u32,       // Physical address of memory map
+    pub drives_length: u32,
+    pub drives_addr: u32,
+    pub config_table: u32,
+    pub boot_loader_name: u32,
+    pub apm_table: u32,
+    pub vbe_control_info: u32,
+    pub vbe_mode_info: u32,
+    pub vbe_mode: u16,
+    pub vbe_interface_seg: u16,
+    pub vbe_interface_off: u16,
+    pub vbe_interface_len: u16,
+}
+
+// Memory map entry (variable size, entry_size at start)
+#[repr(C, packed)]
+pub struct MmapEntry {
+    pub entry_size: u32,      // Size of this entry (not including this field)
+    pub base_addr: u64,       // Start of memory region
+    pub length: u64,          // Size of memory region in bytes
+    pub entry_type: u32,      // Type (1=available, 2+=reserved)
+}
+
+// ============================================================
+// Global Storage
+// ============================================================
+
+// Store parsed memory info
+static mut TOTAL_MEMORY: u64 = 0;
+static mut MMAP_ENTRIES: u32 = 0;
+
+// ============================================================
+// Parsing Functions
+// ============================================================
+
+// Check if memory map is available
+pub fn has_mmap(info: *MultibootInfo) -> bool {
+    unsafe {
+        let flags = volatile_read_u32(info as *u32);
+        (flags & MB_FLAG_MMAP) != 0
+    }
+}
+
+// Get total available memory in bytes
+pub fn get_total_memory() -> u64 {
+    unsafe { TOTAL_MEMORY }
+}
+
+// Get number of memory map entries parsed
+pub fn get_mmap_entry_count() -> u32 {
+    unsafe { MMAP_ENTRIES }
+}
+
+// Parse memory map and calculate total available memory
+pub fn parse_mmap(info: *MultibootInfo) -> u64 {
+    unsafe {
+        let flags = volatile_read_u32(info as *u32);
+
+        if (flags & MB_FLAG_MMAP) == 0 {
+            // No memory map, fallback to mem_upper (in KB)
+            let mem_upper_ptr = (info as u64 + 8) as *u32;
+            let mem_kb = volatile_read_u32(mem_upper_ptr) as u64;
+            TOTAL_MEMORY = mem_kb * 1024;
+            return TOTAL_MEMORY;
+        }
+
+        // Get mmap_length and mmap_addr from info structure
+        let mmap_length_ptr = (info as u64 + 44) as *u32;
+        let mmap_addr_ptr = (info as u64 + 48) as *u32;
+
+        let mmap_length = volatile_read_u32(mmap_length_ptr);
+        let mmap_addr = volatile_read_u32(mmap_addr_ptr);
+
+        let mut total: u64 = 0;
+        let mut offset: u32 = 0;
+        let mut count: u32 = 0;
+
+        while offset < mmap_length {
+            let entry_ptr = (mmap_addr + offset) as *MmapEntry;
+
+            // Read entry fields
+            let entry_size_ptr = entry_ptr as *u32;
+            let entry_size = volatile_read_u32(entry_size_ptr);
+
+            let type_ptr = (entry_ptr as u64 + 20) as *u32;
+            let entry_type = volatile_read_u32(type_ptr);
+
+            if entry_type == MMAP_TYPE_AVAILABLE {
+                let length_ptr = (entry_ptr as u64 + 12) as *u64;
+                let length = volatile_read_u64(length_ptr);
+                total = total + length;
+            }
+
+            count = count + 1;
+
+            // Move to next entry (entry_size + 4 for the size field itself)
+            offset = offset + entry_size + 4;
+        }
+
+        TOTAL_MEMORY = total;
+        MMAP_ENTRIES = count;
+        total
+    }
+}
+
+// Iterate over memory map entries and call callback for each
+// Returns the highest available address
+pub fn find_highest_available(info: *MultibootInfo) -> u64 {
+    unsafe {
+        let flags = volatile_read_u32(info as *u32);
+
+        if (flags & MB_FLAG_MMAP) == 0 {
+            // Fallback: assume 16MB
+            return 16 * 1024 * 1024;
+        }
+
+        let mmap_length_ptr = (info as u64 + 44) as *u32;
+        let mmap_addr_ptr = (info as u64 + 48) as *u32;
+
+        let mmap_length = volatile_read_u32(mmap_length_ptr);
+        let mmap_addr = volatile_read_u32(mmap_addr_ptr);
+
+        let mut highest: u64 = 0;
+        let mut offset: u32 = 0;
+
+        while offset < mmap_length {
+            let entry_ptr = (mmap_addr + offset) as *MmapEntry;
+
+            let entry_size_ptr = entry_ptr as *u32;
+            let entry_size = volatile_read_u32(entry_size_ptr);
+
+            let type_ptr = (entry_ptr as u64 + 20) as *u32;
+            let entry_type = volatile_read_u32(type_ptr);
+
+            if entry_type == MMAP_TYPE_AVAILABLE {
+                let base_ptr = (entry_ptr as u64 + 4) as *u64;
+                let length_ptr = (entry_ptr as u64 + 12) as *u64;
+
+                let base = volatile_read_u64(base_ptr);
+                let length = volatile_read_u64(length_ptr);
+
+                let end = base + length;
+                if end > highest {
+                    highest = end;
+                }
+            }
+
+            offset = offset + entry_size + 4;
+        }
+
+        highest
+    }
+}
+
+// Check if a physical address range is available (not reserved)
+pub fn is_region_available(info: *MultibootInfo, start: u64, size: u64) -> bool {
+    unsafe {
+        let flags = volatile_read_u32(info as *u32);
+
+        if (flags & MB_FLAG_MMAP) == 0 {
+            // No mmap, assume anything above 1MB is available
+            return start >= 0x100000;
+        }
+
+        let mmap_length_ptr = (info as u64 + 44) as *u32;
+        let mmap_addr_ptr = (info as u64 + 48) as *u32;
+
+        let mmap_length = volatile_read_u32(mmap_length_ptr);
+        let mmap_addr = volatile_read_u32(mmap_addr_ptr);
+
+        let end = start + size;
+        let mut offset: u32 = 0;
+
+        while offset < mmap_length {
+            let entry_ptr = (mmap_addr + offset) as *MmapEntry;
+
+            let entry_size_ptr = entry_ptr as *u32;
+            let entry_size = volatile_read_u32(entry_size_ptr);
+
+            let type_ptr = (entry_ptr as u64 + 20) as *u32;
+            let entry_type = volatile_read_u32(type_ptr);
+
+            if entry_type == MMAP_TYPE_AVAILABLE {
+                let base_ptr = (entry_ptr as u64 + 4) as *u64;
+                let length_ptr = (entry_ptr as u64 + 12) as *u64;
+
+                let region_base = volatile_read_u64(base_ptr);
+                let region_length = volatile_read_u64(length_ptr);
+                let region_end = region_base + region_length;
+
+                // Check if our range fits entirely within this available region
+                if start >= region_base && end <= region_end {
+                    return true;
+                }
+            }
+
+            offset = offset + entry_size + 4;
+        }
+
+        false
+    }
+}

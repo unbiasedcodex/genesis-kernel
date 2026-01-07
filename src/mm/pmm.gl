@@ -1,0 +1,272 @@
+// Physical Memory Manager (PMM)
+// Bitmap-based allocator for 4KB physical pages
+
+// ============================================================
+// Constants
+// ============================================================
+
+pub const PAGE_SIZE: u64 = 4096;           // 4KB pages
+const BITMAP_SIZE: u64 = 32768;            // 32KB bitmap = 256K pages = 1GB max
+const BITS_PER_ENTRY: u64 = 64;            // Using u64 for bitmap entries
+
+// ============================================================
+// Bitmap Storage
+// ============================================================
+
+// Bitmap: 1 bit per page. 0 = free, 1 = used
+// 32KB bitmap can track 262144 pages = 1GB of physical memory
+static mut BITMAP: [u64; 4096] = [0; 4096];  // 4096 * 8 = 32KB
+
+// Memory tracking
+static mut TOTAL_PAGES: u64 = 0;
+static mut FREE_PAGES: u64 = 0;
+static mut MAX_ADDR: u64 = 0;
+static mut KERNEL_END_ADDR: u64 = 0;
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Initialize PMM with memory info from Multiboot
+// kernel_end: physical address where kernel ends (from linker)
+// max_addr: highest usable physical address
+pub fn init(kernel_end: u64, max_addr: u64) {
+    unsafe {
+        KERNEL_END_ADDR = kernel_end;
+        MAX_ADDR = max_addr;
+
+        // Calculate total pages we can manage
+        let manageable = if max_addr > BITMAP_SIZE * PAGE_SIZE * 8 {
+            BITMAP_SIZE * PAGE_SIZE * 8
+        } else {
+            max_addr
+        };
+        TOTAL_PAGES = manageable / PAGE_SIZE;
+        FREE_PAGES = 0;
+
+        // Initially mark all pages as used
+        let mut i: u64 = 0;
+        while i < 4096 {
+            BITMAP[i as usize] = 0xFFFFFFFFFFFFFFFF;
+            i = i + 1;
+        }
+    }
+}
+
+// Mark a region as available (free)
+// Called after parsing memory map
+pub fn mark_region_free(base: u64, length: u64) {
+    // Align to page boundaries
+    let start_page = (base + PAGE_SIZE - 1) / PAGE_SIZE;  // Round up
+    let end_addr = base + length;
+    let end_page = end_addr / PAGE_SIZE;  // Round down
+
+    if start_page >= end_page {
+        return;
+    }
+
+    unsafe {
+        let mut page = start_page;
+        while page < end_page {
+            // Skip pages below kernel end
+            let page_addr = page * PAGE_SIZE;
+            if page_addr >= KERNEL_END_ADDR {
+                let idx = page / BITS_PER_ENTRY;
+                let bit = page % BITS_PER_ENTRY;
+
+                if idx < 4096 {
+                    let mask = 1 << bit;
+                    if (BITMAP[idx as usize] & mask) != 0 {
+                        BITMAP[idx as usize] = BITMAP[idx as usize] & (!mask);
+                        FREE_PAGES = FREE_PAGES + 1;
+                    }
+                }
+            }
+            page = page + 1;
+        }
+    }
+}
+
+// Mark a region as used (reserved)
+pub fn mark_region_used(base: u64, length: u64) {
+    let start_page = base / PAGE_SIZE;
+    let end_page = (base + length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    unsafe {
+        let mut page = start_page;
+        while page < end_page {
+            let idx = page / BITS_PER_ENTRY;
+            let bit = page % BITS_PER_ENTRY;
+
+            if idx < 4096 {
+                let mask = 1 << bit;
+                if (BITMAP[idx as usize] & mask) == 0 {
+                    BITMAP[idx as usize] = BITMAP[idx as usize] | mask;
+                    if FREE_PAGES > 0 {
+                        FREE_PAGES = FREE_PAGES - 1;
+                    }
+                }
+            }
+            page = page + 1;
+        }
+    }
+}
+
+// ============================================================
+// Page Allocation
+// ============================================================
+
+// Allocate a single page, returns physical address or 0 on failure
+pub fn alloc_page() -> u64 {
+    unsafe {
+        let mut idx: u64 = 0;
+        while idx < 4096 {
+            // Check if this entry has any free pages
+            if BITMAP[idx as usize] != 0xFFFFFFFFFFFFFFFF {
+                // Find first free bit
+                let mut bit: u64 = 0;
+                while bit < 64 {
+                    let mask = 1 << bit;
+                    if (BITMAP[idx as usize] & mask) == 0 {
+                        // Found free page, mark as used
+                        BITMAP[idx as usize] = BITMAP[idx as usize] | mask;
+                        FREE_PAGES = FREE_PAGES - 1;
+
+                        let page = idx * 64 + bit;
+                        return page * PAGE_SIZE;
+                    }
+                    bit = bit + 1;
+                }
+            }
+            idx = idx + 1;
+        }
+        0  // Out of memory
+    }
+}
+
+// Free a single page
+pub fn free_page(addr: u64) {
+    if addr == 0 {
+        return;
+    }
+
+    let page = addr / PAGE_SIZE;
+    let idx = page / BITS_PER_ENTRY;
+    let bit = page % BITS_PER_ENTRY;
+
+    unsafe {
+        if idx < 4096 {
+            let mask = 1 << bit;
+            if (BITMAP[idx as usize] & mask) != 0 {
+                BITMAP[idx as usize] = BITMAP[idx as usize] & (!mask);
+                FREE_PAGES = FREE_PAGES + 1;
+            }
+        }
+    }
+}
+
+// Allocate contiguous pages
+pub fn alloc_pages(count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    if count == 1 {
+        return alloc_page();
+    }
+
+    unsafe {
+        // Simple linear search for contiguous free pages
+        let max_page = TOTAL_PAGES;
+        let mut start_page: u64 = 0;
+
+        while start_page + count <= max_page {
+            // Check if 'count' pages starting at start_page are free
+            let mut all_free = true;
+            let mut i: u64 = 0;
+
+            while i < count && all_free {
+                let page = start_page + i;
+                let idx = page / BITS_PER_ENTRY;
+                let bit = page % BITS_PER_ENTRY;
+
+                if idx >= 4096 {
+                    all_free = false;
+                } else {
+                    let mask = 1 << bit;
+                    if (BITMAP[idx as usize] & mask) != 0 {
+                        all_free = false;
+                    }
+                }
+                i = i + 1;
+            }
+
+            if all_free {
+                // Mark all pages as used
+                let mut i: u64 = 0;
+                while i < count {
+                    let page = start_page + i;
+                    let idx = page / BITS_PER_ENTRY;
+                    let bit = page % BITS_PER_ENTRY;
+                    BITMAP[idx as usize] = BITMAP[idx as usize] | (1 << bit);
+                    i = i + 1;
+                }
+                FREE_PAGES = FREE_PAGES - count;
+                return start_page * PAGE_SIZE;
+            }
+
+            start_page = start_page + 1;
+        }
+        0  // Out of contiguous memory
+    }
+}
+
+// Free contiguous pages
+pub fn free_pages(addr: u64, count: u64) {
+    if addr == 0 || count == 0 {
+        return;
+    }
+
+    let start_page = addr / PAGE_SIZE;
+
+    unsafe {
+        let mut i: u64 = 0;
+        while i < count {
+            let page = start_page + i;
+            let idx = page / BITS_PER_ENTRY;
+            let bit = page % BITS_PER_ENTRY;
+
+            if idx < 4096 {
+                let mask = 1 << bit;
+                if (BITMAP[idx as usize] & mask) != 0 {
+                    BITMAP[idx as usize] = BITMAP[idx as usize] & (!mask);
+                    FREE_PAGES = FREE_PAGES + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ============================================================
+// Statistics
+// ============================================================
+
+pub fn get_free_pages() -> u64 {
+    unsafe { FREE_PAGES }
+}
+
+pub fn get_total_pages() -> u64 {
+    unsafe { TOTAL_PAGES }
+}
+
+pub fn get_used_pages() -> u64 {
+    unsafe { TOTAL_PAGES - FREE_PAGES }
+}
+
+pub fn get_free_memory() -> u64 {
+    unsafe { FREE_PAGES * PAGE_SIZE }
+}
+
+pub fn get_total_memory() -> u64 {
+    unsafe { TOTAL_PAGES * PAGE_SIZE }
+}

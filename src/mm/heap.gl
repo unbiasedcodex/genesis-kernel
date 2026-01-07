@@ -1,0 +1,284 @@
+// Kernel Heap Allocator
+// Simple bump allocator with free list for deallocation
+
+// ============================================================
+// Constants
+// ============================================================
+
+const PAGE_SIZE: u64 = 4096;
+const HEAP_INITIAL_PAGES: u64 = 16;   // 64KB initial heap
+const HEAP_MAX_PAGES: u64 = 256;      // 1MB max heap
+const MIN_ALLOC_SIZE: u64 = 32;       // Minimum allocation size
+const ALIGNMENT: u64 = 16;            // Allocation alignment
+
+// ============================================================
+// Free List Entry
+// ============================================================
+
+// Free block header
+#[repr(C)]
+struct FreeBlock {
+    size: u64,       // Size of this free block (including header)
+    next: u64,       // Pointer to next free block (0 if none)
+}
+
+// Allocation header (prepended to every allocation)
+#[repr(C)]
+struct AllocHeader {
+    size: u64,       // Size of allocation (including header)
+    magic: u64,      // Magic number for validation
+}
+
+const ALLOC_MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
+
+// ============================================================
+// State
+// ============================================================
+
+static mut HEAP_START: u64 = 0;        // Start of heap region
+static mut HEAP_END: u64 = 0;          // Current end of heap
+static mut HEAP_MAX: u64 = 0;          // Maximum heap address
+static mut HEAP_BUMP: u64 = 0;         // Current bump pointer
+static mut FREE_LIST: u64 = 0;         // Head of free list
+static mut TOTAL_ALLOCATED: u64 = 0;   // Total bytes allocated
+static mut ALLOC_COUNT: u64 = 0;       // Number of allocations
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Initialize heap with given region
+// page_alloc: function to allocate physical pages
+// map_page: function to map pages
+pub fn init(page_alloc: fn() -> u64, map_fn: fn(u64, u64, u64, fn() -> u64) -> bool) -> bool {
+    unsafe {
+        // Allocate initial heap pages
+        // Use a fixed virtual address range for heap (16MB - 32MB)
+        HEAP_START = 0x1000000;  // 16MB
+        HEAP_MAX = 0x2000000;    // 32MB
+        HEAP_END = HEAP_START;
+        HEAP_BUMP = HEAP_START;
+        FREE_LIST = 0;
+        TOTAL_ALLOCATED = 0;
+        ALLOC_COUNT = 0;
+
+        // Map initial pages
+        let mut addr = HEAP_START;
+        let mut i: u64 = 0;
+        while i < HEAP_INITIAL_PAGES {
+            let phys = page_alloc();
+            if phys == 0 {
+                return false;
+            }
+
+            // Map with write permission (PAGE_PRESENT | PAGE_WRITE = 3)
+            if !map_fn(addr, phys, 3, page_alloc) {
+                return false;
+            }
+
+            addr = addr + PAGE_SIZE;
+            i = i + 1;
+        }
+
+        HEAP_END = addr;
+        true
+    }
+}
+
+// ============================================================
+// Allocation
+// ============================================================
+
+// Align size up to alignment boundary
+fn align_up(size: u64, align: u64) -> u64 {
+    (size + align - 1) & (!(align - 1))
+}
+
+// Allocate memory from heap
+pub fn alloc(size: u64) -> *mut u8 {
+    if size == 0 {
+        return 0 as *mut u8;
+    }
+
+    unsafe {
+        // Calculate actual size needed (header + aligned size)
+        let header_size: u64 = 16;  // size_of::<AllocHeader>()
+        let actual_size = align_up(size + header_size, ALIGNMENT);
+        let min_size = if actual_size < MIN_ALLOC_SIZE { MIN_ALLOC_SIZE } else { actual_size };
+
+        // Try to find a suitable free block first
+        let block = find_free_block(min_size);
+        if block != 0 {
+            // Found a free block, use it
+            let header = block as *mut AllocHeader;
+            let header_size_ptr = header as *mut u64;
+            let header_magic_ptr = (block + 8) as *mut u64;
+
+            volatile_write_u64(header_size_ptr, min_size);
+            volatile_write_u64(header_magic_ptr, ALLOC_MAGIC);
+
+            TOTAL_ALLOCATED = TOTAL_ALLOCATED + min_size;
+            ALLOC_COUNT = ALLOC_COUNT + 1;
+
+            return (block + 16) as *mut u8;
+        }
+
+        // No suitable free block, bump allocate
+        if HEAP_BUMP + min_size > HEAP_END {
+            // Need to extend heap
+            if !extend_heap(min_size) {
+                return 0 as *mut u8;  // Out of memory
+            }
+        }
+
+        let block_addr = HEAP_BUMP;
+        HEAP_BUMP = HEAP_BUMP + min_size;
+
+        // Write allocation header
+        let header_size_ptr = block_addr as *mut u64;
+        let header_magic_ptr = (block_addr + 8) as *mut u64;
+
+        volatile_write_u64(header_size_ptr, min_size);
+        volatile_write_u64(header_magic_ptr, ALLOC_MAGIC);
+
+        TOTAL_ALLOCATED = TOTAL_ALLOCATED + min_size;
+        ALLOC_COUNT = ALLOC_COUNT + 1;
+
+        (block_addr + 16) as *mut u8
+    }
+}
+
+// Allocate zeroed memory
+pub fn alloc_zeroed(size: u64) -> *mut u8 {
+    let ptr = alloc(size);
+    if ptr as u64 != 0 {
+        // Zero the memory
+        let mut i: u64 = 0;
+        while i < size {
+            unsafe {
+                let byte_ptr = (ptr as u64 + i) as *mut u8;
+                volatile_write_u8(byte_ptr, 0);
+            }
+            i = i + 1;
+        }
+    }
+    ptr
+}
+
+// Find a free block of at least the given size
+fn find_free_block(size: u64) -> u64 {
+    unsafe {
+        let mut prev_ptr: u64 = 0;
+        let mut current = FREE_LIST;
+
+        while current != 0 {
+            let block_size_ptr = current as *u64;
+            let block_next_ptr = (current + 8) as *u64;
+
+            let block_size = volatile_read_u64(block_size_ptr);
+            let block_next = volatile_read_u64(block_next_ptr);
+
+            if block_size >= size {
+                // Found suitable block, remove from free list
+                if prev_ptr == 0 {
+                    FREE_LIST = block_next;
+                } else {
+                    let prev_next_ptr = (prev_ptr + 8) as *mut u64;
+                    volatile_write_u64(prev_next_ptr, block_next);
+                }
+                return current;
+            }
+
+            prev_ptr = current;
+            current = block_next;
+        }
+
+        0  // No suitable block found
+    }
+}
+
+// Extend heap by allocating more pages
+fn extend_heap(min_size: u64) -> bool {
+    unsafe {
+        // Calculate pages needed
+        let needed = align_up(min_size, PAGE_SIZE);
+        let pages_needed = needed / PAGE_SIZE;
+
+        if HEAP_END + needed > HEAP_MAX {
+            return false;  // Would exceed maximum heap size
+        }
+
+        // Note: We can't call page_alloc/map_page here directly
+        // In a real implementation, we'd store function pointers
+        // For now, return false to indicate we can't grow
+        // The initial heap size should be sufficient for basic operations
+
+        false
+    }
+}
+
+// ============================================================
+// Deallocation
+// ============================================================
+
+// Free allocated memory
+pub fn free(ptr: *mut u8) {
+    if ptr as u64 == 0 {
+        return;
+    }
+
+    unsafe {
+        let block_addr = (ptr as u64) - 16;
+
+        // Validate magic number
+        let magic_ptr = (block_addr + 8) as *u64;
+        let magic = volatile_read_u64(magic_ptr);
+
+        if magic != ALLOC_MAGIC {
+            // Invalid or double free
+            return;
+        }
+
+        // Get block size
+        let size_ptr = block_addr as *u64;
+        let block_size = volatile_read_u64(size_ptr);
+
+        // Clear magic to prevent double-free
+        let magic_mut_ptr = (block_addr + 8) as *mut u64;
+        volatile_write_u64(magic_mut_ptr, 0);
+
+        // Add to free list
+        let next_ptr = (block_addr + 8) as *mut u64;
+        volatile_write_u64(next_ptr, FREE_LIST);
+        FREE_LIST = block_addr;
+
+        TOTAL_ALLOCATED = TOTAL_ALLOCATED - block_size;
+        if ALLOC_COUNT > 0 {
+            ALLOC_COUNT = ALLOC_COUNT - 1;
+        }
+    }
+}
+
+// ============================================================
+// Statistics
+// ============================================================
+
+pub fn get_total_allocated() -> u64 {
+    unsafe { TOTAL_ALLOCATED }
+}
+
+pub fn get_alloc_count() -> u64 {
+    unsafe { ALLOC_COUNT }
+}
+
+pub fn get_heap_size() -> u64 {
+    unsafe { HEAP_END - HEAP_START }
+}
+
+pub fn get_heap_used() -> u64 {
+    unsafe { HEAP_BUMP - HEAP_START }
+}
+
+pub fn get_heap_free() -> u64 {
+    unsafe { HEAP_END - HEAP_BUMP }
+}

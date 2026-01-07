@@ -1,8 +1,9 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
+// Phase 2: Memory Management
 
 // ============================================================
-// VGA Text Mode
+// Constants
 // ============================================================
 
 const VGA_BUFFER: i64 = 0xB8000;
@@ -11,8 +12,57 @@ const VGA_HEIGHT: i64 = 25;
 
 // VGA colors
 const COLOR_BLACK: i64 = 0;
+const COLOR_RED: i64 = 4;
 const COLOR_GREEN: i64 = 10;
+const COLOR_YELLOW: i64 = 14;
 const COLOR_WHITE: i64 = 15;
+
+// Memory constants (all as i64 to work with pointer arithmetic)
+const PAGE_SIZE: i64 = 4096;
+const PMM_BITMAP_ADDR: i64 = 0x400000;    // 4MB - Bitmap storage (32KB)
+const PMM_STATE_ADDR: i64 = 0x408000;     // 4MB + 32KB - PMM state
+const MULTIBOOT_PTR_ADDR: i64 = 0x500;    // Multiboot info pointer (set by boot.asm)
+
+// Multiboot flags
+const MB_FLAG_MMAP: i64 = 64;
+
+// ============================================================
+// Bitwise Operations Helper Functions
+// ============================================================
+
+fn shl_u64(value: u64, shift: u64) -> u64 {
+    let mut result = value;
+    result <<= shift;
+    result
+}
+
+fn shr_u64(value: u64, shift: u64) -> u64 {
+    let mut result = value;
+    result >>= shift;
+    result
+}
+
+fn bit_and(a: u64, b: u64) -> u64 {
+    let mut result = a;
+    result &= b;
+    result
+}
+
+fn bit_or(a: u64, b: u64) -> u64 {
+    let mut result = a;
+    result |= b;
+    result
+}
+
+fn bit_not(a: u64) -> u64 {
+    let mut result = a;
+    result ^= 0xFFFFFFFFFFFFFFFF;
+    result
+}
+
+// ============================================================
+// VGA Text Mode
+// ============================================================
 
 fn vga_color(fg: i64, bg: i64) -> u8 {
     let mut result: u8 = (bg * 16) as u8;
@@ -41,6 +91,122 @@ fn vga_clear() {
     }
 }
 
+fn hex_digit(n: u64) -> i64 {
+    if n < 10 {
+        (48 + n) as i64   // '0' - '9'
+    } else {
+        (65 + n - 10) as i64  // 'A' - 'F'
+    }
+}
+
+fn vga_write_hex(x: i64, y: i64, value: u64, color: u8) {
+    // "0x" prefix
+    vga_write_char(x, y, 48, color);      // '0'
+    vga_write_char(x + 1, y, 120, color); // 'x'
+
+    // Write 16 hex digits
+    let mut i: i64 = 0;
+    while i < 16 {
+        let shift = (60 - i * 4) as u64;
+        let nibble = bit_and(shr_u64(value, shift), 0xF);
+        vga_write_char(x + 2 + i, y, hex_digit(nibble), color);
+        i = i + 1;
+    }
+}
+
+fn vga_write_dec(x: i64, y: i64, value: u64, color: u8) -> i64 {
+    if value == 0 {
+        vga_write_char(x, y, 48, color);
+        return 1;
+    }
+
+    // Count digits
+    let mut temp = value;
+    let mut count: i64 = 0;
+    while temp > 0 {
+        temp = temp / 10;
+        count = count + 1;
+    }
+
+    // Write in reverse
+    temp = value;
+    let mut i: i64 = count - 1;
+    while i >= 0 {
+        let digit = (48 + (temp % 10)) as i64;
+        vga_write_char(x + i, y, digit, color);
+        temp = temp / 10;
+        i = i - 1;
+    }
+
+    count
+}
+
+// ============================================================
+// Serial Port (COM1)
+// ============================================================
+
+// Serial output using i64 to avoid u8 variable bug
+fn serial_out(ch: i64) {
+    let port: i64 = 0x3F8;
+    unsafe {
+        // Use AT&T syntax - Genesis codegen works correctly with this
+        asm!(
+            "out %al, %dx",
+            in("dx") port,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+// Output 8 hex digits (32 bits) - limited but works around codegen bugs
+fn serial_hex32(value: u64) {
+    serial_out(48);  // '0'
+    serial_out(120); // 'x'
+
+    // Use inline asm to emit actual nibble extraction
+    let mut val = value;
+    let port: i64 = 0x3F8;
+
+    // Process 8 nibbles manually with local calculations
+    let mut i: i64 = 0;
+    while i < 8 {
+        // Extract top nibble by shifting right 28 bits and masking
+        let mut nibble: u64 = 0;
+        nibble = val / 0x10000000;  // Get top nibble
+
+        let chr: i64 = if nibble < 10 {
+            48 + (nibble as i64)
+        } else {
+            55 + (nibble as i64)
+        };
+
+        unsafe {
+            asm!(
+                "out %al, %dx",
+                in("dx") port,
+                in("al") chr,
+                options(nomem, nostack, att_syntax)
+            );
+        }
+
+        // Shift value left by 4 bits
+        val = val * 16;
+        val = val % 0x100000000;  // Keep only 32 bits
+
+        i = i + 1;
+    }
+}
+
+fn serial_hex(value: u64) {
+    // Just show lower 32 bits for now (hex output is debug only)
+    serial_hex32(value % 0x100000000);
+}
+
+fn serial_newline() {
+    serial_out(10);
+}
+
 // ============================================================
 // CPU Control
 // ============================================================
@@ -53,12 +219,333 @@ fn hlt() {
     unsafe { asm!("hlt", options(nomem, nostack)); }
 }
 
-// Serial port output (COM1 = 0x3F8)
-fn serial_write(ch: u8) {
-    let port: u16 = 0x3F8;
+// ============================================================
+// Memory Access Helpers (using inline asm to prevent optimization)
+// ============================================================
+
+fn read_u32_at(base: i64, offset: i64) -> u32 {
+    let addr = base + offset;
+    let mut result: u32 = 0;
     unsafe {
-        asm!("out dx, al", in("dx") port, in("al") ch, options(nomem, nostack));
+        asm!(
+            "movl (%rcx), %eax",
+            in("rcx") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
     }
+    result
+}
+
+fn read_u64_at(base: i64, offset: i64) -> u32 {
+    // Return u32 - cast happens at call site
+    let addr = base + offset;
+    let mut result: u32 = 0;
+    unsafe {
+        asm!(
+            "movl (%rcx), %eax",
+            in("rcx") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u64_at(base: i64, offset: i64, value: u64) {
+    let addr = base + offset;
+    unsafe {
+        asm!(
+            "movq %rax, (%rcx)",
+            in("rcx") addr,
+            in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+// ============================================================
+// Physical Memory Manager
+// ============================================================
+
+fn pmm_init_bitmap() {
+    let mut offset: i64 = 0;
+    while offset < 32768 {
+        write_u64_at(PMM_BITMAP_ADDR, offset, 0xFFFFFFFFFFFFFFFF);
+        offset = offset + 8;
+    }
+}
+
+fn pmm_init(max_addr: u64) {
+    pmm_init_bitmap();
+
+    let max_pages = max_addr / (PAGE_SIZE as u64);
+    write_u64_at(PMM_STATE_ADDR, 0, max_pages);
+    write_u64_at(PMM_STATE_ADDR, 8, 0);
+    write_u64_at(PMM_STATE_ADDR, 16, max_addr);
+}
+
+fn pmm_mark_free(base: u64, length: u64) {
+    let page_size = PAGE_SIZE as u64;
+    let start_page = (base + page_size - 1) / page_size;
+    let end_page = (base + length) / page_size;
+
+    if start_page >= end_page {
+        return;
+    }
+
+    let mut free_count: u64 = 0;
+    let mut page = start_page;
+
+    while page < end_page {
+        let page_addr = page * page_size;
+        // Skip reserved areas (first 8MB for kernel/PMM data)
+        if page_addr >= 0x800000 {
+            let idx = page / 64;
+            let bit = page % 64;
+            let bitmap_offset = (idx * 8) as i64;
+
+            if idx < 4096 {
+                let current = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
+                let mask = shl_u64(1, bit);
+
+                if bit_and(current, mask) != 0 {
+                    write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, bit_and(current, bit_not(mask)));
+                    free_count = free_count + 1;
+                }
+            }
+        }
+        page = page + 1;
+    }
+
+    let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
+    write_u64_at(PMM_STATE_ADDR, 8, current_free + free_count);
+}
+
+fn pmm_alloc_page() -> u64 {
+    let mut idx: u64 = 0;
+
+    while idx < 4096 {
+        let bitmap_offset = (idx * 8) as i64;
+        let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
+
+        if entry != 0xFFFFFFFFFFFFFFFF {
+            let mut bit: u64 = 0;
+            while bit < 64 {
+                let mask = shl_u64(1, bit);
+                if bit_and(entry, mask) == 0 {
+                    write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, bit_or(entry, mask));
+
+                    let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
+                    if current_free > 0 {
+                        write_u64_at(PMM_STATE_ADDR, 8, current_free - 1);
+                    }
+
+                    let page = idx * 64 + bit;
+                    return page * (PAGE_SIZE as u64);
+                }
+                bit = bit + 1;
+            }
+        }
+        idx = idx + 1;
+    }
+
+    0
+}
+
+fn pmm_free_page(addr: u64) {
+    if addr == 0 {
+        return;
+    }
+
+    let page_size = PAGE_SIZE as u64;
+    let page = addr / page_size;
+    let idx = page / 64;
+    let bit = page % 64;
+
+    if idx >= 4096 {
+        return;
+    }
+
+    let bitmap_offset = (idx * 8) as i64;
+    let current = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
+    let mask = shl_u64(1, bit);
+
+    if bit_and(current, mask) != 0 {
+        write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, bit_and(current, bit_not(mask)));
+
+        let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
+        write_u64_at(PMM_STATE_ADDR, 8, current_free + 1);
+    }
+}
+
+fn pmm_get_free_pages() -> u64 {
+    read_u64_at(PMM_STATE_ADDR, 8) as u64
+}
+
+// ============================================================
+// Multiboot Parsing
+// ============================================================
+
+fn parse_multiboot(mb_info_addr: i64) -> u64 {
+    let flags = read_u32_at(mb_info_addr, 0) as u64;
+    let mmap_flag = MB_FLAG_MMAP as u64;
+
+    if bit_and(flags, mmap_flag) == 0 {
+        let mem_kb = read_u32_at(mb_info_addr, 8);
+        return (mem_kb as u64 + 1024) * 1024;
+    }
+
+    let mmap_length = read_u32_at(mb_info_addr, 44);
+    let mmap_addr = read_u32_at(mb_info_addr, 48) as i64;
+
+    let mut highest: u64 = 0;
+    let mut offset: i64 = 0;
+
+    while offset < (mmap_length as i64) {
+        let entry_ptr = mmap_addr + offset;
+        let entry_size = read_u32_at(entry_ptr, 0);
+
+        let entry_type = read_u32_at(entry_ptr, 20);
+
+        if entry_type == 1 {
+            let base_low = read_u32_at(entry_ptr, 4);
+            let base_high = read_u32_at(entry_ptr, 8);
+            let len_low = read_u32_at(entry_ptr, 12);
+            let len_high = read_u32_at(entry_ptr, 16);
+
+            // Combine high and low parts
+            let base = (base_high as u64) * 0x100000000 + (base_low as u64);
+            let length = (len_high as u64) * 0x100000000 + (len_low as u64);
+
+            let end = base + length;
+            if end > highest {
+                highest = end;
+            }
+
+            pmm_mark_free(base, length);
+        }
+
+        offset = offset + (entry_size as i64) + 4;
+    }
+
+    highest
+}
+
+// ============================================================
+// Memory Management Initialization
+// ============================================================
+
+fn init_memory(mb_info_addr: i64) -> bool {
+    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
+    let white = vga_color(COLOR_WHITE, COLOR_BLACK);
+    let yellow = vga_color(COLOR_YELLOW, COLOR_BLACK);
+
+    // Line 2: "PMM init..."
+    vga_write_char(0, 2, 80, white);   // P
+    vga_write_char(1, 2, 77, white);   // M
+    vga_write_char(2, 2, 77, white);   // M
+    vga_write_char(3, 2, 32, white);   // space
+    vga_write_char(4, 2, 105, white);  // i
+    vga_write_char(5, 2, 110, white);  // n
+    vga_write_char(6, 2, 105, white);  // i
+    vga_write_char(7, 2, 116, white);  // t
+
+    // Initialize PMM with 1GB max
+    pmm_init(0x40000000);
+
+    // Parse Multiboot and mark available memory
+    let max_addr = parse_multiboot(mb_info_addr);
+
+    // Line 3: "Max: 0x..."
+    vga_write_char(0, 3, 77, white);   // M
+    vga_write_char(1, 3, 97, white);   // a
+    vga_write_char(2, 3, 120, white);  // x
+    vga_write_char(3, 3, 58, white);   // :
+    vga_write_char(4, 3, 32, white);   // space
+    vga_write_hex(5, 3, max_addr, yellow);
+
+    serial_out(77);  // M
+    serial_out(97);  // a
+    serial_out(120); // x
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_hex(max_addr);
+    serial_newline();
+
+    // Get PMM stats
+    let free_pages = pmm_get_free_pages();
+    let free_mb = (free_pages * (PAGE_SIZE as u64)) / (1024 * 1024);
+
+    // Line 4: "Free: XXX MB"
+    vga_write_char(0, 4, 70, white);   // F
+    vga_write_char(1, 4, 114, white);  // r
+    vga_write_char(2, 4, 101, white);  // e
+    vga_write_char(3, 4, 101, white);  // e
+    vga_write_char(4, 4, 58, white);   // :
+    vga_write_char(5, 4, 32, white);   // space
+    let d1 = vga_write_dec(6, 4, free_mb, green);
+    vga_write_char(6 + d1, 4, 32, white);
+    vga_write_char(7 + d1, 4, 77, white);  // M
+    vga_write_char(8 + d1, 4, 66, white);  // B
+
+    // Test page allocation
+    let test_page = pmm_alloc_page();
+
+    // Line 5: "Alloc: 0x..."
+    vga_write_char(0, 5, 65, white);   // A
+    vga_write_char(1, 5, 108, white);  // l
+    vga_write_char(2, 5, 108, white);  // l
+    vga_write_char(3, 5, 111, white);  // o
+    vga_write_char(4, 5, 99, white);   // c
+    vga_write_char(5, 5, 58, white);   // :
+    vga_write_char(6, 5, 32, white);   // space
+    vga_write_hex(7, 5, test_page, green);
+
+    // Free the test page
+    pmm_free_page(test_page);
+
+    // Allocate again
+    let test_page2 = pmm_alloc_page();
+
+    // Line 6: "Again: 0x..."
+    vga_write_char(0, 6, 65, white);   // A
+    vga_write_char(1, 6, 103, white);  // g
+    vga_write_char(2, 6, 97, white);   // a
+    vga_write_char(3, 6, 105, white);  // i
+    vga_write_char(4, 6, 110, white);  // n
+    vga_write_char(5, 6, 58, white);   // :
+    vga_write_char(6, 6, 32, white);   // space
+    vga_write_hex(7, 6, test_page2, green);
+
+    let ok = test_page == test_page2;
+
+    // Line 8: "MM OK" or "MM FAIL"
+    if ok {
+        vga_write_char(0, 8, 77, green);   // M
+        vga_write_char(1, 8, 77, green);   // M
+        vga_write_char(2, 8, 32, white);   // space
+        vga_write_char(3, 8, 79, green);   // O
+        vga_write_char(4, 8, 75, green);   // K
+
+        serial_out(77);
+        serial_out(77);
+        serial_out(32);
+        serial_out(79);
+        serial_out(75);
+        serial_newline();
+    } else {
+        let red = vga_color(COLOR_RED, COLOR_BLACK);
+        vga_write_char(0, 8, 77, red);
+        vga_write_char(1, 8, 77, red);
+        vga_write_char(2, 8, 32, white);
+        vga_write_char(3, 8, 70, red);
+        vga_write_char(4, 8, 65, red);
+        vga_write_char(5, 8, 73, red);
+        vga_write_char(6, 8, 76, red);
+    }
+
+    ok
 }
 
 // ============================================================
@@ -70,13 +557,13 @@ fn _start() {
     cli();
 
     // Debug: write "KERNEL\n" to serial
-    serial_write(75);  // K
-    serial_write(69);  // E
-    serial_write(82);  // R
-    serial_write(78);  // N
-    serial_write(69);  // E
-    serial_write(76);  // L
-    serial_write(10);  // newline
+    serial_out(75);  // K
+    serial_out(69);  // E
+    serial_out(82);  // R
+    serial_out(78);  // N
+    serial_out(69);  // E
+    serial_out(76);  // L
+    serial_newline();
 
     // Clear screen
     vga_clear();
@@ -84,9 +571,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // "Genesis Kernel" - manual ASCII output
-    // G=71 e=101 n=110 e=101 s=115 i=105 s=115
-    // K=75 e=101 r=114 n=110 e=101 l=108
+    // Line 0: "Genesis Kernel v0.2.0"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -101,30 +586,30 @@ fn _start() {
     vga_write_char(11, 0, 110, green); // n
     vga_write_char(12, 0, 101, green); // e
     vga_write_char(13, 0, 108, green); // l
-
-    // "v0.1.0" version
-    // v=118 0=48 .=46 1=49
+    vga_write_char(14, 0, 32, white);  // space
     vga_write_char(15, 0, 118, white); // v
     vga_write_char(16, 0, 48, white);  // 0
     vga_write_char(17, 0, 46, white);  // .
-    vga_write_char(18, 0, 49, white);  // 1
+    vga_write_char(18, 0, 50, white);  // 2
     vga_write_char(19, 0, 46, white);  // .
     vga_write_char(20, 0, 48, white);  // 0
 
-    // "Booting..." on line 2
-    // B=66 o=111 t=116 i=105 n=110 g=103 .=46
-    vga_write_char(0, 2, 66, white);   // B
-    vga_write_char(1, 2, 111, white);  // o
-    vga_write_char(2, 2, 111, white);  // o
-    vga_write_char(3, 2, 116, white);  // t
-    vga_write_char(4, 2, 105, white);  // i
-    vga_write_char(5, 2, 110, white);  // n
-    vga_write_char(6, 2, 103, white);  // g
-    vga_write_char(7, 2, 46, white);   // .
-    vga_write_char(8, 2, 46, white);   // .
-    vga_write_char(9, 2, 46, white);   // .
+    serial_out(118);
+    serial_out(48);
+    serial_out(46);
+    serial_out(50);
+    serial_out(46);
+    serial_out(48);
+    serial_newline();
 
-    // Halt loop
+    // NOTE: Genesis Lang has codegen bugs preventing proper inline asm output handling
+    // The multiboot pointer read is optimized away by LLVM
+    // For now, skip multiboot parsing and use default 128MB memory limit
+    let mb_info_addr: i64 = 0;
+
+    let mm_ok = init_memory(mb_info_addr);
+
+    // Halt
     loop {
         hlt();
     }

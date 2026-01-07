@@ -53,18 +53,30 @@ When running `make run`, you should see:
 BOOT
 64
 KERNEL
+v0.2.0
+Max: 0x00000000XXXXXXXX
+MM OK
 ```
 
 - `BOOT` - 32-bit Multiboot entry reached
 - `64` - Long mode transition successful
 - `KERNEL` - Genesis kernel running
+- `v0.2.0` - Kernel version
+- `Max` - Maximum detected memory address
+- `MM OK` - Memory management initialized
 
 ## Project Structure
 
 ```
 genesis-kernel/
 ├── src/
-│   └── main.gl              # Kernel entry point (_start)
+│   ├── main.gl              # Kernel entry point (_start)
+│   └── mm/
+│       ├── mod.gl           # Memory module
+│       ├── pmm.gl           # Physical Memory Manager
+│       ├── vmm.gl           # Virtual Memory Manager
+│       ├── heap.gl          # Heap allocator
+│       └── multiboot.gl     # Multiboot info parser
 ├── arch/
 │   └── x86_64/
 │       └── boot.asm         # Multiboot + 32→64 bit transition
@@ -86,7 +98,12 @@ genesis-kernel/
   - [x] VGA text output
   - [x] Serial debug output
   - [x] Bootable ISO with GRUB
-- [ ] Phase 2: Memory management
+- [x] Phase 2: Memory management
+  - [x] Physical Memory Manager (bitmap allocator)
+  - [x] Multiboot memory map parsing
+  - [x] Page allocation/deallocation
+  - [x] Virtual Memory Manager (paging)
+  - [x] Heap allocator
 - [ ] Phase 3: Interrupts
 - [ ] Phase 4: Processes
 - [ ] Phase 5: IPC

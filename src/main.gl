@@ -1,6 +1,6 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
-// Phase 2: Memory Management
+// Phase 3: Interrupts
 
 // ============================================================
 // Constants
@@ -25,6 +25,32 @@ const MULTIBOOT_PTR_ADDR: i64 = 0x500;    // Multiboot info pointer (set by boot
 
 // Multiboot flags
 const MB_FLAG_MMAP: i64 = 64;
+
+// Interrupt constants
+const IDT_ENTRIES: i64 = 256;
+const IDT_ENTRY_SIZE: i64 = 16;
+const IDT_ADDR: i64 = 0x410000;           // IDT table
+const IDTR_ADDR: i64 = 0x411000;          // IDTR structure
+const TICK_COUNT_ADDR: i64 = 0x412000;    // Timer tick counter
+
+// PIC ports
+const PIC1_CMD: i64 = 0x20;
+const PIC1_DATA: i64 = 0x21;
+const PIC2_CMD: i64 = 0xA0;
+const PIC2_DATA: i64 = 0xA1;
+const PIC_EOI: i64 = 0x20;
+
+// PIT ports
+const PIT_CHANNEL0: i64 = 0x40;
+const PIT_CMD: i64 = 0x43;
+const PIT_DIVISOR: i64 = 11932;  // ~100 Hz
+
+// Serial port
+const COM1: i64 = 0x3F8;
+
+// Gate types
+const GATE_INTERRUPT: i64 = 0x8E;
+const KERNEL_CS: i64 = 0x08;
 
 // ============================================================
 // Bitwise Operations Helper Functions
@@ -58,6 +84,38 @@ fn bit_not(a: u64) -> u64 {
     let mut result = a;
     result ^= 0xFFFFFFFFFFFFFFFF;
     result
+}
+
+// ============================================================
+// I/O Port Functions
+// ============================================================
+
+fn outb(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn inb(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "in %dx, %al",
+            in("dx") port,
+            lateout("al") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn io_wait() {
+    outb(0x80, 0);
 }
 
 // ============================================================
@@ -141,39 +199,47 @@ fn vga_write_dec(x: i64, y: i64, value: u64, color: u8) -> i64 {
     count
 }
 
+fn vga_write_char_color(x: i64, y: i64, ch: i64, color: i64) {
+    let offset = (y * VGA_WIDTH + x) * 2;
+    let addr = VGA_BUFFER + offset;
+    unsafe {
+        let ptr = addr as *mut u8;
+        volatile_write_u8(ptr, ch as u8);
+        let color_ptr = (addr + 1) as *mut u8;
+        volatile_write_u8(color_ptr, color as u8);
+    }
+}
+
+fn vga_write_hex_byte(x: i64, y: i64, value: u64, color: i64) {
+    let high = bit_and(shr_u64(value, 4), 0xF);
+    let low = bit_and(value, 0xF);
+
+    let ch_high: i64 = if high < 10 { 48 + (high as i64) } else { 55 + (high as i64) };
+    let ch_low: i64 = if low < 10 { 48 + (low as i64) } else { 55 + (low as i64) };
+
+    vga_write_char_color(x, y, ch_high, color);
+    vga_write_char_color(x + 1, y, ch_low, color);
+}
+
 // ============================================================
 // Serial Port (COM1)
 // ============================================================
 
-// Serial output using i64 to avoid u8 variable bug
 fn serial_out(ch: i64) {
-    let port: i64 = 0x3F8;
-    unsafe {
-        // Use AT&T syntax - Genesis codegen works correctly with this
-        asm!(
-            "out %al, %dx",
-            in("dx") port,
-            in("al") ch,
-            options(nomem, nostack, att_syntax)
-        );
-    }
+    outb(COM1, ch);
 }
 
-// Output 8 hex digits (32 bits) - limited but works around codegen bugs
+// Output 8 hex digits (32 bits)
 fn serial_hex32(value: u64) {
     serial_out(48);  // '0'
     serial_out(120); // 'x'
 
-    // Use inline asm to emit actual nibble extraction
     let mut val = value;
-    let port: i64 = 0x3F8;
 
-    // Process 8 nibbles manually with local calculations
     let mut i: i64 = 0;
     while i < 8 {
-        // Extract top nibble by shifting right 28 bits and masking
         let mut nibble: u64 = 0;
-        nibble = val / 0x10000000;  // Get top nibble
+        nibble = val / 0x10000000;
 
         let chr: i64 = if nibble < 10 {
             48 + (nibble as i64)
@@ -181,26 +247,30 @@ fn serial_hex32(value: u64) {
             55 + (nibble as i64)
         };
 
-        unsafe {
-            asm!(
-                "out %al, %dx",
-                in("dx") port,
-                in("al") chr,
-                options(nomem, nostack, att_syntax)
-            );
-        }
+        outb(COM1, chr);
 
-        // Shift value left by 4 bits
         val = val * 16;
-        val = val % 0x100000000;  // Keep only 32 bits
+        val = val % 0x100000000;
 
         i = i + 1;
     }
 }
 
 fn serial_hex(value: u64) {
-    // Just show lower 32 bits for now (hex output is debug only)
     serial_hex32(value % 0x100000000);
+}
+
+fn serial_hex64(value: u64) {
+    serial_out(48);  // '0'
+    serial_out(120); // 'x'
+
+    let mut i: i64 = 60;
+    while i >= 0 {
+        let nibble = bit_and(shr_u64(value, i as u64), 0xF) as i64;
+        let ch: i64 = if nibble < 10 { 48 + nibble } else { 55 + nibble };
+        serial_out(ch);
+        i = i - 4;
+    }
 }
 
 fn serial_newline() {
@@ -215,12 +285,16 @@ fn cli() {
     unsafe { asm!("cli", options(nomem, nostack)); }
 }
 
+fn sti() {
+    unsafe { asm!("sti", options(nomem, nostack)); }
+}
+
 fn hlt() {
     unsafe { asm!("hlt", options(nomem, nostack)); }
 }
 
 // ============================================================
-// Memory Access Helpers (using inline asm to prevent optimization)
+// Memory Access Helpers
 // ============================================================
 
 fn read_u32_at(base: i64, offset: i64) -> u32 {
@@ -238,7 +312,6 @@ fn read_u32_at(base: i64, offset: i64) -> u32 {
 }
 
 fn read_u64_at(base: i64, offset: i64) -> u32 {
-    // Return u32 - cast happens at call site
     let addr = base + offset;
     let mut result: u32 = 0;
     unsafe {
@@ -259,6 +332,52 @@ fn write_u64_at(base: i64, offset: i64, value: u64) {
             "movq %rax, (%rcx)",
             in("rcx") addr,
             in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_u64_addr(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rcx), %rax",
+            in("rcx") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u64_addr(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rax, (%rcx)",
+            in("rcx") addr,
+            in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn write_u16_addr(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movw %ax, (%rcx)",
+            in("rcx") addr,
+            in("ax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn write_u32_addr(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movl %eax, (%rcx)",
+            in("rcx") addr,
+            in("eax") value,
             options(nostack, att_syntax)
         );
     }
@@ -299,7 +418,6 @@ fn pmm_mark_free(base: u64, length: u64) {
 
     while page < end_page {
         let page_addr = page * page_size;
-        // Skip reserved areas (first 8MB for kernel/PMM data)
         if page_addr >= 0x800000 {
             let idx = page / 64;
             let bit = page % 64;
@@ -414,7 +532,6 @@ fn parse_multiboot(mb_info_addr: i64) -> u64 {
             let len_low = read_u32_at(entry_ptr, 12);
             let len_high = read_u32_at(entry_ptr, 16);
 
-            // Combine high and low parts
             let base = (base_high as u64) * 0x100000000 + (base_low as u64);
             let length = (len_high as u64) * 0x100000000 + (len_low as u64);
 
@@ -451,10 +568,8 @@ fn init_memory(mb_info_addr: i64) -> bool {
     vga_write_char(6, 2, 105, white);  // i
     vga_write_char(7, 2, 116, white);  // t
 
-    // Initialize PMM with 1GB max
     pmm_init(0x40000000);
 
-    // Parse Multiboot and mark available memory
     let max_addr = parse_multiboot(mb_info_addr);
 
     // Line 3: "Max: 0x..."
@@ -473,7 +588,6 @@ fn init_memory(mb_info_addr: i64) -> bool {
     serial_hex(max_addr);
     serial_newline();
 
-    // Get PMM stats
     let free_pages = pmm_get_free_pages();
     let free_mb = (free_pages * (PAGE_SIZE as u64)) / (1024 * 1024);
 
@@ -489,7 +603,6 @@ fn init_memory(mb_info_addr: i64) -> bool {
     vga_write_char(7 + d1, 4, 77, white);  // M
     vga_write_char(8 + d1, 4, 66, white);  // B
 
-    // Test page allocation
     let test_page = pmm_alloc_page();
 
     // Line 5: "Alloc: 0x..."
@@ -502,10 +615,8 @@ fn init_memory(mb_info_addr: i64) -> bool {
     vga_write_char(6, 5, 32, white);   // space
     vga_write_hex(7, 5, test_page, green);
 
-    // Free the test page
     pmm_free_page(test_page);
 
-    // Allocate again
     let test_page2 = pmm_alloc_page();
 
     // Line 6: "Again: 0x..."
@@ -549,11 +660,366 @@ fn init_memory(mb_info_addr: i64) -> bool {
 }
 
 // ============================================================
+// PIC (8259 Programmable Interrupt Controller)
+// ============================================================
+
+fn pic_init() {
+    // Save masks
+    let mask1 = inb(PIC1_DATA);
+    let mask2 = inb(PIC2_DATA);
+
+    // ICW1: init + ICW4 needed
+    outb(PIC1_CMD, 0x11);
+    io_wait();
+    outb(PIC2_CMD, 0x11);
+    io_wait();
+
+    // ICW2: vector offsets
+    outb(PIC1_DATA, 32);  // IRQ 0-7 -> INT 32-39
+    io_wait();
+    outb(PIC2_DATA, 40);  // IRQ 8-15 -> INT 40-47
+    io_wait();
+
+    // ICW3: cascading
+    outb(PIC1_DATA, 4);   // Slave on IRQ2
+    io_wait();
+    outb(PIC2_DATA, 2);   // Cascade identity
+    io_wait();
+
+    // ICW4: 8086 mode
+    outb(PIC1_DATA, 1);
+    io_wait();
+    outb(PIC2_DATA, 1);
+    io_wait();
+
+    // Enable only timer (IRQ0) and keyboard (IRQ1)
+    outb(PIC1_DATA, 0xFC);
+    outb(PIC2_DATA, 0xFF);
+}
+
+fn pic_send_eoi(irq: i64) {
+    if irq >= 8 {
+        outb(PIC2_CMD, PIC_EOI);
+    }
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+// ============================================================
+// PIT (Programmable Interval Timer)
+// ============================================================
+
+fn timer_init() {
+    // Initialize tick counter
+    write_u64_addr(TICK_COUNT_ADDR, 0);
+
+    // PIT command: channel 0, lobyte/hibyte, mode 3 (square wave)
+    outb(PIT_CMD, 0x36);
+
+    // Send divisor (PIT_DIVISOR = 11932, low byte = 0x9C, high byte = 0x2E)
+    let divisor_low = PIT_DIVISOR & 0xFF;
+    let divisor_high = (PIT_DIVISOR / 256) & 0xFF;
+    outb(PIT_CHANNEL0, divisor_low);
+    outb(PIT_CHANNEL0, divisor_high);
+}
+
+fn timer_get_ticks() -> u64 {
+    read_u64_addr(TICK_COUNT_ADDR)
+}
+
+// ============================================================
+// IDT (Interrupt Descriptor Table)
+// ============================================================
+
+fn idt_set_gate(index: i64, handler: i64) {
+    let entry_addr = IDT_ADDR + (index * IDT_ENTRY_SIZE);
+
+    // Extract handler address parts using division/modulo
+    // This avoids potential issues with bit operations
+    let handler_u64 = handler as u64;
+    let offset_low = (handler_u64 % 65536) as i64;        // bits 0-15
+    let offset_mid = ((handler_u64 / 65536) % 65536) as i64;  // bits 16-31
+    let offset_high = (handler_u64 / 0x100000000) as i64;     // bits 32-63
+
+    // Type attributes byte: 0x8E = Present + DPL0 + IntGate
+    // At byte 5, IST at byte 4 = 0
+    // As u16 little-endian: 0x8E00 (byte4=0x00, byte5=0x8E)
+    let type_attr: i64 = 0x8E00;
+
+    // Write IDT entry (16 bytes)
+    write_u16_addr(entry_addr + 0, offset_low);           // offset_low
+    write_u16_addr(entry_addr + 2, KERNEL_CS);            // selector
+    write_u16_addr(entry_addr + 4, type_attr);            // IST=0, type
+    write_u16_addr(entry_addr + 6, offset_mid);           // offset_mid
+    write_u32_addr(entry_addr + 8, offset_high);          // offset_high
+    write_u32_addr(entry_addr + 12, 0);                   // reserved
+
+}
+
+fn idt_clear() {
+    let mut i: i64 = 0;
+    while i < IDT_ENTRIES * IDT_ENTRY_SIZE {
+        write_u64_addr(IDT_ADDR + i, 0);
+        i = i + 8;
+    }
+}
+
+fn idt_init() {
+    // Clear all entries
+    idt_clear();
+
+    // Get ISR stub table address
+    let stub_table = get_isr_stub_ptr();
+
+    // Set up all 48 handlers (32 exceptions + 16 IRQs)
+    let mut i: i64 = 0;
+    while i < 48 {
+        let handler = read_u64_addr(stub_table + (i * 8));
+        idt_set_gate(i, handler as i64);
+        i = i + 1;
+    }
+
+    // Load IDT
+    idt_load();
+}
+
+fn get_isr_stub_ptr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea isr_stub_table(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn idt_load() {
+    // Set up IDTR at IDTR_ADDR
+    let limit = (IDT_ENTRIES * IDT_ENTRY_SIZE - 1) as i64;
+    write_u16_addr(IDTR_ADDR, limit);
+
+    // Write base (64-bit)
+    unsafe {
+        asm!(
+            "movq %rax, 2(%rcx)",
+            in("rcx") IDTR_ADDR,
+            in("rax") IDT_ADDR,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // Load IDT
+    unsafe {
+        asm!(
+            "lidt (%rax)",
+            in("rax") IDTR_ADDR,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+// ============================================================
+// Interrupt Handler (called from assembly)
+// ============================================================
+
+fn read_stack_u64(base: i64, offset: i64) -> u64 {
+    read_u64_addr(base + offset)
+}
+
+fn read_cr2() -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "mov %cr2, %rax",
+            lateout("rax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn serial_print_hex64(value: u64) {
+    serial_out(48);  // '0'
+    serial_out(120); // 'x'
+
+    let mut i: i64 = 60;
+    while i >= 0 {
+        let nibble = bit_and(shr_u64(value, i as u64), 0xF) as i64;
+        let ch: i64 = if nibble < 10 { 48 + nibble } else { 55 + nibble };
+        serial_out(ch);
+        i = i - 4;
+    }
+}
+
+// ISR handler - called from assembly (isr_common)
+// Name must match the extern declaration in isr.asm
+pub fn isr_handler(frame_ptr: i64) {
+    // Stack layout:
+    //   [128] = interrupt number
+    //   [136] = error code
+    //   [144] = RIP
+
+    let int_num = read_stack_u64(frame_ptr, 128) as i64;
+
+    if int_num < 32 {
+        // CPU Exception
+        let error_code = read_stack_u64(frame_ptr, 136);
+        let rip = read_stack_u64(frame_ptr, 144);
+        handle_exception(int_num, error_code, rip);
+    } else if int_num < 48 {
+        // Hardware IRQ
+        let irq = int_num - 32;
+        handle_irq(irq);
+    }
+}
+
+fn handle_exception(num: i64, error_code: u64, rip: u64) {
+    // Print to serial
+    serial_out(69);  // E
+    serial_out(88);  // X
+    serial_out(67);  // C
+    serial_out(58);  // :
+    serial_out(48 + ((num / 10) % 10));
+    serial_out(48 + (num % 10));
+    serial_newline();
+
+    // Print error code
+    serial_out(69); serial_out(82); serial_out(82); serial_out(58); // ERR:
+    serial_print_hex64(error_code);
+    serial_newline();
+
+    // Print RIP
+    serial_out(82); serial_out(73); serial_out(80); serial_out(58); // RIP:
+    serial_print_hex64(rip);
+    serial_newline();
+
+    // Page fault: print CR2
+    if num == 14 {
+        let cr2 = read_cr2();
+        serial_out(67); serial_out(82); serial_out(50); serial_out(58); // CR2:
+        serial_print_hex64(cr2);
+        serial_newline();
+    }
+
+    // Display on VGA
+    let red: i64 = 0x4F;
+    vga_write_char_color(0, 20, 69, red);   // E
+    vga_write_char_color(1, 20, 88, red);   // X
+    vga_write_char_color(2, 20, 67, red);   // C
+    vga_write_char_color(3, 20, 32, red);   // space
+    vga_write_hex_byte(4, 20, num as u64, red);
+
+    // Halt on fatal exceptions
+    if num == 8 || num == 13 || num == 14 {
+        serial_out(72); serial_out(65); serial_out(76); serial_out(84); // HALT
+        serial_newline();
+        loop {
+            unsafe { asm!("cli; hlt", options(nomem, nostack)); }
+        }
+    }
+}
+
+fn handle_irq(irq: i64) {
+    if irq == 0 {
+        // Timer interrupt
+        handle_timer();
+    } else if irq == 1 {
+        // Keyboard interrupt
+        handle_keyboard();
+    }
+
+    // Send EOI
+    pic_send_eoi(irq);
+}
+
+fn handle_timer() {
+    let ticks = read_u64_addr(TICK_COUNT_ADDR);
+    write_u64_addr(TICK_COUNT_ADDR, ticks + 1);
+
+    // Every 100 ticks (~1 second), print TICK
+    if (ticks + 1) % 100 == 0 {
+        serial_out(84);  // T
+        serial_out(73);  // I
+        serial_out(67);  // C
+        serial_out(75);  // K
+        serial_newline();
+
+        // Update VGA tick counter (row 10)
+        let seconds = ((ticks + 1) / 100) as i64;
+        let green: i64 = 0x0A;
+        vga_write_char_color(0, 10, 84, green);  // T
+        vga_write_char_color(1, 10, 58, green);  // :
+
+        let d2 = (seconds / 100) % 10;
+        let d1 = (seconds / 10) % 10;
+        let d0 = seconds % 10;
+        vga_write_char_color(2, 10, 48 + d2, green);
+        vga_write_char_color(3, 10, 48 + d1, green);
+        vga_write_char_color(4, 10, 48 + d0, green);
+        vga_write_char_color(5, 10, 115, green); // s
+    }
+}
+
+fn handle_keyboard() {
+    let scancode = inb(0x60);
+
+    serial_out(75);  // K
+    serial_out(66);  // B
+    serial_out(58);  // :
+    serial_print_hex64(scancode as u64);
+    serial_newline();
+}
+
+// ============================================================
+// Interrupt Initialization
+// ============================================================
+
+fn init_interrupts() {
+    let white = vga_color(COLOR_WHITE, COLOR_BLACK);
+    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
+
+    // Line 9: "INT init..."
+    vga_write_char(0, 9, 73, white);   // I
+    vga_write_char(1, 9, 78, white);   // N
+    vga_write_char(2, 9, 84, white);   // T
+    vga_write_char(3, 9, 32, white);   // space
+    vga_write_char(4, 9, 105, white);  // i
+    vga_write_char(5, 9, 110, white);  // n
+    vga_write_char(6, 9, 105, white);  // i
+    vga_write_char(7, 9, 116, white);  // t
+
+    // Initialize PIC (remap IRQs to 32-47)
+    pic_init();
+
+    // Initialize PIT timer (~100 Hz)
+    timer_init();
+
+    // Initialize IDT with ISR stubs
+    idt_init();
+
+    // Enable interrupts
+    sti();
+
+    // Update display: "INT OK"
+    vga_write_char(9, 9, 79, green);   // O
+    vga_write_char(10, 9, 75, green);  // K
+
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(84);  // T
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
+// ============================================================
 // Kernel Entry Point
 // ============================================================
 
 fn _start() {
-    // Disable interrupts
+    // Disable interrupts during setup
     cli();
 
     // Debug: write "KERNEL\n" to serial
@@ -571,7 +1037,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // Line 0: "Genesis Kernel v0.2.0"
+    // Line 0: "Genesis Kernel v0.3.0"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -590,26 +1056,26 @@ fn _start() {
     vga_write_char(15, 0, 118, white); // v
     vga_write_char(16, 0, 48, white);  // 0
     vga_write_char(17, 0, 46, white);  // .
-    vga_write_char(18, 0, 50, white);  // 2
+    vga_write_char(18, 0, 51, white);  // 3
     vga_write_char(19, 0, 46, white);  // .
     vga_write_char(20, 0, 48, white);  // 0
 
-    serial_out(118);
-    serial_out(48);
-    serial_out(46);
-    serial_out(50);
-    serial_out(46);
-    serial_out(48);
+    serial_out(118); // v
+    serial_out(48);  // 0
+    serial_out(46);  // .
+    serial_out(51);  // 3
+    serial_out(46);  // .
+    serial_out(48);  // 0
     serial_newline();
 
-    // NOTE: Genesis Lang has codegen bugs preventing proper inline asm output handling
-    // The multiboot pointer read is optimized away by LLVM
-    // For now, skip multiboot parsing and use default 128MB memory limit
+    // Initialize memory
     let mb_info_addr: i64 = 0;
-
     let mm_ok = init_memory(mb_info_addr);
 
-    // Halt
+    // Initialize interrupts
+    init_interrupts();
+
+    // Main loop with halt
     loop {
         hlt();
     }

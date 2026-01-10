@@ -1,0 +1,204 @@
+// Genesis Kernel - IDT (Interrupt Descriptor Table)
+// x86_64 IDT setup with 256 entries
+
+// ============================================================
+// Constants
+// ============================================================
+
+const IDT_ENTRIES: i64 = 256;
+const IDT_ENTRY_SIZE: i64 = 16;  // Each entry is 16 bytes in x86_64
+const IDT_SIZE: i64 = 4096;      // 256 * 16 = 4096 bytes
+
+// IDT is placed at 0x410000 (after PMM state at 0x408000)
+const IDT_ADDR: i64 = 0x410000;
+const IDTR_ADDR: i64 = 0x411000; // IDTR structure (10 bytes)
+
+// Gate types
+const GATE_INTERRUPT: i64 = 0x8E;  // Present + DPL0 + Interrupt Gate (0xE)
+const GATE_TRAP: i64 = 0x8F;       // Present + DPL0 + Trap Gate (0xF)
+
+// Code segment selector
+const KERNEL_CS: i64 = 0x08;
+
+// ============================================================
+// External: ISR stub table from assembly
+// ============================================================
+
+extern fn get_isr_stub_table() -> i64;
+
+// ============================================================
+// Memory Access Functions
+// ============================================================
+
+fn write_u16(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movw %ax, (%rcx)",
+            in("rcx") addr,
+            in("ax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn write_u32(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movl %eax, (%rcx)",
+            in("rcx") addr,
+            in("eax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_u64_ptr(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rcx), %rax",
+            in("rcx") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================
+// IDT Entry Setup
+// ============================================================
+
+/// Set an IDT entry
+/// index: 0-255
+/// handler: ISR handler address
+/// gate_type: GATE_INTERRUPT or GATE_TRAP
+fn idt_set_gate(index: i64, handler: i64, gate_type: i64) {
+    let entry_addr = IDT_ADDR + (index * IDT_ENTRY_SIZE);
+
+    // Extract handler address parts
+    let offset_low = handler & 0xFFFF;
+    let offset_mid = (handler >> 16) & 0xFFFF;
+    let offset_high = (handler >> 32) & 0xFFFFFFFF;
+
+    // Entry format (16 bytes):
+    // [0-1]   offset_low (16 bits)
+    // [2-3]   selector (16 bits) = 0x08 (kernel code segment)
+    // [4]     IST (3 bits) + reserved (5 bits) = 0
+    // [5]     type_attr (8 bits) = gate_type
+    // [6-7]   offset_mid (16 bits)
+    // [8-11]  offset_high (32 bits)
+    // [12-15] reserved (32 bits) = 0
+
+    write_u16(entry_addr + 0, offset_low);          // offset_low
+    write_u16(entry_addr + 2, KERNEL_CS);           // selector
+    write_u16(entry_addr + 4, gate_type << 8);      // IST=0, type_attr
+    write_u16(entry_addr + 6, offset_mid);          // offset_mid
+    write_u32(entry_addr + 8, offset_high);         // offset_high
+    write_u32(entry_addr + 12, 0);                  // reserved
+}
+
+/// Clear all IDT entries
+fn idt_clear() {
+    let mut i: i64 = 0;
+    while i < IDT_SIZE {
+        let addr = IDT_ADDR + i;
+        unsafe {
+            asm!(
+                "movq $0, (%rcx)",
+                in("rcx") addr,
+                options(nostack, att_syntax)
+            );
+        }
+        i = i + 8;
+    }
+}
+
+// ============================================================
+// IDT Initialization
+// ============================================================
+
+/// Initialize the IDT with exception and IRQ handlers
+pub fn idt_init() {
+    // Clear all entries first
+    idt_clear();
+
+    // Get pointer to ISR stub table (defined in assembly)
+    // The stub table is an array of 48 function pointers (exceptions + IRQs)
+    let stub_table = get_isr_stub_ptr();
+
+    // Set up exception handlers (0-31)
+    let mut i: i64 = 0;
+    while i < 32 {
+        let handler = read_u64_ptr(stub_table + (i * 8));
+        idt_set_gate(i, handler, GATE_INTERRUPT);
+        i = i + 1;
+    }
+
+    // Set up IRQ handlers (32-47)
+    while i < 48 {
+        let handler = read_u64_ptr(stub_table + (i * 8));
+        idt_set_gate(i, handler, GATE_INTERRUPT);
+        i = i + 1;
+    }
+
+    // Load the IDT
+    idt_load();
+}
+
+/// Get pointer to ISR stub table
+fn get_isr_stub_ptr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea isr_stub_table(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+/// Load the IDT using LIDT instruction
+fn idt_load() {
+    // Set up IDTR structure at IDTR_ADDR
+    // [0-1] limit (16 bits) = IDT_SIZE - 1
+    // [2-9] base (64 bits) = IDT_ADDR
+
+    let limit = (IDT_ENTRIES * IDT_ENTRY_SIZE - 1) as i64;
+
+    write_u16(IDTR_ADDR, limit);
+
+    // Write base address (64-bit)
+    unsafe {
+        asm!(
+            "movq %rax, 2(%rcx)",
+            in("rcx") IDTR_ADDR,
+            in("rax") IDT_ADDR,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // Load IDT
+    unsafe {
+        asm!(
+            "lidt (%rax)",
+            in("rax") IDTR_ADDR,
+            options(nostack)
+        );
+    }
+}
+
+/// Enable interrupts
+pub fn sti() {
+    unsafe {
+        asm!("sti", options(nomem, nostack));
+    }
+}
+
+/// Disable interrupts
+pub fn cli() {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
+}

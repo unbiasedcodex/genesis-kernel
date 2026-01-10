@@ -1,0 +1,375 @@
+// Genesis Kernel - Interrupt Handlers
+// Exception and IRQ handlers
+
+// ============================================================
+// Imports
+// ============================================================
+
+use crate::interrupts::pic::pic_send_eoi;
+
+// ============================================================
+// Constants
+// ============================================================
+
+const VGA_BUFFER: i64 = 0xB8000;
+const VGA_WIDTH: i64 = 80;
+
+// Serial port
+const COM1: i64 = 0x3F8;
+
+// Timer tick counter (stored at fixed address)
+const TICK_COUNT_ADDR: i64 = 0x412000;
+
+// PIT (Programmable Interval Timer) ports
+const PIT_CHANNEL0: i64 = 0x40;
+const PIT_CMD: i64 = 0x43;
+
+// PIT frequency: 1193182 Hz / divisor = interrupt frequency
+// divisor = 11932 gives ~100 Hz (10ms intervals)
+const PIT_DIVISOR: i64 = 11932;
+
+// ============================================================
+// I/O Functions
+// ============================================================
+
+fn outb(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn serial_out(ch: i64) {
+    outb(COM1, ch);
+}
+
+fn serial_newline() {
+    serial_out(10);
+}
+
+// ============================================================
+// Memory Access
+// ============================================================
+
+fn read_u64_at(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rcx), %rax",
+            in("rcx") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u64_at(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rax, (%rcx)",
+            in("rcx") addr,
+            in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_stack_u64(base: i64, offset: i64) -> u64 {
+    let addr = base + offset;
+    read_u64_at(addr)
+}
+
+// ============================================================
+// VGA Output
+// ============================================================
+
+fn vga_write_char(x: i64, y: i64, ch: i64, color: i64) {
+    let offset = (y * VGA_WIDTH + x) * 2;
+    let addr = VGA_BUFFER + offset;
+    unsafe {
+        let ptr = addr as *mut u8;
+        volatile_write_u8(ptr, ch as u8);
+        let color_ptr = (addr + 1) as *mut u8;
+        volatile_write_u8(color_ptr, color as u8);
+    }
+}
+
+fn vga_write_hex_byte(x: i64, y: i64, value: u64, color: i64) {
+    let high = (value >> 4) & 0xF;
+    let low = value & 0xF;
+
+    let ch_high: i64 = if high < 10 { 48 + (high as i64) } else { 55 + (high as i64) };
+    let ch_low: i64 = if low < 10 { 48 + (low as i64) } else { 55 + (low as i64) };
+
+    vga_write_char(x, y, ch_high, color);
+    vga_write_char(x + 1, y, ch_low, color);
+}
+
+// ============================================================
+// Timer Initialization
+// ============================================================
+
+/// Initialize the PIT timer at ~100 Hz
+pub fn timer_init() {
+    // Initialize tick counter
+    write_u64_at(TICK_COUNT_ADDR, 0);
+
+    // PIT command: channel 0, access mode lobyte/hibyte, mode 3 (square wave)
+    // Command byte: 0x36 = 00 11 011 0
+    //   bits 6-7: channel 0
+    //   bits 4-5: access mode (lobyte/hibyte)
+    //   bits 1-3: mode 3 (square wave generator)
+    //   bit 0: binary mode
+    outb(PIT_CMD, 0x36);
+
+    // Send divisor (low byte first, then high byte)
+    let divisor_low = PIT_DIVISOR & 0xFF;
+    let divisor_high = (PIT_DIVISOR >> 8) & 0xFF;
+
+    outb(PIT_CHANNEL0, divisor_low);
+    outb(PIT_CHANNEL0, divisor_high);
+}
+
+/// Get current tick count
+pub fn timer_get_ticks() -> u64 {
+    read_u64_at(TICK_COUNT_ADDR)
+}
+
+// ============================================================
+// Exception Names
+// ============================================================
+
+fn serial_print_exception_name(num: i64) {
+    // Print exception number and name to serial
+    serial_out(69);  // E
+    serial_out(88);  // X
+    serial_out(67);  // C
+    serial_out(58);  // :
+
+    // Print number
+    let d1 = (num / 10) % 10;
+    let d0 = num % 10;
+    if num >= 10 {
+        serial_out(48 + d1);
+    }
+    serial_out(48 + d0);
+    serial_out(32);  // space
+
+    // Print name based on exception number
+    if num == 0 {
+        // #DE - Divide Error
+        serial_out(68); serial_out(73); serial_out(86); // DIV
+        serial_out(47); serial_out(48); // /0
+    } else if num == 6 {
+        // #UD - Invalid Opcode
+        serial_out(73); serial_out(78); serial_out(86); // INV
+        serial_out(79); serial_out(80); // OP
+    } else if num == 8 {
+        // #DF - Double Fault
+        serial_out(68); serial_out(66); serial_out(76); // DBL
+        serial_out(70); serial_out(76); serial_out(84); // FLT
+    } else if num == 13 {
+        // #GP - General Protection
+        serial_out(71); serial_out(80); // GP
+        serial_out(70); serial_out(65); serial_out(85); serial_out(76); serial_out(84); // FAULT
+    } else if num == 14 {
+        // #PF - Page Fault
+        serial_out(80); serial_out(71); // PG
+        serial_out(70); serial_out(65); serial_out(85); serial_out(76); serial_out(84); // FAULT
+    }
+
+    serial_newline();
+}
+
+// ============================================================
+// Main ISR Handler (called from assembly)
+// ============================================================
+
+/// Main interrupt handler - called from isr_common in assembly
+/// frame_ptr points to the saved register state on the stack
+#[no_mangle]
+pub fn isr_handler(frame_ptr: i64) {
+    // Stack layout from frame_ptr:
+    //   [0]   = saved DS
+    //   [8]   = r15
+    //   ...
+    //   [120] = rax
+    //   [128] = interrupt number
+    //   [136] = error code
+    //   [144] = RIP (pushed by CPU)
+    //   [152] = CS
+    //   [160] = RFLAGS
+    //   [168] = RSP (if privilege change)
+    //   [176] = SS (if privilege change)
+
+    let int_num = read_stack_u64(frame_ptr, 128) as i64;
+    let error_code = read_stack_u64(frame_ptr, 136);
+    let rip = read_stack_u64(frame_ptr, 144);
+
+    if int_num < 32 {
+        // CPU Exception
+        handle_exception(int_num, error_code, rip, frame_ptr);
+    } else if int_num < 48 {
+        // Hardware IRQ
+        let irq = int_num - 32;
+        handle_irq(irq);
+    }
+    // Interrupts 48-255 are unused for now
+}
+
+// ============================================================
+// Exception Handler
+// ============================================================
+
+fn handle_exception(num: i64, error_code: u64, rip: u64, frame_ptr: i64) {
+    // Print exception info to serial
+    serial_print_exception_name(num);
+
+    // Print error code for relevant exceptions
+    if num == 8 || num == 10 || num == 11 || num == 12 || num == 13 || num == 14 {
+        serial_out(69); serial_out(82); serial_out(82); serial_out(58); // ERR:
+        serial_print_hex(error_code);
+        serial_newline();
+    }
+
+    // Print RIP
+    serial_out(82); serial_out(73); serial_out(80); serial_out(58); // RIP:
+    serial_print_hex(rip);
+    serial_newline();
+
+    // For page fault, read CR2 (faulting address)
+    if num == 14 {
+        let cr2 = read_cr2();
+        serial_out(67); serial_out(82); serial_out(50); serial_out(58); // CR2:
+        serial_print_hex(cr2);
+        serial_newline();
+    }
+
+    // Display on VGA (row 20)
+    let red: i64 = 0x4F;  // White on red
+    vga_write_char(0, 20, 69, red);   // E
+    vga_write_char(1, 20, 88, red);   // X
+    vga_write_char(2, 20, 67, red);   // C
+    vga_write_char(3, 20, 32, red);   // space
+    vga_write_hex_byte(4, 20, num as u64, red);
+
+    // Halt on fatal exceptions
+    if num == 8 || num == 13 || num == 14 {
+        serial_out(72); serial_out(65); serial_out(76); serial_out(84); // HALT
+        serial_newline();
+        loop {
+            unsafe { asm!("cli; hlt", options(nomem, nostack)); }
+        }
+    }
+}
+
+fn read_cr2() -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "mov %cr2, %rax",
+            lateout("rax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn serial_print_hex(value: u64) {
+    serial_out(48);  // '0'
+    serial_out(120); // 'x'
+
+    let mut i: i64 = 60;
+    while i >= 0 {
+        let nibble = ((value >> (i as u64)) & 0xF) as i64;
+        let ch: i64 = if nibble < 10 { 48 + nibble } else { 55 + nibble };
+        serial_out(ch);
+        i = i - 4;
+    }
+}
+
+// ============================================================
+// IRQ Handler
+// ============================================================
+
+fn handle_irq(irq: i64) {
+    if irq == 0 {
+        // Timer interrupt
+        handle_timer();
+    } else if irq == 1 {
+        // Keyboard interrupt
+        handle_keyboard();
+    }
+    // Other IRQs are ignored for now
+
+    // Send End of Interrupt
+    pic_send_eoi(irq);
+}
+
+// ============================================================
+// Timer Handler
+// ============================================================
+
+fn handle_timer() {
+    // Increment tick counter
+    let ticks = read_u64_at(TICK_COUNT_ADDR);
+    write_u64_at(TICK_COUNT_ADDR, ticks + 1);
+
+    // Every 100 ticks (~1 second at 100Hz), print TICK
+    if (ticks + 1) % 100 == 0 {
+        serial_out(84);  // T
+        serial_out(73);  // I
+        serial_out(67);  // C
+        serial_out(75);  // K
+        serial_newline();
+
+        // Also update VGA tick counter display (row 10)
+        let seconds = ((ticks + 1) / 100) as i64;
+        let green: i64 = 0x0A;
+        vga_write_char(0, 10, 84, green);  // T
+        vga_write_char(1, 10, 58, green);  // :
+
+        // Display seconds counter
+        let d2 = (seconds / 100) % 10;
+        let d1 = (seconds / 10) % 10;
+        let d0 = seconds % 10;
+        vga_write_char(2, 10, 48 + d2, green);
+        vga_write_char(3, 10, 48 + d1, green);
+        vga_write_char(4, 10, 48 + d0, green);
+        vga_write_char(5, 10, 115, green); // s
+    }
+}
+
+// ============================================================
+// Keyboard Handler
+// ============================================================
+
+fn handle_keyboard() {
+    // Read scancode from keyboard data port
+    let scancode = inb(0x60);
+
+    // Print scancode to serial (for debugging)
+    serial_out(75);  // K
+    serial_out(66);  // B
+    serial_out(58);  // :
+    serial_print_hex(scancode as u64);
+    serial_newline();
+}
+
+fn inb(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "in %dx, %al",
+            in("dx") port,
+            lateout("al") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}

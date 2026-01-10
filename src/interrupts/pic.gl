@@ -1,0 +1,157 @@
+// Genesis Kernel - 8259 PIC (Programmable Interrupt Controller)
+// Remaps IRQs to avoid conflict with CPU exceptions
+
+// ============================================================
+// PIC I/O Ports
+// ============================================================
+
+const PIC1_CMD: i64 = 0x20;      // Master PIC command port
+const PIC1_DATA: i64 = 0x21;     // Master PIC data port
+const PIC2_CMD: i64 = 0xA0;      // Slave PIC command port
+const PIC2_DATA: i64 = 0xA1;     // Slave PIC data port
+
+// ============================================================
+// PIC Commands
+// ============================================================
+
+const ICW1_INIT: i64 = 0x10;     // Initialization
+const ICW1_ICW4: i64 = 0x01;     // ICW4 needed
+const ICW4_8086: i64 = 0x01;     // 8086/88 mode
+
+const PIC_EOI: i64 = 0x20;       // End of interrupt
+
+// ============================================================
+// IRQ Offsets (after remapping)
+// ============================================================
+
+const PIC1_OFFSET: i64 = 32;     // Master PIC: IRQ 0-7 -> INT 32-39
+const PIC2_OFFSET: i64 = 40;     // Slave PIC: IRQ 8-15 -> INT 40-47
+
+// ============================================================
+// I/O Port Functions
+// ============================================================
+
+fn outb(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn inb(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "in %dx, %al",
+            in("dx") port,
+            lateout("al") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn io_wait() {
+    // Short delay by writing to unused port
+    outb(0x80, 0);
+}
+
+// ============================================================
+// PIC Functions
+// ============================================================
+
+/// Initialize and remap the 8259 PIC
+/// Master PIC: IRQ 0-7 -> Interrupt 32-39
+/// Slave PIC: IRQ 8-15 -> Interrupt 40-47
+pub fn pic_init() {
+    // Save current masks
+    let mask1 = inb(PIC1_DATA);
+    let mask2 = inb(PIC2_DATA);
+
+    // Start initialization sequence (ICW1)
+    outb(PIC1_CMD, ICW1_INIT | ICW1_ICW4);
+    io_wait();
+    outb(PIC2_CMD, ICW1_INIT | ICW1_ICW4);
+    io_wait();
+
+    // Set vector offsets (ICW2)
+    outb(PIC1_DATA, PIC1_OFFSET);  // Master: IRQ 0-7 -> INT 32-39
+    io_wait();
+    outb(PIC2_DATA, PIC2_OFFSET);  // Slave: IRQ 8-15 -> INT 40-47
+    io_wait();
+
+    // Configure cascading (ICW3)
+    outb(PIC1_DATA, 4);            // Master: slave on IRQ2 (bit 2)
+    io_wait();
+    outb(PIC2_DATA, 2);            // Slave: cascade identity 2
+    io_wait();
+
+    // Set 8086 mode (ICW4)
+    outb(PIC1_DATA, ICW4_8086);
+    io_wait();
+    outb(PIC2_DATA, ICW4_8086);
+    io_wait();
+
+    // Restore saved masks (or set new ones)
+    // For now, mask all except timer (IRQ0) and keyboard (IRQ1)
+    outb(PIC1_DATA, 0xFC);         // Enable IRQ0 (timer), IRQ1 (keyboard)
+    outb(PIC2_DATA, 0xFF);         // Mask all slave IRQs
+}
+
+/// Send End of Interrupt to PIC
+/// Must be called at end of IRQ handler
+pub fn pic_send_eoi(irq: i64) {
+    if irq >= 8 {
+        // IRQ came from slave PIC
+        outb(PIC2_CMD, PIC_EOI);
+    }
+    // Always send to master (for both master and slave IRQs)
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+/// Disable (mask) a specific IRQ
+pub fn pic_mask_irq(irq: i64) {
+    let port: i64;
+    let irq_line: i64;
+
+    if irq < 8 {
+        port = PIC1_DATA;
+        irq_line = irq;
+    } else {
+        port = PIC2_DATA;
+        irq_line = irq - 8;
+    }
+
+    let current = inb(port);
+    let mask = 1 << irq_line;
+    outb(port, current | mask);
+}
+
+/// Enable (unmask) a specific IRQ
+pub fn pic_unmask_irq(irq: i64) {
+    let port: i64;
+    let irq_line: i64;
+
+    if irq < 8 {
+        port = PIC1_DATA;
+        irq_line = irq;
+    } else {
+        port = PIC2_DATA;
+        irq_line = irq - 8;
+    }
+
+    let current = inb(port);
+    let mask = 1 << irq_line;
+    let inverted_mask = mask ^ 0xFF;
+    outb(port, current & inverted_mask);
+}
+
+/// Disable all IRQs (mask all)
+pub fn pic_disable() {
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}

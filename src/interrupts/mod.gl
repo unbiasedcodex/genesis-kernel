@@ -1,0 +1,14 @@
+// Genesis Kernel - Interrupts Module
+// Re-exports public functions from submodules
+
+pub mod idt;
+pub mod pic;
+pub mod handlers;
+
+// Re-export main initialization functions
+pub use idt::idt_init;
+pub use idt::sti;
+pub use idt::cli;
+pub use pic::pic_init;
+pub use handlers::timer_init;
+pub use handlers::timer_get_ticks;

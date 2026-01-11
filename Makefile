@@ -1,5 +1,5 @@
 # Genesis Kernel Makefile
-# Phase 3: Interrupts
+# Phase 4: Processes
 
 # Tools
 GLC = /root/genesisos/genesis-lang/target/release/glc
@@ -19,12 +19,14 @@ ISO = genesis.iso
 # Object files
 OBJ_BOOT = arch/x86_64/boot.o
 OBJ_ISR = arch/x86_64/isr.o
+OBJ_CTX = arch/x86_64/context.o
 OBJ_KERNEL = kernel.o
-OBJS = $(OBJ_BOOT) $(OBJ_ISR) $(OBJ_KERNEL)
+OBJS = $(OBJ_BOOT) $(OBJ_ISR) $(OBJ_CTX) $(OBJ_KERNEL)
 
 # Source files
 SRC_BOOT = arch/x86_64/boot.asm
 SRC_ISR = arch/x86_64/isr.asm
+SRC_CTX = arch/x86_64/context.asm
 SRC_KERNEL = src/main.gl
 
 # Default target
@@ -43,6 +45,10 @@ $(OBJ_BOOT): $(SRC_BOOT)
 
 # Compile ISR stubs (interrupt service routines)
 $(OBJ_ISR): $(SRC_ISR)
+	$(NASM) $(NASMFLAGS) $< -o $@
+
+# Compile context switch routines
+$(OBJ_CTX): $(SRC_CTX)
 	$(NASM) $(NASMFLAGS) $< -o $@
 
 # Compile Genesis kernel (64-bit)

@@ -153,6 +153,15 @@ isr_common:
     mov rdi, rsp            ; First argument: pointer to interrupt frame
     call isr_handler
 
+    ; Check if context switch is needed by reading SWITCH_RSP_ADDR (0x422010)
+    mov rax, [0x422010]
+    test rax, rax
+    jz .no_switch
+
+    ; Context switch: use new RSP from memory
+    mov rsp, rax
+
+.no_switch:
     ; Restore segment registers
     pop rax
     mov ds, ax

@@ -1,6 +1,6 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
-// Phase 3: Interrupts
+// Phase 4: Processes
 
 // ============================================================
 // Constants
@@ -51,6 +51,34 @@ const COM1: i64 = 0x3F8;
 // Gate types
 const GATE_INTERRUPT: i64 = 0x8E;
 const KERNEL_CS: i64 = 0x08;
+
+// Process management
+const MAX_PROCS: i64 = 8;
+const PCB_SIZE: i64 = 64;
+const PROC_TABLE_ADDR: i64 = 0x420000;    // PCB array
+const CURRENT_PID_ADDR: i64 = 0x421000;   // Current process ID
+const NUM_PROCS_ADDR: i64 = 0x421008;     // Number of active processes
+const SCHED_ENABLED_ADDR: i64 = 0x421010; // Scheduler enabled flag
+const PROC_STACK_BASE: i64 = 0x500000;    // Base for process stacks
+const PROC_STACK_SIZE: i64 = 0x4000;      // 16KB per process
+
+// PCB offsets
+const PCB_PID: i64 = 0;
+const PCB_STATE: i64 = 8;
+const PCB_RSP: i64 = 16;
+const PCB_STACK_BASE: i64 = 24;
+
+// Process states
+const PROC_UNUSED: i64 = 0;
+const PROC_READY: i64 = 1;
+const PROC_RUNNING: i64 = 2;
+
+// Test process counters (persistent memory)
+const PROC_A_COUNTER: i64 = 0x422000;
+const PROC_B_COUNTER: i64 = 0x422008;
+
+// Context switch RSP (set by isr_handler, read by isr.asm)
+const SWITCH_RSP_ADDR: i64 = 0x422010;
 
 // ============================================================
 // Bitwise Operations Helper Functions
@@ -853,8 +881,11 @@ fn serial_print_hex64(value: u64) {
 }
 
 // ISR handler - called from assembly (isr_common)
-// Name must match the extern declaration in isr.asm
+// Sets SWITCH_RSP_ADDR to new RSP if context switch needed, 0 otherwise
 pub fn isr_handler(frame_ptr: i64) {
+    // Clear switch RSP at start
+    write_u64_addr(SWITCH_RSP_ADDR, 0);
+
     // Stack layout:
     //   [128] = interrupt number
     //   [136] = error code
@@ -871,6 +902,24 @@ pub fn isr_handler(frame_ptr: i64) {
         // Hardware IRQ
         let irq = int_num - 32;
         handle_irq(irq);
+
+        // On timer interrupt (IRQ 0), check for context switch
+        if irq == 0 {
+            let current = get_current_pid();
+
+            // Only save RSP if process was RUNNING (was scheduled before)
+            // This prevents overwriting initial RSP of idle process
+            let current_state = pcb_get_state(current);
+            if current_state == PROC_RUNNING {
+                pcb_set_rsp(current, frame_ptr);
+            }
+
+            // Get next process RSP (scheduler updates current_pid)
+            let new_rsp = schedule_pick_next();
+            if new_rsp != 0 {
+                write_u64_addr(SWITCH_RSP_ADDR, new_rsp as u64);
+            }
+        }
     }
 }
 
@@ -1015,6 +1064,343 @@ fn init_interrupts() {
 }
 
 // ============================================================
+// Process Management
+// ============================================================
+
+// Assembly function wrappers
+
+// Placeholder - context switch now done in isr.asm
+fn do_context_switch(old_rsp_ptr: i64, new_rsp: i64) {
+    // Not used anymore - switch done via return value in isr_handler
+}
+
+// Initialize process stack with fake interrupt frame
+// Returns the initial RSP to store in PCB
+fn init_process_stack(stack_top: i64, entry: i64) -> i64 {
+    let mut ptr = stack_top;
+
+    // Push SS (kernel data segment)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0x10);
+
+    // Push RSP (process stack pointer after iretq)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, (stack_top - 8) as u64);
+
+    // Push RFLAGS (IF=1 to enable interrupts)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0x202);
+
+    // Push CS (kernel code segment)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0x08);
+
+    // Push RIP (entry point)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, entry as u64);
+
+    // Push error code (0)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0);
+
+    // Push interrupt number (0)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0);
+
+    // Push 15 GPRs (all zeros): rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15
+    // Note: isr_common pushes 15 GPRs, NOT 16!
+    let mut i: i64 = 0;
+    while i < 15 {
+        ptr = ptr - 8;
+        write_u64_addr(ptr, 0);
+        i = i + 1;
+    }
+
+    // Push DS (kernel data segment)
+    ptr = ptr - 8;
+    write_u64_addr(ptr, 0x10);
+
+    ptr
+}
+
+fn asm_get_rsp() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "mov %rsp, %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn pcb_addr(pid: i64) -> i64 {
+    PROC_TABLE_ADDR + (pid * PCB_SIZE)
+}
+
+fn pcb_get_pid(pid: i64) -> i64 {
+    let addr = pcb_addr(pid);
+    read_u64_addr(addr + PCB_PID) as i64
+}
+
+fn pcb_get_state(pid: i64) -> i64 {
+    let addr = pcb_addr(pid);
+    read_u64_addr(addr + PCB_STATE) as i64
+}
+
+fn pcb_set_state(pid: i64, state: i64) {
+    let addr = pcb_addr(pid);
+    write_u64_addr(addr + PCB_STATE, state as u64);
+}
+
+fn pcb_get_rsp(pid: i64) -> i64 {
+    let addr = pcb_addr(pid);
+    read_u64_addr(addr + PCB_RSP) as i64
+}
+
+fn pcb_set_rsp(pid: i64, rsp: i64) {
+    let addr = pcb_addr(pid);
+    write_u64_addr(addr + PCB_RSP, rsp as u64);
+}
+
+fn get_current_pid() -> i64 {
+    read_u64_addr(CURRENT_PID_ADDR) as i64
+}
+
+fn set_current_pid(pid: i64) {
+    write_u64_addr(CURRENT_PID_ADDR, pid as u64);
+}
+
+fn get_num_procs() -> i64 {
+    read_u64_addr(NUM_PROCS_ADDR) as i64
+}
+
+fn is_sched_enabled() -> bool {
+    read_u64_addr(SCHED_ENABLED_ADDR) != 0
+}
+
+fn enable_scheduler() {
+    write_u64_addr(SCHED_ENABLED_ADDR, 1);
+}
+
+// Create a new process
+fn proc_create(entry: i64) -> i64 {
+    let num_procs = get_num_procs();
+    if num_procs >= MAX_PROCS {
+        return -1;
+    }
+
+    let pid = num_procs;
+    let pcb = pcb_addr(pid);
+
+    // Calculate stack for this process
+    let stack_base = PROC_STACK_BASE + (pid * PROC_STACK_SIZE);
+    let stack_top = stack_base + PROC_STACK_SIZE;
+
+    // Initialize the process stack with fake interrupt frame
+    let initial_rsp = init_process_stack(stack_top, entry);
+
+    // Fill PCB
+    write_u64_addr(pcb + PCB_PID, pid as u64);
+    write_u64_addr(pcb + PCB_STATE, PROC_READY as u64);
+    write_u64_addr(pcb + PCB_RSP, initial_rsp as u64);
+    write_u64_addr(pcb + PCB_STACK_BASE, stack_base as u64);
+
+    // Increment process count
+    write_u64_addr(NUM_PROCS_ADDR, (num_procs + 1) as u64);
+
+    pid
+}
+
+// ============================================================
+// Scheduler
+// ============================================================
+
+// Returns the new RSP if switch needed, 0 if no switch
+fn schedule_pick_next() -> i64 {
+    if !is_sched_enabled() {
+        return 0;
+    }
+
+    let num_procs = get_num_procs();
+    if num_procs < 2 {
+        return 0;
+    }
+
+    let current = get_current_pid();
+
+    // Find next ready process (round-robin)
+    let mut next = (current + 1) % num_procs;
+    let mut checked: i64 = 0;
+
+    while checked < num_procs {
+        let state = pcb_get_state(next);
+        if state == PROC_READY || state == PROC_RUNNING {
+            break;
+        }
+        next = (next + 1) % num_procs;
+        checked = checked + 1;
+    }
+
+    // No switch needed if same process
+    if next == current {
+        return 0;
+    }
+
+    // Update states
+    pcb_set_state(current, PROC_READY);
+    pcb_set_state(next, PROC_RUNNING);
+
+    // Save current RSP will be done by caller using frame_ptr
+    // Return the new RSP
+    let new_rsp = pcb_get_rsp(next);
+
+    // Update current PID
+    set_current_pid(next);
+
+    new_rsp
+}
+
+// ============================================================
+// Test Processes
+// ============================================================
+
+fn process_a() {
+    // Print 'A' on each run
+    outb(COM1, 65);
+
+    loop {
+        hlt();  // Wait for next scheduler tick
+    }
+}
+
+fn process_b() {
+    // Print 'B' on each run
+    outb(COM1, 66);
+
+    loop {
+        hlt();  // Wait for next scheduler tick
+    }
+}
+
+fn process_idle() {
+    loop {
+        hlt();
+    }
+}
+
+fn get_process_a_addr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea process_a(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn get_process_b_addr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea process_b(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn get_process_idle_addr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea process_idle(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================
+// Process Initialization
+// ============================================================
+
+fn init_processes() {
+    let white = vga_color(COLOR_WHITE, COLOR_BLACK);
+    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
+
+    // Line 11: "PROC init..."
+    vga_write_char(0, 11, 80, white);   // P
+    vga_write_char(1, 11, 82, white);   // R
+    vga_write_char(2, 11, 79, white);   // O
+    vga_write_char(3, 11, 67, white);   // C
+    vga_write_char(4, 11, 32, white);   // space
+    vga_write_char(5, 11, 105, white);  // i
+    vga_write_char(6, 11, 110, white);  // n
+    vga_write_char(7, 11, 105, white);  // i
+    vga_write_char(8, 11, 116, white);  // t
+
+    // Clear process table
+    let mut i: i64 = 0;
+    while i < MAX_PROCS * PCB_SIZE {
+        write_u64_addr(PROC_TABLE_ADDR + i, 0);
+        i = i + 8;
+    }
+
+    // Initialize scheduler state
+    write_u64_addr(CURRENT_PID_ADDR, 0);
+    write_u64_addr(NUM_PROCS_ADDR, 0);
+    write_u64_addr(SCHED_ENABLED_ADDR, 0);
+
+    // Initialize test process counters
+    write_u64_addr(PROC_A_COUNTER, 0);
+    write_u64_addr(PROC_B_COUNTER, 0);
+
+    // Create idle process (PID 0)
+    // Note: PID 0 starts as READY, not RUNNING
+    // This prevents saving kernel stack as P0's RSP on first switch
+    let idle_addr = get_process_idle_addr();
+    let pid0 = proc_create(idle_addr);
+    // pcb_set_state stays READY from proc_create
+    set_current_pid(pid0);
+
+    // Create test process A (PID 1)
+    let proc_a_addr = get_process_a_addr();
+    proc_create(proc_a_addr);
+
+    // Create test process B (PID 2)
+    let proc_b_addr = get_process_b_addr();
+    proc_create(proc_b_addr);
+
+    // Enable scheduler
+    enable_scheduler();
+
+    // Update display: "PROC OK"
+    vga_write_char(10, 11, 79, green);  // O
+    vga_write_char(11, 11, 75, green);  // K
+
+    serial_out(80);  // P
+    serial_out(82);  // R
+    serial_out(79);  // O
+    serial_out(67);  // C
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    let num = get_num_procs();
+    serial_out(78);  // N
+    serial_out(61);  // =
+    serial_out(48 + num);  // number
+    serial_newline();
+}
+
+// ============================================================
 // Kernel Entry Point
 // ============================================================
 
@@ -1037,7 +1423,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // Line 0: "Genesis Kernel v0.3.0"
+    // Line 0: "Genesis Kernel v0.4.0"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -1056,14 +1442,14 @@ fn _start() {
     vga_write_char(15, 0, 118, white); // v
     vga_write_char(16, 0, 48, white);  // 0
     vga_write_char(17, 0, 46, white);  // .
-    vga_write_char(18, 0, 51, white);  // 3
+    vga_write_char(18, 0, 52, white);  // 4
     vga_write_char(19, 0, 46, white);  // .
     vga_write_char(20, 0, 48, white);  // 0
 
     serial_out(118); // v
     serial_out(48);  // 0
     serial_out(46);  // .
-    serial_out(51);  // 3
+    serial_out(52);  // 4
     serial_out(46);  // .
     serial_out(48);  // 0
     serial_newline();
@@ -1072,7 +1458,10 @@ fn _start() {
     let mb_info_addr: i64 = 0;
     let mm_ok = init_memory(mb_info_addr);
 
-    // Initialize interrupts
+    // Initialize processes BEFORE interrupts (scheduler state must exist)
+    init_processes();
+
+    // Initialize interrupts (this enables timer which triggers scheduler)
     init_interrupts();
 
     // Main loop with halt

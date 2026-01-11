@@ -1,5 +1,5 @@
 # Genesis Kernel Makefile
-# Phase 4: Processes
+# Phase 6: User Space Servers
 
 # Tools
 GLC = /root/genesisos/genesis-lang/target/release/glc

@@ -16,6 +16,7 @@ MBOOT_CHECKSUM      equ -(MBOOT_MAGIC + MBOOT_FLAGS)
 ; Paging
 PAGE_PRESENT        equ 1 << 0
 PAGE_WRITE          equ 1 << 1
+PAGE_USER           equ 1 << 2
 PAGE_HUGE           equ 1 << 7
 
 ; ============================================================
@@ -34,14 +35,44 @@ align 4
 
 section .data
 
+; ============================================================
+; GDT (Global Descriptor Table) - 64-bit
+; ============================================================
+; Selector layout:
+;   0x00 = Null
+;   0x08 = Kernel Code64 (DPL 0)
+;   0x10 = Kernel Data   (DPL 0)
+;   0x18 = User Code64   (DPL 3) -> selector 0x1B with RPL=3
+;   0x20 = User Data     (DPL 3) -> selector 0x23 with RPL=3
+;   0x28 = TSS (16 bytes, filled at runtime)
+; ============================================================
+
 align 16
+global gdt64
 gdt64:
-    dq 0                        ; Null
-    dq 0x00AF9A000000FFFF       ; Code64
-    dq 0x00CF92000000FFFF       ; Data
+    dq 0                        ; 0x00: Null
+    dq 0x00AF9A000000FFFF       ; 0x08: Kernel Code64 (DPL=0)
+    dq 0x00CF92000000FFFF       ; 0x10: Kernel Data   (DPL=0)
+    dq 0x00AFFA000000FFFF       ; 0x18: User Code64   (DPL=3)
+    dq 0x00CFF2000000FFFF       ; 0x20: User Data     (DPL=3)
+global gdt64_tss
+gdt64_tss:
+    dq 0                        ; 0x28: TSS low  (filled at runtime)
+    dq 0                        ; 0x30: TSS high (filled at runtime)
+gdt64_end:
+
+; 32-bit compatible GDTR (for boot)
+global gdt64_ptr
 gdt64_ptr:
-    dw $ - gdt64 - 1
-    dd gdt64
+    dw gdt64_end - gdt64 - 1    ; Limit
+    dd gdt64                     ; Base (32-bit for boot)
+    dd 0                         ; Padding for alignment
+
+; 64-bit GDTR (for kernel reload)
+global gdt64_ptr64
+gdt64_ptr64:
+    dw gdt64_end - gdt64 - 1    ; Limit
+    dq gdt64                     ; Base (64-bit)
 
 ; ============================================================
 ; BSS
@@ -58,6 +89,33 @@ align 16
 stack_bottom:
     resb 65536
 stack_top:
+
+; ============================================================
+; TSS (Task State Segment) - 64-bit
+; ============================================================
+; Offset  Size  Description
+; 0x00    4     Reserved
+; 0x04    8     RSP0 (kernel stack for ring 0)
+; 0x0C    8     RSP1
+; 0x14    8     RSP2
+; 0x1C    8     Reserved
+; 0x24    8     IST1
+; 0x2C    8     IST2
+; 0x34    8     IST3
+; 0x3C    8     IST4
+; 0x44    8     IST5
+; 0x4C    8     IST6
+; 0x54    8     IST7
+; 0x5C    8     Reserved
+; 0x64    2     Reserved
+; 0x66    2     IOPB offset
+; Total: 104 bytes (0x68)
+; ============================================================
+
+align 16
+global tss64
+tss64:
+    resb 104
 
 
 ; ============================================================
@@ -109,19 +167,20 @@ _start_asm:
 
     ; PML4[0] -> PDPT
     mov eax, ecx
-    or eax, PAGE_PRESENT | PAGE_WRITE
+    or eax, PAGE_PRESENT | PAGE_WRITE | PAGE_USER
     mov [ebx], eax
 
     ; PDPT[0] -> PD
     mov eax, edx
-    or eax, PAGE_PRESENT | PAGE_WRITE
+    or eax, PAGE_PRESENT | PAGE_WRITE | PAGE_USER
     mov [ecx], eax
 
     ; PD[0..3] -> 4x 2MB pages (first 8MB identity mapped)
-    mov dword [edx +  0], 0x000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE
-    mov dword [edx +  8], 0x200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE
-    mov dword [edx + 16], 0x400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE
-    mov dword [edx + 24], 0x600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE
+    ; All pages marked PAGE_USER to allow ring 3 access (Phase 6 PoC)
+    mov dword [edx +  0], 0x000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx +  8], 0x200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 16], 0x400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 24], 0x600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
 
     ; Load CR3 with PML4 address
     mov eax, ebx

@@ -104,6 +104,16 @@ IRQ 14, 46          ; Primary ATA
 IRQ 15, 47          ; Secondary ATA
 
 ; ============================================================
+; System call handler (INT 0x80)
+; ============================================================
+
+global isr128
+isr128:
+    push qword 0                ; Dummy error code
+    push qword 128              ; Syscall interrupt number (0x80)
+    jmp isr_common
+
+; ============================================================
 ; Common ISR handler
 ; Saves all registers, calls C handler, restores and returns
 ; ============================================================
@@ -205,5 +215,10 @@ isr_stub_table:
     dq isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
     dq irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7
     dq irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15
+
+; Syscall stub pointer (entry 48 = isr128)
+global isr_syscall_ptr
+isr_syscall_ptr:
+    dq isr128
 
 section .note.GNU-stack noalloc noexec nowrite progbits

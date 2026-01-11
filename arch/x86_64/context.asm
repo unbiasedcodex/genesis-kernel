@@ -34,7 +34,7 @@ asm_context_switch:
     ret
 
 ; ============================================================
-; init_process_stack - Initialize a new process stack
+; init_process_stack_kernel - Initialize a KERNEL mode process stack
 ;
 ; Sets up a fake interrupt frame so the process can be
 ; "resumed" by the scheduler as if it was interrupted.
@@ -114,6 +114,85 @@ asm_init_stack:
     ret
 
 ; ============================================================
+; init_process_stack_user - Initialize a USER mode process stack
+;
+; Sets up a fake interrupt frame for RING 3 process.
+; The process will start in user mode after IRETQ.
+;
+; Arguments:
+;   rdi = user stack top (ring 3 stack)
+;   rsi = entry point (RIP)
+;
+; Returns:
+;   rax = initial RSP value (to store in PCB)
+;
+; Stack layout (matching isr_common):
+;   [top]
+;   SS        = 0x23 (user data, RPL=3)
+;   RSP       = user_stack_top - 8
+;   RFLAGS    = 0x202 (IF=1)
+;   CS        = 0x1B (user code, RPL=3)
+;   RIP       = entry point
+;   error_code = 0
+;   int_num    = 0
+;   rax..r15   = 0
+;   ds         = 0x23 (user data)
+; ============================================================
+
+global asm_init_stack_user
+asm_init_stack_user:
+    mov rax, rdi            ; Start at stack top
+
+    ; Push SS (user data segment, RPL=3)
+    sub rax, 8
+    mov qword [rax], 0x23
+
+    ; Push RSP (user stack pointer)
+    sub rax, 8
+    mov rcx, rdi
+    sub rcx, 8
+    mov [rax], rcx
+
+    ; Push RFLAGS (IF=1 to enable interrupts)
+    sub rax, 8
+    mov qword [rax], 0x202
+
+    ; Push CS (user code segment, RPL=3)
+    sub rax, 8
+    mov qword [rax], 0x1B
+
+    ; Push RIP (entry point)
+    sub rax, 8
+    mov [rax], rsi
+
+    ; Push error code (0)
+    sub rax, 8
+    mov qword [rax], 0
+
+    ; Push interrupt number (0)
+    sub rax, 8
+    mov qword [rax], 0
+
+    ; Push all GPRs (15 registers)
+    mov rcx, 15
+.push_gpr_user:
+    sub rax, 8
+    mov qword [rax], 0
+    dec rcx
+    jnz .push_gpr_user
+
+    ; Push one more for rax
+    sub rax, 8
+    mov qword [rax], 0
+
+    ; Push DS (user data segment)
+    sub rax, 8
+    mov qword [rax], 0x23
+
+    ; RAX now points to the "saved" stack pointer
+    ret
+
+; ============================================================
 ; get_rsp - Get current RSP value
 ; Returns: rax = current RSP
 ; ============================================================
@@ -121,6 +200,46 @@ asm_init_stack:
 global get_rsp
 get_rsp:
     mov rax, rsp
+    ret
+
+; ============================================================
+; tss_set_rsp0 - Set RSP0 in TSS (kernel stack for ring transitions)
+;
+; Arguments:
+;   rdi = TSS base address
+;   rsi = RSP0 value (kernel stack pointer)
+;
+; TSS RSP0 is at offset 0x04 (4 bytes from start)
+; ============================================================
+
+global tss_set_rsp0
+tss_set_rsp0:
+    mov [rdi + 4], rsi      ; TSS.RSP0 is at offset 4
+    ret
+
+; ============================================================
+; tss_load - Load Task Register with TSS selector
+;
+; Arguments:
+;   rdi = TSS selector (e.g., 0x28)
+; ============================================================
+
+global tss_load
+tss_load:
+    mov ax, di
+    ltr ax
+    ret
+
+; ============================================================
+; gdt_reload - Reload GDT with 64-bit pointer
+;
+; Arguments:
+;   rdi = pointer to GDTR structure (10 bytes: limit + base)
+; ============================================================
+
+global gdt_reload
+gdt_reload:
+    lgdt [rdi]
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -175,12 +175,17 @@ _start_asm:
     or eax, PAGE_PRESENT | PAGE_WRITE | PAGE_USER
     mov [ecx], eax
 
-    ; PD[0..3] -> 4x 2MB pages (first 8MB identity mapped)
+    ; PD[0..7] -> 8x 2MB pages (first 16MB identity mapped)
     ; All pages marked PAGE_USER to allow ring 3 access (Phase 6 PoC)
+    ; Extended to 16MB to support ELF loading (Phase 10)
     mov dword [edx +  0], 0x000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx +  8], 0x200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx + 16], 0x400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx + 24], 0x600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 32], 0x800000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 40], 0xA00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 48], 0xC00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 56], 0xE00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
 
     ; Load CR3 with PML4 address
     mov eax, ebx

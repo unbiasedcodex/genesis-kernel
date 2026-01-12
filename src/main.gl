@@ -1,6 +1,6 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
-// Phase 9: Shell and Commands
+// Phase 10: ELF Loader
 
 // ============================================================
 // Constants
@@ -287,6 +287,82 @@ const SYS_KB_AVAIL: i64 = 17;                 // Check if key available
 const KEY_BACKSPACE: i64 = 8;
 const KEY_ENTER: i64 = 10;
 const KEY_ESC: i64 = 27;
+
+// ELF Loader syscall
+const SYS_EXEC: i64 = 18;                      // Execute ELF binary
+
+// ============================================================
+// ELF64 Format Constants
+// ============================================================
+
+// ELF Magic bytes: 0x7F 'E' 'L' 'F'
+const ELF_MAGIC0: i64 = 0x7F;
+const ELF_MAGIC1: i64 = 0x45;  // E
+const ELF_MAGIC2: i64 = 0x4C;  // L
+const ELF_MAGIC3: i64 = 0x46;  // F
+
+// ELF Header offsets (64-bit ELF)
+const EH_MAGIC: i64 = 0;                       // Magic (4 bytes)
+const EH_CLASS: i64 = 4;                       // Class: 1=32-bit, 2=64-bit
+const EH_DATA: i64 = 5;                        // Data: 1=LE, 2=BE
+const EH_VERSION: i64 = 6;                     // Version
+const EH_OSABI: i64 = 7;                       // OS/ABI
+const EH_TYPE: i64 = 16;                       // Type: 2=EXEC
+const EH_MACHINE: i64 = 18;                    // Machine: 0x3E=x86-64
+const EH_ENTRY: i64 = 24;                      // Entry point (8 bytes)
+const EH_PHOFF: i64 = 32;                      // Program header offset (8 bytes)
+const EH_SHOFF: i64 = 40;                      // Section header offset (8 bytes)
+const EH_PHENTSIZE: i64 = 54;                  // Program header entry size (2 bytes)
+const EH_PHNUM: i64 = 56;                      // Number of program headers (2 bytes)
+
+// ELF Class values
+const ELF_CLASS64: i64 = 2;
+
+// ELF Data (endianness)
+const ELF_DATA_LE: i64 = 1;
+
+// ELF Type values
+const ET_EXEC: i64 = 2;
+
+// ELF Machine values
+const EM_X86_64: i64 = 0x3E;
+
+// Program Header offsets (64-bit)
+const PH_TYPE: i64 = 0;                        // Segment type (4 bytes)
+const PH_FLAGS: i64 = 4;                       // Segment flags (4 bytes)
+const PH_OFFSET: i64 = 8;                      // File offset (8 bytes)
+const PH_VADDR: i64 = 16;                      // Virtual address (8 bytes)
+const PH_PADDR: i64 = 24;                      // Physical address (8 bytes)
+const PH_FILESZ: i64 = 32;                     // Size in file (8 bytes)
+const PH_MEMSZ: i64 = 40;                      // Size in memory (8 bytes)
+const PH_ALIGN: i64 = 48;                      // Alignment (8 bytes)
+
+// Program Header size
+const PH_SIZE: i64 = 56;
+
+// Segment types
+const PT_NULL: i64 = 0;
+const PT_LOAD: i64 = 1;
+
+// Segment flags
+const PF_X: i64 = 1;                           // Execute
+const PF_W: i64 = 2;                           // Write
+const PF_R: i64 = 4;                           // Read
+
+// ELF Loader memory region
+const ELF_LOAD_BASE: i64 = 0x800000;           // Base address for loaded ELF
+const ELF_LOAD_SIZE: i64 = 0x100000;           // 1MB max per ELF
+
+// ELF Loader errors
+const ELF_OK: i64 = 0;
+const ELF_ERR_NOT_FOUND: i64 = -1;
+const ELF_ERR_BAD_MAGIC: i64 = -2;
+const ELF_ERR_NOT_64BIT: i64 = -3;
+const ELF_ERR_NOT_LE: i64 = -4;
+const ELF_ERR_NOT_EXEC: i64 = -5;
+const ELF_ERR_BAD_ARCH: i64 = -6;
+const ELF_ERR_NO_PROC: i64 = -7;
+const ELF_ERR_LOAD_FAIL: i64 = -8;
 
 // ============================================================
 // Bitwise Operations Helper Functions
@@ -1394,6 +1470,8 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         result = syscall_kb_read();
     } else if num == SYS_KB_AVAIL {
         result = syscall_kb_avail();
+    } else if num == SYS_EXEC {
+        result = syscall_exec(arg1);
     }
 
     result
@@ -1413,6 +1491,14 @@ fn syscall_kb_avail() -> i64 {
     } else {
         0
     }
+}
+
+// SYS_EXEC - Execute ELF binary by filename
+// arg1: filename as packed bytes (8 chars in u64)
+// Returns: new PID on success, negative error on failure
+fn syscall_exec(name_lo: i64) -> i64 {
+    // Execute the ELF binary
+    elf_exec(name_lo as u64)
 }
 
 // SYS_YIELD - Yield CPU to scheduler
@@ -1880,6 +1966,11 @@ fn ramfs_init() {
     ramfs_create_file_internal(116, 101, 115, 116, 0, 0, 0, 0);    // "test"
     ramfs_write_file_data(1, 84, 101, 115, 116, 32, 102, 105, 108, 101, 10, 0, 0, 0, 0);  // "Test file\n"
 
+    // Create "app" - minimal ELF test program (prints "ELF!" and loops)
+    // File index will be 2
+    ramfs_create_file_internal(97, 112, 112, 0, 0, 0, 0, 0);  // "app"
+    ramfs_create_test_elf(2);
+
     serial_out(82);  // R
     serial_out(65);  // A
     serial_out(77);  // M
@@ -1930,6 +2021,80 @@ fn ramfs_create_file_internal(c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i
     write_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS, (free_blocks - 1) as u64);
 
     slot
+}
+
+// Helper: write 8 bytes to file at offset (for binary data)
+fn ramfs_write_8bytes(file_idx: i64, offset: i64, b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64) {
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let data_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    let val: u64 = (b0 as u64) + ((b1 as u64) * 256) + ((b2 as u64) * 65536) + ((b3 as u64) * 16777216)
+                 + ((b4 as u64) * 0x100000000) + ((b5 as u64) * 0x10000000000)
+                 + ((b6 as u64) * 0x1000000000000) + ((b7 as u64) * 0x100000000000000);
+    write_u64_addr(data_addr + offset, val);
+}
+
+// Helper: set file size directly
+fn ramfs_set_file_size(file_idx: i64, size: i64) {
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    write_u64_addr(entry_addr + FE_SIZE, size as u64);
+}
+
+// Create test ELF binary (189 bytes)
+// Minimal ELF that prints "ELF!" and yields in a loop
+fn ramfs_create_test_elf(file_idx: i64) {
+    // ELF Header bytes 0-7:   7f 45 4c 46 02 01 01 00
+    ramfs_write_8bytes(file_idx, 0,   0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00);
+    // ELF Header bytes 8-15:  00 00 00 00 00 00 00 00
+    ramfs_write_8bytes(file_idx, 8,   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // ELF Header bytes 16-23: 02 00 3e 00 01 00 00 00
+    ramfs_write_8bytes(file_idx, 16,  0x02, 0x00, 0x3E, 0x00, 0x01, 0x00, 0x00, 0x00);
+    // ELF Header bytes 24-31: 78 00 80 00 00 00 00 00 (entry = 0x800078)
+    ramfs_write_8bytes(file_idx, 24,  0x78, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // ELF Header bytes 32-39: 40 00 00 00 00 00 00 00 (phoff = 64)
+    ramfs_write_8bytes(file_idx, 32,  0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // ELF Header bytes 40-47: 00 00 00 00 00 00 00 00 (shoff = 0)
+    ramfs_write_8bytes(file_idx, 40,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // ELF Header bytes 48-55: 00 00 00 00 40 00 38 00
+    ramfs_write_8bytes(file_idx, 48,  0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00);
+    // ELF Header bytes 56-63: 01 00 00 00 00 00 00 00 (phnum = 1)
+    ramfs_write_8bytes(file_idx, 56,  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+
+    // Program Header bytes 64-71: 01 00 00 00 05 00 00 00 (PT_LOAD, flags=5)
+    ramfs_write_8bytes(file_idx, 64,  0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00);
+    // Program Header bytes 72-79: 00 00 00 00 00 00 00 00 (offset = 0)
+    ramfs_write_8bytes(file_idx, 72,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // Program Header bytes 80-87: 00 00 80 00 00 00 00 00 (vaddr = 0x800000)
+    ramfs_write_8bytes(file_idx, 80,  0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // Program Header bytes 88-95: 00 00 80 00 00 00 00 00 (paddr = 0x800000)
+    ramfs_write_8bytes(file_idx, 88,  0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // Program Header bytes 96-103: bd 00 00 00 00 00 00 00 (filesz = 189)
+    ramfs_write_8bytes(file_idx, 96,  0xBD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // Program Header bytes 104-111: bd 00 00 00 00 00 00 00 (memsz = 189)
+    ramfs_write_8bytes(file_idx, 104, 0xBD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    // Program Header bytes 112-119: 00 10 00 00 00 00 00 00 (align = 0x1000)
+    ramfs_write_8bytes(file_idx, 112, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+
+    // Code starts at offset 120 (0x78)
+    // mov rax, 2; mov rdi, 'E'; int 0x80
+    ramfs_write_8bytes(file_idx, 120, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x45, 0x00);
+    ramfs_write_8bytes(file_idx, 128, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x02, 0x00, 0x00);
+    // mov rdi, 'L'; int 0x80
+    ramfs_write_8bytes(file_idx, 136, 0x00, 0xBF, 0x4C, 0x00, 0x00, 0x00, 0xCD, 0x80);
+    // mov rax, 2; mov rdi, 'F'; int 0x80
+    ramfs_write_8bytes(file_idx, 144, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x46, 0x00);
+    ramfs_write_8bytes(file_idx, 152, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x02, 0x00, 0x00);
+    // mov rdi, '!'; int 0x80
+    ramfs_write_8bytes(file_idx, 160, 0x00, 0xBF, 0x21, 0x00, 0x00, 0x00, 0xCD, 0x80);
+    // mov rax, 2; mov rdi, 10; int 0x80
+    ramfs_write_8bytes(file_idx, 168, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x0A, 0x00);
+    ramfs_write_8bytes(file_idx, 176, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x00, 0x00, 0x00);
+    // loop: mov rax, 0; int 0x80; jmp loop
+    ramfs_write_8bytes(file_idx, 184, 0x00, 0xCD, 0x80, 0xEB, 0xF7, 0x00, 0x00, 0x00);
+
+    // Set file size to 189 bytes
+    ramfs_set_file_size(file_idx, 189);
 }
 
 // Helper: write initial data to file (up to 14 bytes)
@@ -2118,6 +2283,302 @@ fn fd_close(pid: i64, fd: i64) -> i64 {
         result = 0;
     }
     result
+}
+
+// ============================================================
+// ELF64 Loader Functions
+// ============================================================
+
+// Read a 16-bit value from file (little-endian)
+fn elf_read_u16(file_idx: i64, offset: i64) -> i64 {
+    let b0 = ramfs_read_byte(file_idx, offset);
+    let b1 = ramfs_read_byte(file_idx, offset + 1);
+    if b0 < 0 || b1 < 0 {
+        return -1;
+    }
+    b0 + (b1 * 256)
+}
+
+// Read a 32-bit value from file (little-endian)
+fn elf_read_u32(file_idx: i64, offset: i64) -> i64 {
+    let b0 = ramfs_read_byte(file_idx, offset);
+    let b1 = ramfs_read_byte(file_idx, offset + 1);
+    let b2 = ramfs_read_byte(file_idx, offset + 2);
+    let b3 = ramfs_read_byte(file_idx, offset + 3);
+    if b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0 {
+        return -1;
+    }
+    b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+}
+
+// Read a 64-bit value from file (little-endian)
+fn elf_read_u64(file_idx: i64, offset: i64) -> i64 {
+    // Read low 32 bits
+    let lo = elf_read_u32(file_idx, offset);
+    // Read high 32 bits
+    let hi = elf_read_u32(file_idx, offset + 4);
+    if lo < 0 || hi < 0 {
+        return -1;
+    }
+    // Combine (handle as unsigned)
+    let hi_shifted = hi * 0x100000000;  // hi << 32
+    lo + hi_shifted
+}
+
+// Validate ELF64 header
+// Returns ELF_OK if valid, error code otherwise
+fn elf_validate(file_idx: i64) -> i64 {
+    // Check file exists and has minimum size
+    let size = ramfs_file_size(file_idx);
+    if size < 64 {
+        return ELF_ERR_BAD_MAGIC;
+    }
+
+    // Check magic: 0x7F, 'E', 'L', 'F'
+    let m0 = ramfs_read_byte(file_idx, 0);
+    let m1 = ramfs_read_byte(file_idx, 1);
+    let m2 = ramfs_read_byte(file_idx, 2);
+    let m3 = ramfs_read_byte(file_idx, 3);
+
+    if m0 != ELF_MAGIC0 || m1 != ELF_MAGIC1 || m2 != ELF_MAGIC2 || m3 != ELF_MAGIC3 {
+        return ELF_ERR_BAD_MAGIC;
+    }
+
+    // Check class (must be 64-bit)
+    let class = ramfs_read_byte(file_idx, EH_CLASS);
+    if class != ELF_CLASS64 {
+        return ELF_ERR_NOT_64BIT;
+    }
+
+    // Check endianness (must be little-endian)
+    let data = ramfs_read_byte(file_idx, EH_DATA);
+    if data != ELF_DATA_LE {
+        return ELF_ERR_NOT_LE;
+    }
+
+    // Check type (must be executable)
+    let elf_type = elf_read_u16(file_idx, EH_TYPE);
+    if elf_type != ET_EXEC {
+        return ELF_ERR_NOT_EXEC;
+    }
+
+    // Check machine (must be x86-64)
+    let machine = elf_read_u16(file_idx, EH_MACHINE);
+    if machine != EM_X86_64 {
+        return ELF_ERR_BAD_ARCH;
+    }
+
+    ELF_OK
+}
+
+// Get ELF entry point
+fn elf_get_entry(file_idx: i64) -> i64 {
+    elf_read_u64(file_idx, EH_ENTRY)
+}
+
+// Get program header offset
+fn elf_get_phoff(file_idx: i64) -> i64 {
+    elf_read_u64(file_idx, EH_PHOFF)
+}
+
+// Get number of program headers
+fn elf_get_phnum(file_idx: i64) -> i64 {
+    elf_read_u16(file_idx, EH_PHNUM)
+}
+
+// Get program header entry size
+fn elf_get_phentsize(file_idx: i64) -> i64 {
+    elf_read_u16(file_idx, EH_PHENTSIZE)
+}
+
+// Load a single LOAD segment from file to memory
+// Returns 0 on success, -1 on failure
+fn elf_load_segment(file_idx: i64, ph_offset: i64, load_base: i64) -> i64 {
+    // Read segment type
+    let seg_type = elf_read_u32(file_idx, ph_offset + PH_TYPE);
+    if seg_type != PT_LOAD {
+        // Not a LOAD segment, skip
+        return 0;
+    }
+
+    // Read segment info
+    let file_offset = elf_read_u64(file_idx, ph_offset + PH_OFFSET);
+    let vaddr = elf_read_u64(file_idx, ph_offset + PH_VADDR);
+    let filesz = elf_read_u64(file_idx, ph_offset + PH_FILESZ);
+    let memsz = elf_read_u64(file_idx, ph_offset + PH_MEMSZ);
+
+    // Debug output
+    serial_out(76);  // L
+    serial_out(79);  // O
+    serial_out(65);  // A
+    serial_out(68);  // D
+    serial_out(58);  // :
+    serial_hex32(vaddr as u64);
+    serial_out(32);  // space
+    serial_hex32(filesz as u64);
+    serial_newline();
+
+    // Calculate destination address
+    // Use load_base as offset from vaddr
+    let dest_addr = load_base + (vaddr % ELF_LOAD_SIZE);
+
+    // Copy file data to memory
+    let mut i: i64 = 0;
+    while i < filesz {
+        let byte = ramfs_read_byte(file_idx, file_offset + i);
+        if byte >= 0 {
+            write_byte_addr(dest_addr + i, byte);
+        }
+        i = i + 1;
+    }
+
+    // Zero out BSS (memsz > filesz)
+    while i < memsz {
+        write_byte_addr(dest_addr + i, 0);
+        i = i + 1;
+    }
+
+    0
+}
+
+// Load all LOAD segments from ELF file
+// Returns entry point address on success, negative error on failure
+fn elf_load_segments(file_idx: i64, load_base: i64) -> i64 {
+    let phoff = elf_get_phoff(file_idx);
+    let phnum = elf_get_phnum(file_idx);
+    let phentsize = elf_get_phentsize(file_idx);
+
+    serial_out(80);  // P
+    serial_out(72);  // H
+    serial_out(58);  // :
+    serial_out(48 + phnum);
+    serial_newline();
+
+    // Load each program header
+    let mut i: i64 = 0;
+    while i < phnum {
+        let ph_offset = phoff + (i * phentsize);
+        let result = elf_load_segment(file_idx, ph_offset, load_base);
+        if result < 0 {
+            return ELF_ERR_LOAD_FAIL;
+        }
+        i = i + 1;
+    }
+
+    // Return entry point (adjusted for load base)
+    let entry = elf_get_entry(file_idx);
+    load_base + (entry % ELF_LOAD_SIZE)
+}
+
+// Execute an ELF file by name
+// Creates a new user process and loads the ELF binary
+// Returns new PID on success, negative error on failure
+fn elf_exec(name_lo: u64) -> i64 {
+    // Find file in RAMFS
+    let file_idx = ramfs_find_file(name_lo);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(78);  // N
+        serial_out(70);  // F (not found)
+        serial_newline();
+        return ELF_ERR_NOT_FOUND;
+    }
+
+    // Validate ELF header
+    let valid = elf_validate(file_idx);
+    if valid != ELF_OK {
+        serial_out(69);  // E
+        serial_out(73);  // I (invalid)
+        serial_out(48 - valid);  // error code
+        serial_newline();
+        return valid;
+    }
+
+    serial_out(69);  // E
+    serial_out(76);  // L
+    serial_out(70);  // F
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    // Calculate load base for this process
+    let num_procs = get_num_procs();
+    if num_procs >= MAX_PROCS {
+        return ELF_ERR_NO_PROC;
+    }
+    let load_base = ELF_LOAD_BASE + (num_procs * ELF_LOAD_SIZE);
+
+    // Load ELF segments to memory
+    let entry = elf_load_segments(file_idx, load_base);
+    if entry < 0 {
+        return entry;
+    }
+
+    serial_out(69);  // E
+    serial_out(78);  // N
+    serial_out(84);  // T
+    serial_out(58);  // :
+    serial_hex32(entry as u64);
+    serial_newline();
+
+    // Create user process with entry point
+    let pid = elf_create_process(entry);
+
+    pid
+}
+
+// Create a new user process for ELF execution
+// Similar to proc_create_user but uses dynamic entry point
+fn elf_create_process(entry: i64) -> i64 {
+    let num_procs = get_num_procs();
+    if num_procs >= MAX_PROCS {
+        return -1;
+    }
+
+    let pid = num_procs;
+    let pcb = pcb_addr(pid);
+
+    // Calculate user stack for this process
+    let user_stack_base = PROC_STACK_BASE + (pid * PROC_STACK_SIZE);
+    let user_stack_top = user_stack_base + PROC_STACK_SIZE;
+
+    // Calculate kernel stack for this process
+    let kernel_stack_base = KSTACK_BASE + (pid * KSTACK_SIZE);
+    let kernel_stack_top = kernel_stack_base + KSTACK_SIZE;
+
+    // Initialize the process stack for user mode
+    let initial_rsp = init_process_stack_user(user_stack_top, kernel_stack_top, entry);
+
+    // Fill PCB
+    write_u64_addr(pcb + PCB_PID, pid as u64);
+    write_u64_addr(pcb + PCB_STATE, PROC_READY as u64);
+    write_u64_addr(pcb + PCB_RSP, initial_rsp as u64);
+    write_u64_addr(pcb + PCB_STACK_BASE, user_stack_base as u64);
+    write_u64_addr(pcb + PCB_KSTACK_BASE, kernel_stack_base as u64);
+    write_u64_addr(pcb + PCB_FLAGS, PROC_FLAG_USER as u64);
+
+    // Initialize FD table for new process
+    fd_init(pid);
+
+    // Initialize capability table for new process
+    cap_init(pid);
+
+    // Give basic capabilities (can be restricted later)
+    cap_add(pid, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
+
+    // Increment process count
+    write_u64_addr(NUM_PROCS_ADDR, (num_procs + 1) as u64);
+
+    serial_out(69);  // E
+    serial_out(88);  // X
+    serial_out(69);  // E
+    serial_out(67);  // C
+    serial_out(58);  // :
+    serial_out(48 + pid);
+    serial_newline();
+
+    pid
 }
 
 // ============================================================
@@ -3182,6 +3643,23 @@ fn sys_kb_avail() -> i64 {
     result
 }
 
+// Syscall wrapper: execute ELF binary
+// name_lo: packed filename (first 8 chars)
+// Returns: new PID on success, negative error on failure
+fn sys_exec(name_lo: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_EXEC,
+            in("rdi") name_lo,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // User mode server A (runs in ring 3)
 fn process_a() {
     // Print startup message using syscalls
@@ -3525,6 +4003,10 @@ fn cmd_help() {
     // "  clear - clear screen"
     console_print_str(32, 32, 99, 108, 101, 97, 114, 0);
     console_putchar(10);
+
+    // "  run   - run program"
+    console_print_str(32, 32, 114, 117, 110, 0, 0, 0);
+    console_putchar(10);
 }
 
 // Command: ps - show processes
@@ -3533,9 +4015,10 @@ fn cmd_ps() {
     console_print_str(80, 73, 68, 32, 83, 84, 65, 84);  // "PID STAT"
     console_putchar(10);
 
-    // Print each process
+    // Print each process (use dynamic count)
+    let num_procs = get_num_procs();
     let mut pid: i64 = 0;
-    while pid < 6 {  // 6 processes including shell
+    while pid < num_procs {
         let state = pcb_get_state(pid);
         if state != PROC_UNUSED {
             // Print PID
@@ -3657,6 +4140,53 @@ fn cmd_clear() {
     write_u64_addr(CONSOLE_CURSOR_Y, CONSOLE_START_ROW as u64);
 }
 
+// Command: run <filename> - execute ELF binary
+fn cmd_run() {
+    // Get filename starting at position 4 (after "run ")
+    let c0 = shell_line_get(4);
+    let c1 = shell_line_get(5);
+    let c2 = shell_line_get(6);
+    let c3 = shell_line_get(7);
+    let c4 = shell_line_get(8);
+    let c5 = shell_line_get(9);
+    let c6 = shell_line_get(10);
+    let c7 = shell_line_get(11);
+
+    // Pack filename into u64 (little-endian)
+    let name_lo = c0 + (c1 * 256) + (c2 * 65536) + (c3 * 16777216) +
+                  (c4 * 0x100000000) + (c5 * 0x10000000000) +
+                  (c6 * 0x1000000000000) + (c7 * 0x100000000000000);
+
+    // Print "run: "
+    console_print_str(114, 117, 110, 58, 32, 0, 0, 0);  // "run: "
+
+    // Print filename
+    if c0 > 0 { console_putchar(c0); }
+    if c1 > 0 { console_putchar(c1); }
+    if c2 > 0 { console_putchar(c2); }
+    if c3 > 0 { console_putchar(c3); }
+    if c4 > 0 { console_putchar(c4); }
+    if c5 > 0 { console_putchar(c5); }
+    if c6 > 0 { console_putchar(c6); }
+    if c7 > 0 { console_putchar(c7); }
+    console_putchar(10);  // newline
+
+    // Execute the ELF file
+    let result = sys_exec(name_lo);
+
+    if result >= 0 {
+        // Print "PID: N"
+        console_print_str(80, 73, 68, 58, 32, 0, 0, 0);  // "PID: "
+        console_putchar(48 + result);
+        console_putchar(10);
+    } else {
+        // Print error
+        console_print_str(69, 82, 82, 58, 32, 0, 0, 0);  // "ERR: "
+        console_putchar(48 - result);  // error code as digit
+        console_putchar(10);
+    }
+}
+
 // Execute command in line buffer
 fn shell_execute() {
     let len = read_u64_addr(SHELL_LINE_LEN_ADDR) as i64;
@@ -3689,6 +4219,11 @@ fn shell_execute() {
         // "clear" = 99, 108, 101, 97, 114
         else if shell_cmd_match(99, 108, 101, 97, 114, 0, 0, 0) {
             cmd_clear();
+        }
+        // "run " = 114, 117, 110, 32
+        else if shell_line_get(0) == 114 && shell_line_get(1) == 117 &&
+                shell_line_get(2) == 110 && shell_line_get(3) == 32 {
+            cmd_run();
         }
         else {
             // Unknown command
@@ -3731,7 +4266,7 @@ fn process_shell() {
     let green: i64 = 0x0A;
     let white: i64 = 0x0F;
 
-    // "Genesis Shell v0.9.0"
+    // "Genesis Shell v0.0.10"
     vga_write_char_color(0, CONSOLE_START_ROW, 71, green);   // G
     vga_write_char_color(1, CONSOLE_START_ROW, 101, green);  // e
     vga_write_char_color(2, CONSOLE_START_ROW, 110, green);  // n
@@ -3749,9 +4284,10 @@ fn process_shell() {
     vga_write_char_color(14, CONSOLE_START_ROW, 118, white); // v
     vga_write_char_color(15, CONSOLE_START_ROW, 48, white);  // 0
     vga_write_char_color(16, CONSOLE_START_ROW, 46, white);  // .
-    vga_write_char_color(17, CONSOLE_START_ROW, 57, white);  // 9
+    vga_write_char_color(17, CONSOLE_START_ROW, 48, white);  // 0
     vga_write_char_color(18, CONSOLE_START_ROW, 46, white);  // .
-    vga_write_char_color(19, CONSOLE_START_ROW, 48, white);  // 0
+    vga_write_char_color(19, CONSOLE_START_ROW, 49, white);  // 1
+    vga_write_char_color(20, CONSOLE_START_ROW, 48, white);  // 0
 
     // Move to next line and show prompt
     write_u64_addr(CONSOLE_CURSOR_X, 0);
@@ -4072,7 +4608,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // Line 0: "Genesis Kernel v0.8.0"
+    // Line 0: "Genesis Kernel v0.0.10"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -4091,15 +4627,17 @@ fn _start() {
     vga_write_char(15, 0, 118, white); // v
     vga_write_char(16, 0, 48, white);  // 0
     vga_write_char(17, 0, 46, white);  // .
-    vga_write_char(18, 0, 57, white);  // 9
+    vga_write_char(18, 0, 48, white);  // 0
     vga_write_char(19, 0, 46, white);  // .
-    vga_write_char(20, 0, 48, white);  // 0
+    vga_write_char(20, 0, 49, white);  // 1
+    vga_write_char(21, 0, 48, white);  // 0
 
     serial_out(118); // v
     serial_out(48);  // 0
     serial_out(46);  // .
-    serial_out(57);  // 9
+    serial_out(48);  // 0
     serial_out(46);  // .
+    serial_out(49);  // 1
     serial_out(48);  // 0
     serial_newline();
 

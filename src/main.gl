@@ -1008,6 +1008,90 @@ fn test_memory_ops() {
 }
 
 // ============================================================
+// Volatile Operations (L3)
+// ============================================================
+
+// L3.5: Test volatile operations (uses compiler built-ins)
+fn test_volatile_ops() {
+    // [VOL]
+    serial_out(91);   // [
+    serial_out(86);   // V
+    serial_out(79);   // O
+    serial_out(76);   // L
+    serial_out(93);   // ]
+    serial_out(32);   // space
+
+    // Test volatile write/read at 0x600000 (safe memory region)
+    test_volatile_u8();
+    test_volatile_u16();
+    test_volatile_u32();
+
+    serial_newline();
+}
+
+// L3.0: Test volatile u8 read/write
+fn test_volatile_u8() {
+    let ptr = 0x600000 as *mut u8;
+    unsafe {
+        volatile_write_u8(ptr, 0xAB);
+        let val: u8 = volatile_read_u8(ptr);
+        let expected: u8 = 0xAB;
+        if val == expected {
+            serial_out(56);  // 8
+            serial_out(79);  // O
+            serial_out(75);  // K
+            serial_out(32);  // space
+        } else {
+            serial_out(56);  // 8
+            serial_out(70);  // F
+            serial_out(32);  // space
+        }
+    }
+}
+
+// L3.1/L3.2: Test volatile u16 read/write
+fn test_volatile_u16() {
+    let ptr = 0x600000 as *mut u16;
+    unsafe {
+        volatile_write_u16(ptr, 0xBEEF);
+        let val: u16 = volatile_read_u16(ptr);
+        let expected: u16 = 0xBEEF;
+        if val == expected {
+            serial_out(49);  // 1
+            serial_out(54);  // 6
+            serial_out(79);  // O
+            serial_out(75);  // K
+            serial_out(32);  // space
+        } else {
+            serial_out(49);  // 1
+            serial_out(54);  // 6
+            serial_out(70);  // F
+            serial_out(32);  // space
+        }
+    }
+}
+
+// L3.3/L3.4: Test volatile u32 read/write
+fn test_volatile_u32() {
+    let ptr = 0x600000 as *mut u32;
+    unsafe {
+        volatile_write_u32(ptr, 0xDEADBEEF);
+        let val: u32 = volatile_read_u32(ptr);
+        let expected: u32 = 0xDEADBEEF;
+        if val == expected {
+            serial_out(51);  // 3
+            serial_out(50);  // 2
+            serial_out(79);  // O
+            serial_out(75);  // K
+        } else {
+            serial_out(51);  // 3
+            serial_out(50);  // 2
+            serial_out(70);  // F
+        }
+    }
+}
+
+// ============================================================
 // VGA Text Mode
 // ============================================================
 
@@ -6357,6 +6441,9 @@ fn _start() {
 
     // Test memory operations (L2)
     test_memory_ops();
+
+    // Test volatile operations (L3)
+    test_volatile_ops();
 
     // Initialize processes BEFORE interrupts (scheduler state must exist)
     init_processes();

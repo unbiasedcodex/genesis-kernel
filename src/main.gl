@@ -1,6 +1,6 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
-// Phase 6: User Space Servers
+// Phase 7: VFS and Device Servers
 
 // ============================================================
 // Constants
@@ -108,6 +108,11 @@ const SYS_PRINT: i64 = 2;      // Print character to serial
 const SYS_SEND: i64 = 3;       // Send message to process
 const SYS_RECV: i64 = 4;       // Receive message from queue
 const SYS_EXIT: i64 = 5;       // Exit process
+const SYS_OPEN: i64 = 6;       // Open file (returns fd)
+const SYS_READ: i64 = 7;       // Read from file
+const SYS_WRITE: i64 = 8;      // Write to file
+const SYS_CLOSE: i64 = 9;      // Close file descriptor
+const SYS_FSTAT: i64 = 10;     // Get file status (size)
 
 // Syscall result storage (returned in RAX after syscall)
 const SYSCALL_RET_ADDR: i64 = 0x422020;
@@ -130,6 +135,87 @@ const MQ_HEAD: i64 = 0;            // Queue head index
 const MQ_TAIL: i64 = 8;            // Queue tail index
 const MQ_COUNT: i64 = 16;          // Number of messages in queue
 const MQ_MSGS: i64 = 24;           // Message array start
+
+// ============================================================
+// VFS and RAM Disk Constants
+// ============================================================
+
+// VFS Server PID (fixed)
+const VFS_SERVER_PID: i64 = 3;
+
+// RAM Disk memory layout
+const RAMFS_BASE: i64 = 0x700000;           // RAM disk base address
+const RAMFS_SUPERBLOCK: i64 = 0x700000;     // Superblock (512 bytes)
+const RAMFS_FILE_TABLE: i64 = 0x700200;     // File table (2KB)
+const RAMFS_DATA_BLOCKS: i64 = 0x701000;    // Data blocks start
+
+// RAM Disk limits
+const RAMFS_MAX_FILES: i64 = 32;            // Maximum number of files
+const RAMFS_FILE_ENTRY_SIZE: i64 = 64;      // Size of file table entry
+const RAMFS_BLOCK_SIZE: i64 = 512;          // Data block size
+const RAMFS_MAX_BLOCKS: i64 = 256;          // Maximum data blocks (128KB)
+const RAMFS_NAME_MAX: i64 = 15;             // Max filename length
+
+// Superblock offsets (512 bytes total)
+const SB_MAGIC: i64 = 0;                    // Magic number (8 bytes)
+const SB_VERSION: i64 = 8;                  // Version (8 bytes)
+const SB_TOTAL_BLOCKS: i64 = 16;            // Total blocks (8 bytes)
+const SB_FREE_BLOCKS: i64 = 24;             // Free blocks (8 bytes)
+const SB_TOTAL_FILES: i64 = 32;             // Max files (8 bytes)
+const SB_USED_FILES: i64 = 40;              // Used file slots (8 bytes)
+
+// File entry offsets (64 bytes per entry)
+const FE_FLAGS: i64 = 0;                    // Flags: 0=unused, 1=file, 2=dir
+const FE_NAME: i64 = 8;                     // Filename (16 bytes)
+const FE_SIZE: i64 = 24;                    // File size (8 bytes)
+const FE_BLOCK: i64 = 32;                   // First data block index (8 bytes)
+const FE_BLOCKS: i64 = 40;                  // Number of blocks used (8 bytes)
+const FE_RESERVED: i64 = 48;                // Reserved (16 bytes)
+
+// File flags
+const FILE_UNUSED: i64 = 0;
+const FILE_REGULAR: i64 = 1;
+const FILE_DIRECTORY: i64 = 2;
+
+// VFS IPC Message Types (first byte of message data)
+const VFS_OPEN: i64 = 1;                    // Open file: {type, mode, name[14]}
+const VFS_READ: i64 = 2;                    // Read file: {type, fd, offset(2), size(2)}
+const VFS_WRITE: i64 = 3;                   // Write file: {type, fd, size, data[13]}
+const VFS_CLOSE: i64 = 4;                   // Close file: {type, fd}
+const VFS_STAT: i64 = 5;                    // Get file info: {type, fd}
+const VFS_CREATE: i64 = 6;                  // Create file: {type, mode, name[14]}
+const VFS_DELETE: i64 = 7;                  // Delete file: {type, name[15]}
+const VFS_LIST: i64 = 8;                    // List files: {type, index}
+
+// VFS Response Types
+const VFS_OK: i64 = 0;                      // Success
+const VFS_ERR_NOT_FOUND: i64 = -1;          // File not found
+const VFS_ERR_EXISTS: i64 = -2;             // File already exists
+const VFS_ERR_FULL: i64 = -3;               // Filesystem full
+const VFS_ERR_INVALID: i64 = -4;            // Invalid operation
+const VFS_ERR_NO_FD: i64 = -5;              // No free file descriptors
+
+// File Descriptor Constants
+const MAX_FDS_PER_PROC: i64 = 8;            // Max open files per process
+const FD_TABLE_ADDR: i64 = 0x440000;        // File descriptor tables base
+const FD_ENTRY_SIZE: i64 = 16;              // Size per FD entry
+const FD_TABLE_SIZE: i64 = 128;             // Per-process FD table (8*16)
+
+// FD Entry offsets
+const FD_FILE_IDX: i64 = 0;                 // File table index (-1 if closed)
+const FD_OFFSET: i64 = 8;                   // Current read/write offset
+
+// Console Server PID
+const CONSOLE_SERVER_PID: i64 = 4;
+
+// Keyboard buffer
+const KB_BUFFER_ADDR: i64 = 0x450000;       // Keyboard input buffer
+const KB_BUFFER_SIZE: i64 = 256;            // Buffer size
+const KB_HEAD_ADDR: i64 = 0x450100;         // Buffer head index
+const KB_TAIL_ADDR: i64 = 0x450108;         // Buffer tail index
+
+// RAMFS Magic number: "GENVFS\0\0"
+const RAMFS_MAGIC: i64 = 0x0053465F56454E47;
 
 // ============================================================
 // Bitwise Operations Helper Functions
@@ -1061,6 +1147,16 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         result = syscall_recv(arg1);
     } else if num == SYS_EXIT {
         result = syscall_exit();
+    } else if num == SYS_OPEN {
+        result = syscall_open(arg1);
+    } else if num == SYS_READ {
+        result = syscall_read(arg1, arg2);
+    } else if num == SYS_WRITE {
+        result = syscall_write(arg1, arg2);
+    } else if num == SYS_CLOSE {
+        result = syscall_close(arg1);
+    } else if num == SYS_FSTAT {
+        result = syscall_fstat(arg1);
     }
 
     result
@@ -1113,6 +1209,144 @@ fn syscall_exit() -> i64 {
     }
 
     0
+}
+
+// ============================================================
+// File System Syscalls
+// ============================================================
+
+// SYS_OPEN - Open file by index (simplified: arg1 = file index)
+// Returns: file descriptor, or -1 on error
+fn syscall_open(file_idx: i64) -> i64 {
+    let current = get_current_pid();
+
+    // Validate file index
+    if file_idx < 0 || file_idx >= RAMFS_MAX_FILES {
+        return VFS_ERR_INVALID;
+    }
+
+    // Check if file exists
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let flags = read_u64_addr(entry_addr + FE_FLAGS) as i64;
+    if flags == FILE_UNUSED {
+        return VFS_ERR_NOT_FOUND;
+    }
+
+    // Allocate file descriptor
+    let fd = fd_alloc(current, file_idx);
+    if fd < 0 {
+        return VFS_ERR_NO_FD;
+    }
+
+    fd
+}
+
+// SYS_READ - Read byte from file descriptor
+// arg1 = fd, arg2 = not used (reads current position)
+// Returns: byte value (0-255), or -1 on EOF/error
+fn syscall_read(fd: i64, arg2: i64) -> i64 {
+    let current = get_current_pid();
+
+    // Get file index from FD
+    let file_idx = fd_get_file(current, fd);
+    if file_idx < 0 {
+        return -1;  // Invalid FD
+    }
+
+    // Get current offset
+    let offset = fd_get_offset(current, fd);
+
+    // Read byte from file
+    let byte = ramfs_read_byte(file_idx, offset);
+    if byte < 0 {
+        return -1;  // EOF or error
+    }
+
+    // Advance offset
+    fd_set_offset(current, fd, offset + 1);
+
+    byte
+}
+
+// SYS_WRITE - Write byte to file descriptor (simplified: single byte)
+// arg1 = fd, arg2 = byte value
+// Returns: 0 on success, -1 on error
+fn syscall_write(fd: i64, byte_val: i64) -> i64 {
+    let current = get_current_pid();
+
+    // Get file index from FD
+    let file_idx = fd_get_file(current, fd);
+    if file_idx < 0 {
+        return -1;  // Invalid FD
+    }
+
+    // Get current offset
+    let offset = fd_get_offset(current, fd);
+
+    // Write byte to file (simplified: only supports writing within block)
+    if offset >= RAMFS_BLOCK_SIZE {
+        return -1;  // Block full
+    }
+
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let data_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Calculate byte position within 8-byte word
+    let word_offset = (offset / 8) * 8;
+    let byte_pos = offset % 8;
+
+    // Read current word, modify byte, write back
+    let current_word = read_u64_addr(data_addr + word_offset);
+
+    // Build mask and new byte position using multiplication
+    let mut multiplier: u64 = 1;
+    let mut bi: i64 = 0;
+    while bi < byte_pos {
+        multiplier = multiplier * 256;
+        bi = bi + 1;
+    }
+
+    // Clear the byte at position and set new value
+    let clear_mask = 255 * multiplier;
+    let cleared = current_word - ((current_word / multiplier) % 256) * multiplier;
+    let new_word = cleared + ((byte_val as u64) * multiplier);
+
+    write_u64_addr(data_addr + word_offset, new_word);
+
+    // Update file size if writing past current size
+    let current_size = read_u64_addr(entry_addr + FE_SIZE) as i64;
+    if offset >= current_size {
+        write_u64_addr(entry_addr + FE_SIZE, (offset + 1) as u64);
+    }
+
+    // Advance offset
+    fd_set_offset(current, fd, offset + 1);
+
+    0
+}
+
+// SYS_CLOSE - Close file descriptor
+// arg1 = fd
+// Returns: 0 on success, -1 on error
+fn syscall_close(fd: i64) -> i64 {
+    let current = get_current_pid();
+    fd_close(current, fd)
+}
+
+// SYS_FSTAT - Get file size
+// arg1 = fd
+// Returns: file size, or -1 on error
+fn syscall_fstat(fd: i64) -> i64 {
+    let current = get_current_pid();
+
+    // Get file index from FD
+    let file_idx = fd_get_file(current, fd);
+    if file_idx < 0 {
+        return -1;
+    }
+
+    ramfs_file_size(file_idx)
 }
 
 // ============================================================
@@ -1248,6 +1482,282 @@ fn syscall_recv(src_out_ptr: i64) -> i64 {
         }
     }
 
+    result
+}
+
+// ============================================================
+// RAM Disk Functions
+// ============================================================
+
+// Initialize RAM disk with empty filesystem
+fn ramfs_init() {
+    // Clear superblock
+    let mut i: i64 = 0;
+    while i < 512 {
+        write_u64_addr(RAMFS_SUPERBLOCK + i, 0);
+        i = i + 8;
+    }
+
+    // Write superblock
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_MAGIC, RAMFS_MAGIC as u64);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_VERSION, 1);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_TOTAL_BLOCKS, RAMFS_MAX_BLOCKS as u64);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS, RAMFS_MAX_BLOCKS as u64);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_TOTAL_FILES, RAMFS_MAX_FILES as u64);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES, 0);
+
+    // Clear file table
+    let file_table_size = RAMFS_MAX_FILES * RAMFS_FILE_ENTRY_SIZE;
+    i = 0;
+    while i < file_table_size {
+        write_u64_addr(RAMFS_FILE_TABLE + i, 0);
+        i = i + 8;
+    }
+
+    // Create initial test files
+    ramfs_create_file_internal(104, 101, 108, 108, 111, 0, 0, 0);  // "hello"
+    ramfs_write_file_data(0, 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 33, 10, 0);  // "Hello World!\n"
+
+    ramfs_create_file_internal(116, 101, 115, 116, 0, 0, 0, 0);    // "test"
+    ramfs_write_file_data(1, 84, 101, 115, 116, 32, 102, 105, 108, 101, 10, 0, 0, 0, 0);  // "Test file\n"
+
+    serial_out(82);  // R
+    serial_out(65);  // A
+    serial_out(77);  // M
+    serial_out(70);  // F
+    serial_out(83);  // S
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
+// Helper: create file with character name (max 8 chars for simplicity)
+fn ramfs_create_file_internal(c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64, c6: i64, c7: i64) -> i64 {
+    // Find free slot
+    let used = read_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES) as i64;
+    if used >= RAMFS_MAX_FILES {
+        return -1;
+    }
+
+    let slot = used;
+    let entry_addr = RAMFS_FILE_TABLE + (slot * RAMFS_FILE_ENTRY_SIZE);
+
+    // Set flags to regular file
+    write_u64_addr(entry_addr + FE_FLAGS, FILE_REGULAR as u64);
+
+    // Write name as bytes (pack into 64-bit values)
+    let name_lo: u64 = (c0 as u64) + ((c1 as u64) * 256) + ((c2 as u64) * 65536) + ((c3 as u64) * 16777216)
+                     + ((c4 as u64) * 0x100000000) + ((c5 as u64) * 0x10000000000)
+                     + ((c6 as u64) * 0x1000000000000) + ((c7 as u64) * 0x100000000000000);
+    write_u64_addr(entry_addr + FE_NAME, name_lo);
+    write_u64_addr(entry_addr + FE_NAME + 8, 0);  // Clear rest of name
+
+    // Set size to 0 initially
+    write_u64_addr(entry_addr + FE_SIZE, 0);
+
+    // Allocate first data block
+    let free_blocks = read_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS) as i64;
+    if free_blocks <= 0 {
+        return -1;
+    }
+
+    let block_idx = (RAMFS_MAX_BLOCKS - free_blocks) as i64;
+    write_u64_addr(entry_addr + FE_BLOCK, block_idx as u64);
+    write_u64_addr(entry_addr + FE_BLOCKS, 1);
+
+    // Update superblock
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES, (used + 1) as u64);
+    write_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS, (free_blocks - 1) as u64);
+
+    slot
+}
+
+// Helper: write initial data to file (up to 14 bytes)
+fn ramfs_write_file_data(file_idx: i64, b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64,
+                          b7: i64, b8: i64, b9: i64, b10: i64, b11: i64, b12: i64, b13: i64) {
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let data_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Write data bytes
+    let lo: u64 = (b0 as u64) + ((b1 as u64) * 256) + ((b2 as u64) * 65536) + ((b3 as u64) * 16777216)
+                + ((b4 as u64) * 0x100000000) + ((b5 as u64) * 0x10000000000)
+                + ((b6 as u64) * 0x1000000000000) + ((b7 as u64) * 0x100000000000000);
+    write_u64_addr(data_addr, lo);
+
+    let hi: u64 = (b8 as u64) + ((b9 as u64) * 256) + ((b10 as u64) * 65536) + ((b11 as u64) * 16777216)
+                + ((b12 as u64) * 0x100000000) + ((b13 as u64) * 0x10000000000);
+    write_u64_addr(data_addr + 8, hi);
+
+    // Calculate actual size (count non-zero bytes until first zero)
+    let mut size: i64 = 14;  // Assume full length
+    if b0 == 0 { size = 0; }
+    else if b1 == 0 { size = 1; }
+    else if b2 == 0 { size = 2; }
+    else if b3 == 0 { size = 3; }
+    else if b4 == 0 { size = 4; }
+    else if b5 == 0 { size = 5; }
+    else if b6 == 0 { size = 6; }
+    else if b7 == 0 { size = 7; }
+    else if b8 == 0 { size = 8; }
+    else if b9 == 0 { size = 9; }
+    else if b10 == 0 { size = 10; }
+    else if b11 == 0 { size = 11; }
+    else if b12 == 0 { size = 12; }
+    else if b13 == 0 { size = 13; }
+
+    write_u64_addr(entry_addr + FE_SIZE, size as u64);
+}
+
+// Find file by name (first 8 chars only for simplicity)
+fn ramfs_find_file(name_lo: u64) -> i64 {
+    let used = read_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES) as i64;
+    let mut result: i64 = -1;
+    let mut i: i64 = 0;
+    while i < used {
+        let entry_addr = RAMFS_FILE_TABLE + (i * RAMFS_FILE_ENTRY_SIZE);
+        let flags = read_u64_addr(entry_addr + FE_FLAGS) as i64;
+        if flags != FILE_UNUSED {
+            let entry_name = read_u64_addr(entry_addr + FE_NAME);
+            if entry_name == name_lo {
+                if result < 0 {
+                    result = i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    result
+}
+
+// Read file size
+fn ramfs_file_size(file_idx: i64) -> i64 {
+    let mut result: i64 = -1;
+    if file_idx >= 0 && file_idx < RAMFS_MAX_FILES {
+        let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+        result = read_u64_addr(entry_addr + FE_SIZE) as i64;
+    }
+    result
+}
+
+// Read byte from file at offset
+fn ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
+    let mut result: i64 = -1;
+
+    if file_idx >= 0 && file_idx < RAMFS_MAX_FILES {
+        let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+        let size = read_u64_addr(entry_addr + FE_SIZE) as i64;
+
+        if offset >= 0 && offset < size {
+            let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+            let data_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+            // Read the byte at offset
+            let byte_offset = offset % 8;
+            let qword_offset = (offset / 8) * 8;
+            let qword = read_u64_addr(data_addr + qword_offset);
+
+            // Extract byte using division (avoid bitwise issues)
+            let mut shift_val = qword;
+            let mut bi: i64 = 0;
+            while bi < byte_offset {
+                shift_val = shift_val / 256;
+                bi = bi + 1;
+            }
+            result = (shift_val % 256) as i64;
+        }
+    }
+
+    result
+}
+
+// ============================================================
+// File Descriptor Table Functions
+// ============================================================
+
+// Get FD table base for a process
+fn fd_table_addr(pid: i64) -> i64 {
+    FD_TABLE_ADDR + (pid * FD_TABLE_SIZE)
+}
+
+// Initialize FD table for a process
+fn fd_init(pid: i64) {
+    let base = fd_table_addr(pid);
+    let mut i: i64 = 0;
+    while i < MAX_FDS_PER_PROC {
+        let entry = base + (i * FD_ENTRY_SIZE);
+        write_u64_addr(entry + FD_FILE_IDX, 0xFFFFFFFFFFFFFFFF);  // -1 = closed
+        write_u64_addr(entry + FD_OFFSET, 0);
+        i = i + 1;
+    }
+}
+
+// Allocate a new FD for a process
+fn fd_alloc(pid: i64, file_idx: i64) -> i64 {
+    let base = fd_table_addr(pid);
+    let mut result: i64 = -1;
+    let mut i: i64 = 0;
+    while i < MAX_FDS_PER_PROC {
+        let entry = base + (i * FD_ENTRY_SIZE);
+        let idx = read_u64_addr(entry + FD_FILE_IDX);
+        if idx == 0xFFFFFFFFFFFFFFFF {
+            if result < 0 {
+                // Found free slot
+                write_u64_addr(entry + FD_FILE_IDX, file_idx as u64);
+                write_u64_addr(entry + FD_OFFSET, 0);
+                result = i;
+            }
+        }
+        i = i + 1;
+    }
+    result
+}
+
+// Get file index from FD
+fn fd_get_file(pid: i64, fd: i64) -> i64 {
+    let mut result: i64 = -1;
+    if fd >= 0 && fd < MAX_FDS_PER_PROC {
+        let base = fd_table_addr(pid);
+        let entry = base + (fd * FD_ENTRY_SIZE);
+        let idx = read_u64_addr(entry + FD_FILE_IDX);
+        if idx != 0xFFFFFFFFFFFFFFFF {
+            result = idx as i64;
+        }
+    }
+    result
+}
+
+// Get current offset for FD
+fn fd_get_offset(pid: i64, fd: i64) -> i64 {
+    let mut result: i64 = -1;
+    if fd >= 0 && fd < MAX_FDS_PER_PROC {
+        let base = fd_table_addr(pid);
+        let entry = base + (fd * FD_ENTRY_SIZE);
+        result = read_u64_addr(entry + FD_OFFSET) as i64;
+    }
+    result
+}
+
+// Set offset for FD
+fn fd_set_offset(pid: i64, fd: i64, offset: i64) {
+    if fd >= 0 && fd < MAX_FDS_PER_PROC {
+        let base = fd_table_addr(pid);
+        let entry = base + (fd * FD_ENTRY_SIZE);
+        write_u64_addr(entry + FD_OFFSET, offset as u64);
+    }
+}
+
+// Close FD
+fn fd_close(pid: i64, fd: i64) -> i64 {
+    let mut result: i64 = -1;
+    if fd >= 0 && fd < MAX_FDS_PER_PROC {
+        let base = fd_table_addr(pid);
+        let entry = base + (fd * FD_ENTRY_SIZE);
+        write_u64_addr(entry + FD_FILE_IDX, 0xFFFFFFFFFFFFFFFF);
+        write_u64_addr(entry + FD_OFFSET, 0);
+        result = 0;
+    }
     result
 }
 
@@ -1954,6 +2464,83 @@ fn sys_recv() -> i64 {
     result
 }
 
+// Syscall wrapper: open file by index
+fn sys_open(file_idx: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") file_idx,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Syscall wrapper: read byte from file
+fn sys_read(fd: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_READ,
+            in("rdi") fd,
+            in("rsi") 0,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Syscall wrapper: write byte to file
+fn sys_write_file(fd: i64, byte_val: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_WRITE,
+            in("rdi") fd,
+            in("rsi") byte_val,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Syscall wrapper: close file
+fn sys_close(fd: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_CLOSE,
+            in("rdi") fd,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Syscall wrapper: get file size
+fn sys_fstat(fd: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_FSTAT,
+            in("rdi") fd,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // User mode server A (runs in ring 3)
 fn process_a() {
     // Print startup message using syscalls
@@ -1962,14 +2549,33 @@ fn process_a() {
     sys_print(93);   // ]
     sys_print(32);   // space
 
+    // Demonstrate VFS: open and read "hello" file (index 0)
+    let fd = sys_open(0);  // Open file index 0 ("hello")
+    if fd >= 0 {
+        sys_print(70);   // F
+        sys_print(58);   // :
+
+        // Read and print file contents
+        loop {
+            let byte = sys_read(fd);
+            if byte < 0 || byte == 0 {
+                break;  // EOF or error
+            }
+            sys_print(byte);
+        }
+
+        sys_close(fd);
+        sys_print(32);   // space
+    }
+
     // Counter for messages
     let mut counter: i64 = 0;
 
     loop {
         counter = counter + 1;
 
-        // Send message to process B (PID 2) every 100 iterations
-        if counter % 100 == 0 {
+        // Send message to process B (PID 2) every 500 iterations
+        if counter % 500 == 0 {
             sys_send(2, 65);  // Send 'A' character
         }
 
@@ -2022,6 +2628,124 @@ fn process_idle() {
     }
 }
 
+// ============================================================
+// VFS Server Process (PID 3)
+// ============================================================
+
+// VFS Server: handles file operations via IPC
+fn process_vfs_server() {
+    // Print startup message
+    sys_print(91);   // [
+    sys_print(86);   // V
+    sys_print(70);   // F
+    sys_print(83);   // S
+    sys_print(93);   // ]
+    sys_print(32);   // space
+
+    loop {
+        // Check for incoming VFS requests
+        let msg = sys_recv();
+        if msg >= 0 {
+            // Extract command type from message (low byte)
+            let cmd = msg % 256;
+
+            // Handle VFS commands
+            if cmd == VFS_LIST {
+                // List files: respond with file count
+                vfs_handle_list();
+            } else if cmd == VFS_OPEN {
+                // Open file: extract filename from message
+                vfs_handle_open(msg);
+            } else if cmd == VFS_READ {
+                // Read file
+                vfs_handle_read(msg);
+            } else if cmd == VFS_STAT {
+                // Get file info
+                vfs_handle_stat(msg);
+            }
+        }
+
+        sys_yield();
+    }
+}
+
+// VFS Handler: list files
+fn vfs_handle_list() {
+    // Get number of files in filesystem
+    let used = read_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES) as i64;
+
+    // Print to serial for debugging
+    sys_print(76);   // L
+    sys_print(58);   // :
+    sys_print(48 + used);  // file count
+    sys_print(32);   // space
+}
+
+// VFS Handler: open file (simplified - just return file index)
+fn vfs_handle_open(msg: i64) {
+    // For now, treat msg as file index directly (simplified)
+    // In real implementation, would parse filename from IPC message buffer
+    let file_idx = (msg / 256) % 256;  // Second byte is file index
+
+    if file_idx >= 0 && file_idx < RAMFS_MAX_FILES {
+        let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+        let flags = read_u64_addr(entry_addr + FE_FLAGS) as i64;
+
+        if flags != FILE_UNUSED {
+            sys_print(79);   // O
+            sys_print(58);   // :
+            sys_print(48 + file_idx);  // file index
+            sys_print(32);   // space
+        }
+    }
+}
+
+// VFS Handler: read file
+fn vfs_handle_read(msg: i64) {
+    // Parse: byte 1 = file_idx, byte 2 = offset
+    let file_idx = (msg / 256) % 256;
+    let offset = (msg / 65536) % 256;
+
+    let byte = ramfs_read_byte(file_idx, offset);
+    if byte >= 0 && byte != 0 {
+        sys_print(byte);  // Output the byte read
+    }
+}
+
+// VFS Handler: get file stat (size)
+fn vfs_handle_stat(msg: i64) {
+    let file_idx = (msg / 256) % 256;
+    let size = ramfs_file_size(file_idx);
+
+    sys_print(83);   // S
+    sys_print(58);   // :
+    if size >= 0 {
+        sys_print(48 + (size % 10));
+    }
+    sys_print(32);   // space
+}
+
+// ============================================================
+// Console Server Process (PID 4)
+// ============================================================
+
+// Console Server: handles keyboard input and display
+fn process_console_server() {
+    // Print startup message
+    sys_print(91);   // [
+    sys_print(67);   // C
+    sys_print(79);   // O
+    sys_print(78);   // N
+    sys_print(93);   // ]
+    sys_print(32);   // space
+
+    loop {
+        // Console server mainly handles keyboard events
+        // In this simplified version, just yield
+        sys_yield();
+    }
+}
+
 fn get_process_a_addr() -> i64 {
     let mut result: i64 = 0;
     unsafe {
@@ -2051,6 +2775,30 @@ fn get_process_idle_addr() -> i64 {
     unsafe {
         asm!(
             "lea process_idle(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn get_vfs_server_addr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea process_vfs_server(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn get_console_server_addr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea process_console_server(%rip), %rax",
             lateout("rax") result,
             options(nostack, att_syntax)
         );
@@ -2109,6 +2857,16 @@ fn init_processes() {
         mq_i = mq_i + 1;
     }
 
+    // Initialize file descriptor tables for all processes
+    let mut fd_i: i64 = 0;
+    while fd_i < MAX_PROCS {
+        fd_init(fd_i);
+        fd_i = fd_i + 1;
+    }
+
+    // Initialize RAM disk filesystem
+    ramfs_init();
+
     // Create idle process (PID 0) - runs in KERNEL mode
     // Note: PID 0 starts as READY, not RUNNING
     // This prevents saving kernel stack as P0's RSP on first switch
@@ -2123,6 +2881,14 @@ fn init_processes() {
     // Create test process B (PID 2) - runs in USER mode (ring 3)
     let proc_b_addr = get_process_b_addr();
     proc_create_user(proc_b_addr);
+
+    // Create VFS server (PID 3) - runs in USER mode (ring 3)
+    let vfs_addr = get_vfs_server_addr();
+    proc_create_user(vfs_addr);
+
+    // Create Console server (PID 4) - runs in USER mode (ring 3)
+    let console_addr = get_console_server_addr();
+    proc_create_user(console_addr);
 
     // Enable scheduler
     enable_scheduler();
@@ -2181,7 +2947,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // Line 0: "Genesis Kernel v0.6.0"
+    // Line 0: "Genesis Kernel v0.7.0"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -2200,14 +2966,14 @@ fn _start() {
     vga_write_char(15, 0, 118, white); // v
     vga_write_char(16, 0, 48, white);  // 0
     vga_write_char(17, 0, 46, white);  // .
-    vga_write_char(18, 0, 54, white);  // 6
+    vga_write_char(18, 0, 55, white);  // 7
     vga_write_char(19, 0, 46, white);  // .
     vga_write_char(20, 0, 48, white);  // 0
 
     serial_out(118); // v
     serial_out(48);  // 0
     serial_out(46);  // .
-    serial_out(54);  // 6
+    serial_out(55);  // 7
     serial_out(46);  // .
     serial_out(48);  // 0
     serial_newline();

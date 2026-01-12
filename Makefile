@@ -1,5 +1,5 @@
 # Genesis Kernel Makefile
-# Phase 7: VFS and Device Servers
+# Phase 12: Device Drivers & Disk I/O
 
 # Tools
 GLC = /root/genesisos/genesis-lang/target/release/glc
@@ -74,9 +74,23 @@ run-vga: iso
 debug: iso
 	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -d int -no-reboot
 
+# Create test disk image (8MB)
+disk:
+	@dd if=/dev/zero of=test.img bs=1M count=8 2>/dev/null
+	@echo "Genesis Test Disk - Sector 0" | dd of=test.img bs=1 conv=notrunc 2>/dev/null
+	@echo "Created test.img (8MB)"
+
+# Run with disk attached (serial)
+run-disk: iso disk
+	qemu-system-x86_64 -cdrom $(ISO) -drive file=test.img,format=raw,if=ide -serial stdio -display none
+
+# Run with disk attached (VGA)
+run-disk-vga: iso disk
+	qemu-system-x86_64 -cdrom $(ISO) -drive file=test.img,format=raw,if=ide
+
 # Clean build artifacts
 clean:
-	rm -f $(KERNEL) kernel64.elf $(OBJS) $(ISO)
+	rm -f $(KERNEL) kernel64.elf $(OBJS) $(ISO) test.img
 	rm -rf iso/boot/kernel.elf
 
 # Check tools
@@ -86,4 +100,4 @@ check:
 	@which grub-mkrescue > /dev/null || (echo "Error: grub-mkrescue not found" && exit 1)
 	@echo "All tools found"
 
-.PHONY: all iso run run-vga debug clean check
+.PHONY: all iso run run-vga debug disk run-disk run-disk-vga clean check

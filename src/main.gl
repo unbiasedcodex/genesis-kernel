@@ -1,6 +1,6 @@
 // Genesis Kernel - Entry Point
 // Microkernel for Genesis OS
-// Phase 11: Advanced IPC & Signals
+// Phase 12: Device Drivers & Disk I/O
 
 // ============================================================
 // Constants
@@ -442,6 +442,75 @@ const PROC_ZOMBIE: i64 = 4;                       // Exited, waiting for parent 
 const PROC_STOPPED: i64 = 5;                      // Stopped by signal
 
 // ============================================================
+// ATA PIO Constants (Phase 12)
+// ============================================================
+
+// Primary ATA controller ports (I/O base 0x1F0)
+const ATA_PRIMARY_IO: i64 = 0x1F0;
+const ATA_PRIMARY_CTRL: i64 = 0x3F6;
+
+// ATA I/O port offsets
+const ATA_DATA: i64 = 0;                          // Data register (R/W, 16-bit)
+const ATA_ERROR: i64 = 1;                         // Error register (R)
+const ATA_FEATURES: i64 = 1;                      // Features register (W)
+const ATA_SECCOUNT: i64 = 2;                      // Sector count (R/W)
+const ATA_LBA_LO: i64 = 3;                        // LBA low byte (R/W)
+const ATA_LBA_MID: i64 = 4;                       // LBA mid byte (R/W)
+const ATA_LBA_HI: i64 = 5;                        // LBA high byte (R/W)
+const ATA_DRIVE: i64 = 6;                         // Drive/head register (R/W)
+const ATA_STATUS: i64 = 7;                        // Status register (R)
+const ATA_COMMAND: i64 = 7;                       // Command register (W)
+
+// ATA control port offsets
+const ATA_ALT_STATUS: i64 = 0;                    // Alternate status (R)
+const ATA_DEV_CTRL: i64 = 0;                      // Device control (W)
+
+// ATA status register bits
+const ATA_SR_BSY: i64 = 0x80;                     // Busy
+const ATA_SR_DRDY: i64 = 0x40;                    // Drive ready
+const ATA_SR_DF: i64 = 0x20;                      // Drive fault
+const ATA_SR_DSC: i64 = 0x10;                     // Drive seek complete
+const ATA_SR_DRQ: i64 = 0x08;                     // Data request ready
+const ATA_SR_CORR: i64 = 0x04;                    // Corrected data
+const ATA_SR_IDX: i64 = 0x02;                     // Index
+const ATA_SR_ERR: i64 = 0x01;                     // Error
+
+// ATA commands
+const ATA_CMD_READ_PIO: i64 = 0x20;               // Read sectors (PIO)
+const ATA_CMD_WRITE_PIO: i64 = 0x30;              // Write sectors (PIO)
+const ATA_CMD_IDENTIFY: i64 = 0xEC;               // Identify drive
+const ATA_CMD_FLUSH: i64 = 0xE7;                  // Flush cache
+
+// Drive selection
+const ATA_MASTER: i64 = 0xE0;                     // Master drive (LBA mode)
+const ATA_SLAVE: i64 = 0xF0;                      // Slave drive (LBA mode)
+
+// ATA sector size
+const ATA_SECTOR_SIZE: i64 = 512;
+
+// ATA memory addresses for driver state
+const ATA_STATE_ADDR: i64 = 0xA00000;             // ATA driver state
+const ATA_IDENTIFY_ADDR: i64 = 0xA00100;          // IDENTIFY data (512 bytes)
+const ATA_BUFFER_ADDR: i64 = 0xA10000;            // Disk read buffer (64KB)
+const ATA_BUFFER_SIZE: i64 = 0x10000;             // 64KB buffer (128 sectors)
+
+// ATA state offsets
+const ATA_PRESENT: i64 = 0;                       // Drive present flag (8 bytes)
+const ATA_TOTAL_SECTORS: i64 = 8;                 // Total sectors (8 bytes)
+const ATA_LAST_ERROR: i64 = 16;                   // Last error code (8 bytes)
+
+// ATA syscalls
+const SYS_DISK_READ: i64 = 25;                    // Read disk sectors
+const SYS_DISK_INFO: i64 = 26;                    // Get disk information
+
+// ATA error codes
+const ATA_OK: i64 = 0;                            // Success
+const ATA_ERR_NO_DRIVE: i64 = -40;                // No drive present
+const ATA_ERR_TIMEOUT: i64 = -41;                 // Operation timeout
+const ATA_ERR_IO: i64 = -42;                      // I/O error
+const ATA_ERR_INVALID: i64 = -43;                 // Invalid parameter
+
+// ============================================================
 // Bitwise Operations Helper Functions
 // ============================================================
 
@@ -659,6 +728,285 @@ fn io_wait() {
     outb(0x80, 0);
 }
 
+// 16-bit port I/O
+fn outw(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "outw %ax, %dx",
+            in("dx") port,
+            in("ax") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn inw(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "inw %dx, %ax",
+            in("dx") port,
+            lateout("ax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// 32-bit port I/O
+fn outl(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "outl %eax, %dx",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn inl(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "inl %dx, %eax",
+            in("dx") port,
+            lateout("eax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// PCI configuration ports
+const PCI_CONFIG_ADDR: i64 = 0xCF8;
+const PCI_CONFIG_DATA: i64 = 0xCFC;
+
+// Read PCI configuration space (32-bit)
+// bus: 0-255, device: 0-31, func: 0-7, offset: 0-252 (must be 4-byte aligned)
+fn pci_config_read(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
+    // Build PCI config address: 0x80000000 | bus << 16 | device << 11 | func << 8 | offset
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    outl(PCI_CONFIG_ADDR, addr);
+    inl(PCI_CONFIG_DATA)
+}
+
+// Test PCI config ports (L1.5)
+// Reads vendor/device ID from bus 0, device 0 (host bridge)
+fn test_pci_ports() {
+    // [PCI]
+    serial_out(91);   // [
+    serial_out(80);   // P
+    serial_out(67);   // C
+    serial_out(73);   // I
+    serial_out(93);   // ]
+    serial_out(32);   // space
+
+    // Read vendor/device ID from PCI 0:0.0
+    let vendor_device = pci_config_read(0, 0, 0, 0);
+
+    // Extract vendor ID (lower 16 bits)
+    let vendor = vendor_device - ((vendor_device / 65536) * 65536);
+
+    // 0xFFFF means no device, but we should have host bridge
+    if vendor != 0xFFFF {
+        // OK vendor=
+        serial_out(79);   // O
+        serial_out(75);   // K
+        serial_out(32);   // space
+        serial_hex(vendor as u64);
+        serial_newline();
+    } else {
+        // No device
+        serial_out(78);   // N
+        serial_out(79);   // O
+        serial_out(78);   // N
+        serial_out(69);   // E
+        serial_newline();
+    }
+}
+
+// ============================================================
+// Memory Operations (L2)
+// ============================================================
+
+// L2.1: Copy memory block from src to dst
+fn memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = read_byte_addr(src + i);
+        write_byte_addr(dst + i, byte);
+        i = i + 1;
+    }
+}
+
+// L2.2: Fill memory block with value
+fn memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        write_byte_addr(dst + i, value);
+        i = i + 1;
+    }
+}
+
+// L2.3: Compare memory blocks
+// Returns: 0 if equal, difference of first non-matching byte otherwise
+// Note: Uses result variable to avoid early return bug in compiler
+fn memcmp(a: i64, b: i64, len: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut result: i64 = 0;
+    let mut found_diff: bool = false;
+    while i < len {
+        if !found_diff {
+            let byte_a = read_byte_addr(a + i);
+            let byte_b = read_byte_addr(b + i);
+            if byte_a != byte_b {
+                result = byte_a - byte_b;
+                found_diff = true;
+            }
+        }
+        i = i + 1;
+    }
+    result
+}
+
+// L2.4: Zero memory block (wrapper for memset)
+fn memzero(dst: i64, len: i64) {
+    memset(dst, 0, len);
+}
+
+// Test memory operations (L2.5/L2.6)
+// Uses addresses in safe memory region above kernel
+const MEM_TEST_ADDR_A: i64 = 0x200000;  // 2MB - test buffer A
+const MEM_TEST_ADDR_B: i64 = 0x210000;  // 2MB + 64KB - test buffer B
+
+fn test_memory_ops() {
+    // [MEM]
+    serial_out(91);   // [
+    serial_out(77);   // M
+    serial_out(69);   // E
+    serial_out(77);   // M
+    serial_out(93);   // ]
+    serial_out(32);   // space
+
+    // Test 1: memset 512 bytes and verify
+    memset(MEM_TEST_ADDR_A, 0xAB, 512);
+    let mut ok: bool = true;
+    let mut i: i64 = 0;
+    while i < 512 {
+        if read_byte_addr(MEM_TEST_ADDR_A + i) != 0xAB {
+            ok = false;
+        }
+        i = i + 1;
+    }
+
+    if ok {
+        // set OK
+        serial_out(115); // s
+        serial_out(101); // e
+        serial_out(116); // t
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+        serial_out(32);  // space
+    } else {
+        // set FAIL
+        serial_out(115); // s
+        serial_out(101); // e
+        serial_out(116); // t
+        serial_out(32);  // space
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_newline();
+        return;
+    }
+
+    // Test 2: memcpy 512 bytes and verify
+    memzero(MEM_TEST_ADDR_B, 512);
+    memcpy(MEM_TEST_ADDR_B, MEM_TEST_ADDR_A, 512);
+
+    if memcmp(MEM_TEST_ADDR_A, MEM_TEST_ADDR_B, 512) == 0 {
+        // cpy OK
+        serial_out(99);  // c
+        serial_out(112); // p
+        serial_out(121); // y
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+        serial_out(32);  // space
+    } else {
+        // cpy FAIL
+        serial_out(99);  // c
+        serial_out(112); // p
+        serial_out(121); // y
+        serial_out(32);  // space
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_newline();
+        return;
+    }
+
+    // Test 3: memcmp difference detection
+    write_byte_addr(MEM_TEST_ADDR_B + 256, 0xFF);  // Change one byte
+    if memcmp(MEM_TEST_ADDR_A, MEM_TEST_ADDR_B, 512) != 0 {
+        // cmp OK
+        serial_out(99);  // c
+        serial_out(109); // m
+        serial_out(112); // p
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+        serial_out(32);  // space
+    } else {
+        // cmp FAIL
+        serial_out(99);  // c
+        serial_out(109); // m
+        serial_out(112); // p
+        serial_out(32);  // space
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_newline();
+        return;
+    }
+
+    // Test 4: Large buffer test (64KB)
+    memset(MEM_TEST_ADDR_A, 0x55, 65536);
+    memcpy(MEM_TEST_ADDR_B, MEM_TEST_ADDR_A, 65536);
+
+    // Spot check: first, middle, last bytes
+    let first_ok = read_byte_addr(MEM_TEST_ADDR_B) == 0x55;
+    let mid_ok = read_byte_addr(MEM_TEST_ADDR_B + 32768) == 0x55;
+    let last_ok = read_byte_addr(MEM_TEST_ADDR_B + 65535) == 0x55;
+
+    if first_ok && mid_ok && last_ok {
+        // 64K OK
+        serial_out(54);  // 6
+        serial_out(52);  // 4
+        serial_out(75);  // K
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        // 64K FAIL
+        serial_out(54);  // 6
+        serial_out(52);  // 4
+        serial_out(75);  // K
+        serial_out(32);  // space
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+    }
+
+    serial_newline();
+}
+
 // ============================================================
 // VGA Text Mode
 // ============================================================
@@ -816,6 +1164,44 @@ fn serial_hex64(value: u64) {
 
 fn serial_newline() {
     serial_out(10);
+}
+
+// Print decimal number to serial
+fn serial_print_dec(value: i64) {
+    if value == 0 {
+        serial_out(48);
+        return;
+    }
+
+    let mut num = value;
+    if num < 0 {
+        serial_out(45);  // '-'
+        num = 0 - num;
+    }
+
+    // Count digits
+    let mut temp = num;
+    let mut digits: i64 = 0;
+    while temp > 0 {
+        temp = temp / 10;
+        digits = digits + 1;
+    }
+
+    // Build divisor
+    let mut divisor: i64 = 1;
+    let mut d: i64 = 1;
+    while d < digits {
+        divisor = divisor * 10;
+        d = d + 1;
+    }
+
+    // Print digits
+    while divisor > 0 {
+        let digit = num / divisor;
+        serial_out(48 + digit);
+        num = num - (digit * divisor);
+        divisor = divisor / 10;
+    }
 }
 
 // ============================================================
@@ -1561,6 +1947,10 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         result = syscall_shmat(arg1);
     } else if num == SYS_SHMDT {
         result = syscall_shmdt(arg1);
+    } else if num == SYS_DISK_READ {
+        result = syscall_disk_read(arg1, arg2, arg3);
+    } else if num == SYS_DISK_INFO {
+        result = syscall_disk_info(arg1);
     }
 
     result
@@ -1995,6 +2385,372 @@ fn syscall_shmdt(addr: i64) -> i64 {
     }
 
     0
+}
+
+// ============================================================
+// ATA PIO Driver (Phase 12)
+// ============================================================
+
+// Initialize ATA driver state
+fn ata_init_state() {
+    write_u64_addr(ATA_STATE_ADDR + ATA_PRESENT, 0);
+    write_u64_addr(ATA_STATE_ADDR + ATA_TOTAL_SECTORS, 0);
+    write_u64_addr(ATA_STATE_ADDR + ATA_LAST_ERROR, 0);
+}
+
+// Read ATA status register
+fn ata_read_status() -> i64 {
+    inb(ATA_PRIMARY_IO + ATA_STATUS)
+}
+
+// Read ATA alternate status (doesn't clear IRQ)
+fn ata_read_alt_status() -> i64 {
+    inb(ATA_PRIMARY_CTRL + ATA_ALT_STATUS)
+}
+
+// Wait for BSY flag to clear (drive not busy)
+// Returns: 0 on success, ATA_ERR_TIMEOUT on timeout
+fn ata_wait_not_busy() -> i64 {
+    let mut timeout: i64 = 100000;
+    let mut result: i64 = ATA_ERR_TIMEOUT;
+
+    while timeout > 0 {
+        let status = ata_read_status();
+        let is_busy = status / 128;  // BSY is bit 7 (0x80)
+        if is_busy == 0 {
+            result = ATA_OK;
+            timeout = 0;  // Exit loop
+        } else {
+            timeout = timeout - 1;
+        }
+    }
+
+    result
+}
+
+// Wait for DRQ flag (data ready to transfer)
+// Returns: 0 on success, negative error code
+fn ata_wait_drq() -> i64 {
+    let mut timeout: i64 = 100000;
+    let mut result: i64 = ATA_ERR_TIMEOUT;
+
+    while timeout > 0 {
+        let status = ata_read_status();
+
+        // Check ERR bit (bit 0)
+        let err_bit = status - ((status / 2) * 2);
+        if err_bit != 0 {
+            result = ATA_ERR_IO;
+            timeout = 0;  // Exit loop
+        } else {
+            // Check DRQ bit (bit 3 = 0x08)
+            let drq_check = status / 8;
+            let drq_bit = drq_check - ((drq_check / 2) * 2);
+            if drq_bit != 0 {
+                result = ATA_OK;
+                timeout = 0;  // Exit loop
+            } else {
+                timeout = timeout - 1;
+            }
+        }
+    }
+
+    result
+}
+
+// Select drive (master or slave)
+fn ata_select_drive(drive: i64) {
+    outb(ATA_PRIMARY_IO + ATA_DRIVE, drive);
+    // 400ns delay (read status 4 times)
+    ata_read_alt_status();
+    ata_read_alt_status();
+    ata_read_alt_status();
+    ata_read_alt_status();
+}
+
+// Software reset ATA controller
+fn ata_soft_reset() {
+    outb(ATA_PRIMARY_CTRL + ATA_DEV_CTRL, 4);  // Set SRST bit
+    io_wait();
+    io_wait();
+    io_wait();
+    io_wait();
+    outb(ATA_PRIMARY_CTRL + ATA_DEV_CTRL, 0);  // Clear SRST bit
+    io_wait();
+    io_wait();
+    io_wait();
+    io_wait();
+}
+
+// Detect if primary master drive is present
+// Returns: 1 if present, 0 if not
+fn ata_detect_drive() -> i64 {
+    let mut present: i64 = 0;
+
+    // Software reset
+    ata_soft_reset();
+
+    // Select master drive
+    ata_select_drive(ATA_MASTER);
+
+    // Wait for drive to be ready
+    let wait_result = ata_wait_not_busy();
+    if wait_result == ATA_OK {
+        // Check drive signature
+        let lba_mid = inb(ATA_PRIMARY_IO + ATA_LBA_MID);
+        let lba_hi = inb(ATA_PRIMARY_IO + ATA_LBA_HI);
+
+        // ATA drive: both should be 0
+        // ATAPI: 0x14, 0xEB
+        if lba_mid == 0 && lba_hi == 0 {
+            // Could be an ATA drive, try IDENTIFY
+            present = 1;
+        }
+    }
+
+    present
+}
+
+// Read 16-bit word from ATA data port
+fn ata_read_data_word() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "in %dx, %ax",
+            in("dx") ATA_PRIMARY_IO + ATA_DATA,
+            lateout("ax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Send IDENTIFY command and read drive info
+// Returns: total sectors, or negative error
+fn ata_identify() -> i64 {
+    // Select master drive
+    ata_select_drive(ATA_MASTER);
+
+    // Zero out sector count and LBA registers
+    outb(ATA_PRIMARY_IO + ATA_SECCOUNT, 0);
+    outb(ATA_PRIMARY_IO + ATA_LBA_LO, 0);
+    outb(ATA_PRIMARY_IO + ATA_LBA_MID, 0);
+    outb(ATA_PRIMARY_IO + ATA_LBA_HI, 0);
+
+    // Send IDENTIFY command
+    outb(ATA_PRIMARY_IO + ATA_COMMAND, ATA_CMD_IDENTIFY);
+
+    // Check status
+    let status = ata_read_status();
+    if status == 0 {
+        return ATA_ERR_NO_DRIVE;
+    }
+
+    // Wait for BSY to clear
+    let wait_result = ata_wait_not_busy();
+    if wait_result != ATA_OK {
+        return wait_result;
+    }
+
+    // Check mid/hi LBA - non-zero means not ATA
+    let lba_mid = inb(ATA_PRIMARY_IO + ATA_LBA_MID);
+    let lba_hi = inb(ATA_PRIMARY_IO + ATA_LBA_HI);
+    if lba_mid != 0 || lba_hi != 0 {
+        return ATA_ERR_NO_DRIVE;
+    }
+
+    // Wait for DRQ
+    let drq_result = ata_wait_drq();
+    if drq_result != ATA_OK {
+        return drq_result;
+    }
+
+    // Read 256 words (512 bytes) of IDENTIFY data
+    let mut i: i64 = 0;
+    while i < 256 {
+        let word = ata_read_data_word();
+        let addr = ATA_IDENTIFY_ADDR + (i * 2);
+        // Store as 16-bit value
+        let byte_lo = word - ((word / 256) * 256);
+        let byte_hi = word / 256;
+        write_byte_addr(addr, byte_lo);
+        write_byte_addr(addr + 1, byte_hi);
+        i = i + 1;
+    }
+
+    // Extract total LBA28 sectors from words 60-61
+    let word60_lo = read_byte_addr(ATA_IDENTIFY_ADDR + 120) as i64;
+    let word60_hi = read_byte_addr(ATA_IDENTIFY_ADDR + 121) as i64;
+    let word61_lo = read_byte_addr(ATA_IDENTIFY_ADDR + 122) as i64;
+    let word61_hi = read_byte_addr(ATA_IDENTIFY_ADDR + 123) as i64;
+
+    let total_sectors = word60_lo + (word60_hi * 256) +
+                        (word61_lo * 65536) + (word61_hi * 16777216);
+
+    total_sectors
+}
+
+// Read sectors from disk using PIO mode (LBA28)
+// lba: starting sector (28-bit)
+// count: number of sectors to read (1-255)
+// buffer: destination address
+// Returns: bytes read, or negative error
+fn ata_read_sectors(lba: i64, count: i64, buffer: i64) -> i64 {
+    // Validate parameters
+    if count <= 0 || count > 255 {
+        return ATA_ERR_INVALID;
+    }
+
+    // Check drive is present
+    let present = read_u64_addr(ATA_STATE_ADDR + ATA_PRESENT) as i64;
+    if present == 0 {
+        return ATA_ERR_NO_DRIVE;
+    }
+
+    // Wait for drive ready
+    let wait_result = ata_wait_not_busy();
+    if wait_result != ATA_OK {
+        return wait_result;
+    }
+
+    // Select drive and set LBA mode (bits 24-27 of LBA + drive select)
+    let lba_high_bits = lba / 16777216;  // bits 24-27
+    let drive_byte = ATA_MASTER + lba_high_bits;
+    outb(ATA_PRIMARY_IO + ATA_DRIVE, drive_byte);
+
+    // Set sector count
+    outb(ATA_PRIMARY_IO + ATA_SECCOUNT, count);
+
+    // Set LBA address (bits 0-23)
+    let lba_lo = lba - ((lba / 256) * 256);
+    let lba_mid_val = (lba / 256) - ((lba / 65536) * 256);
+    let lba_hi_val = (lba / 65536) - ((lba / 16777216) * 256);
+
+    outb(ATA_PRIMARY_IO + ATA_LBA_LO, lba_lo);
+    outb(ATA_PRIMARY_IO + ATA_LBA_MID, lba_mid_val);
+    outb(ATA_PRIMARY_IO + ATA_LBA_HI, lba_hi_val);
+
+    // Send READ SECTORS command
+    outb(ATA_PRIMARY_IO + ATA_COMMAND, ATA_CMD_READ_PIO);
+
+    // Read each sector
+    let mut sector: i64 = 0;
+    let mut total_bytes: i64 = 0;
+    let mut error: i64 = 0;
+
+    while sector < count && error == 0 {
+        // Wait for DRQ
+        let drq_result = ata_wait_drq();
+        if drq_result != ATA_OK {
+            error = drq_result;
+        } else {
+            // Read 256 words (512 bytes)
+            let sector_offset = sector * ATA_SECTOR_SIZE;
+            let mut word_idx: i64 = 0;
+            while word_idx < 256 {
+                let word = ata_read_data_word();
+                let byte_offset = buffer + sector_offset + (word_idx * 2);
+                let byte_lo = word - ((word / 256) * 256);
+                let byte_hi = word / 256;
+                write_byte_addr(byte_offset, byte_lo);
+                write_byte_addr(byte_offset + 1, byte_hi);
+                word_idx = word_idx + 1;
+            }
+            total_bytes = total_bytes + ATA_SECTOR_SIZE;
+            sector = sector + 1;
+        }
+    }
+
+    if error != 0 {
+        write_u64_addr(ATA_STATE_ADDR + ATA_LAST_ERROR, error as u64);
+        return error;
+    }
+
+    total_bytes
+}
+
+// Initialize ATA driver and detect drive
+// Returns: total sectors if drive found, 0 otherwise
+fn ata_init() -> i64 {
+    ata_init_state();
+
+    serial_out(65);  // A
+    serial_out(84);  // T
+    serial_out(65);  // A
+    serial_out(32);  // space
+
+    // Detect drive
+    let detected = ata_detect_drive();
+    if detected == 0 {
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_newline();
+        return 0;
+    }
+
+    // Get drive info
+    let sectors = ata_identify();
+    if sectors <= 0 {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return 0;
+    }
+
+    // Store state
+    write_u64_addr(ATA_STATE_ADDR + ATA_PRESENT, 1);
+    write_u64_addr(ATA_STATE_ADDR + ATA_TOTAL_SECTORS, sectors as u64);
+
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_out(32);  // space
+
+    // Print sector count
+    serial_print_dec(sectors);
+    serial_out(83);  // S
+    serial_newline();
+
+    sectors
+}
+
+// ============================================================
+// Disk Syscalls (Phase 12)
+// ============================================================
+
+// SYS_DISK_READ - Read sectors from disk
+// arg1: LBA (sector number)
+// arg2: count (number of sectors, 1-128)
+// arg3: destination buffer address
+// Returns: bytes read, or negative error
+fn syscall_disk_read(lba: i64, count: i64, buffer: i64) -> i64 {
+    // Validate count (max 128 sectors = 64KB)
+    if count <= 0 || count > 128 {
+        return ATA_ERR_INVALID;
+    }
+
+    // Validate buffer address (must be in safe range)
+    // Allow reading to ATA_BUFFER_ADDR or user-space addresses
+    if buffer < ATA_BUFFER_ADDR && buffer < PROC_STACK_BASE {
+        return ATA_ERR_INVALID;
+    }
+
+    ata_read_sectors(lba, count, buffer)
+}
+
+// SYS_DISK_INFO - Get disk information
+// arg1: info type (0=present, 1=total_sectors, 2=last_error)
+// Returns: requested info value
+fn syscall_disk_info(info_type: i64) -> i64 {
+    if info_type == 0 {
+        read_u64_addr(ATA_STATE_ADDR + ATA_PRESENT) as i64
+    } else if info_type == 1 {
+        read_u64_addr(ATA_STATE_ADDR + ATA_TOTAL_SECTORS) as i64
+    } else if info_type == 2 {
+        read_u64_addr(ATA_STATE_ADDR + ATA_LAST_ERROR) as i64
+    } else {
+        ATA_ERR_INVALID
+    }
 }
 
 // ============================================================
@@ -4684,6 +5440,14 @@ fn cmd_help() {
     // "  kill  - signal proc"
     console_print_str(32, 32, 107, 105, 108, 108, 0, 0);
     console_putchar(10);
+
+    // "  disk  - disk info"
+    console_print_str(32, 32, 100, 105, 115, 107, 0, 0);
+    console_putchar(10);
+
+    // "  sector - read sector"
+    console_print_str(32, 32, 115, 101, 99, 116, 111, 114);
+    console_putchar(10);
 }
 
 // Command: ps - show processes
@@ -4931,6 +5695,182 @@ fn cmd_kill() {
     }
 }
 
+// Command: disk - show disk status (Phase 12)
+fn cmd_disk() {
+    // Get disk info via syscall wrappers
+    let present = sys_disk_info(0);
+    let total = sys_disk_info(1);
+
+    // Print "Disk: "
+    console_print_str(68, 105, 115, 107, 58, 32, 0, 0);
+
+    if present == 0 {
+        // Print "NO DISK"
+        console_print_str(78, 79, 32, 68, 73, 83, 75, 0);
+    } else {
+        // Print "ATA PIO"
+        console_print_str(65, 84, 65, 32, 80, 73, 79, 0);
+        console_putchar(10);
+
+        // Print "Sectors: <number>"
+        console_print_str(83, 101, 99, 116, 111, 114, 115, 58);  // "Sectors:"
+        console_putchar(32);
+
+        // Print number
+        console_print_dec(total);
+
+        // Print " (~<size>MB)"
+        console_putchar(32);
+        console_putchar(40);  // (
+        let mb = total / 2048;  // 512 bytes/sector, 1MB = 2048 sectors
+        console_print_dec(mb);
+        console_putchar(77);   // M
+        console_putchar(66);   // B
+        console_putchar(41);   // )
+    }
+    console_putchar(10);
+}
+
+// Command: sector <lba> - read and display sector (Phase 12)
+fn cmd_sector() {
+    // Check disk present
+    let present = sys_disk_info(0);
+    if present == 0 {
+        console_print_str(78, 79, 32, 68, 73, 83, 75, 0);  // "NO DISK"
+        console_putchar(10);
+        return;
+    }
+
+    // Parse LBA from position 7 (after "sector ")
+    let mut lba: i64 = 0;
+    let mut pos: i64 = 7;
+    let len = read_u64_addr(SHELL_LINE_LEN_ADDR) as i64;
+
+    while pos < len {
+        let ch = shell_line_get(pos);
+        if ch >= 48 && ch <= 57 {
+            lba = lba * 10 + (ch - 48);
+            pos = pos + 1;
+        } else {
+            pos = len;  // Exit loop
+        }
+    }
+
+    // Read sector to buffer
+    let bytes = sys_disk_read(lba, 1, ATA_BUFFER_ADDR);
+
+    if bytes < 0 {
+        console_print_str(69, 82, 82, 58, 32, 0, 0, 0);  // "ERR: "
+        console_print_dec(0 - bytes);
+        console_putchar(10);
+        return;
+    }
+
+    // Print "LBA <lba>:"
+    console_print_str(76, 66, 65, 32, 0, 0, 0, 0);  // "LBA "
+    console_print_dec(lba);
+    console_putchar(58);  // :
+    console_putchar(10);
+
+    // Display first 64 bytes in hex
+    let mut i: i64 = 0;
+    while i < 64 {
+        let byte = read_byte_addr(ATA_BUFFER_ADDR + i) as i64;
+        // Print as hex (2 digits)
+        let hi = byte / 16;
+        let lo = byte - (hi * 16);
+        if hi < 10 {
+            console_putchar(48 + hi);
+        } else {
+            console_putchar(65 + hi - 10);
+        }
+        if lo < 10 {
+            console_putchar(48 + lo);
+        } else {
+            console_putchar(65 + lo - 10);
+        }
+        console_putchar(32);  // space
+
+        // Newline every 16 bytes
+        let col = i + 1;
+        let row_check = col / 16;
+        let row_rem = col - (row_check * 16);
+        if row_rem == 0 {
+            console_putchar(10);
+        }
+        i = i + 1;
+    }
+}
+
+// Helper: print decimal number to console
+fn console_print_dec(value: i64) {
+    if value == 0 {
+        console_putchar(48);
+        return;
+    }
+
+    let mut num = value;
+    if num < 0 {
+        console_putchar(45);  // '-'
+        num = 0 - num;
+    }
+
+    // Count digits
+    let mut temp = num;
+    let mut digits: i64 = 0;
+    while temp > 0 {
+        temp = temp / 10;
+        digits = digits + 1;
+    }
+
+    // Print digits (up to 10 digits)
+    let mut divisor: i64 = 1;
+    let mut d: i64 = 1;
+    while d < digits {
+        divisor = divisor * 10;
+        d = d + 1;
+    }
+
+    while divisor > 0 {
+        let digit = num / divisor;
+        console_putchar(48 + digit);
+        num = num - (digit * divisor);
+        divisor = divisor / 10;
+    }
+}
+
+// Syscall wrapper: read disk sectors (Phase 12)
+fn sys_disk_read(lba: i64, count: i64, buffer: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_DISK_READ,
+            in("rdi") lba,
+            in("rsi") count,
+            in("rdx") buffer,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Syscall wrapper: get disk info (Phase 12)
+fn sys_disk_info(info_type: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") SYS_DISK_INFO,
+            in("rdi") info_type,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // Execute command in line buffer
 fn shell_execute() {
     let len = read_u64_addr(SHELL_LINE_LEN_ADDR) as i64;
@@ -4975,6 +5915,17 @@ fn shell_execute() {
                 shell_line_get(4) == 32 {
             cmd_kill();
         }
+        // "disk" = 100, 105, 115, 107
+        else if shell_cmd_match(100, 105, 115, 107, 0, 0, 0, 0) {
+            cmd_disk();
+        }
+        // "sector " = 115, 101, 99, 116, 111, 114, 32
+        else if shell_line_get(0) == 115 && shell_line_get(1) == 101 &&
+                shell_line_get(2) == 99 && shell_line_get(3) == 116 &&
+                shell_line_get(4) == 111 && shell_line_get(5) == 114 &&
+                shell_line_get(6) == 32 {
+            cmd_sector();
+        }
         else {
             // Unknown command
             console_print_str(63, 32, 0, 0, 0, 0, 0, 0);  // "? "
@@ -5016,7 +5967,7 @@ fn process_shell() {
     let green: i64 = 0x0A;
     let white: i64 = 0x0F;
 
-    // "Genesis Shell v0.0.11"
+    // "Genesis Shell v0.0.12"
     vga_write_char_color(0, CONSOLE_START_ROW, 71, green);   // G
     vga_write_char_color(1, CONSOLE_START_ROW, 101, green);  // e
     vga_write_char_color(2, CONSOLE_START_ROW, 110, green);  // n
@@ -5037,7 +5988,7 @@ fn process_shell() {
     vga_write_char_color(17, CONSOLE_START_ROW, 48, white);  // 0
     vga_write_char_color(18, CONSOLE_START_ROW, 46, white);  // .
     vga_write_char_color(19, CONSOLE_START_ROW, 49, white);  // 1
-    vga_write_char_color(20, CONSOLE_START_ROW, 49, white);  // 1
+    vga_write_char_color(20, CONSOLE_START_ROW, 50, white);  // 2
 
     // Move to next line and show prompt
     write_u64_addr(CONSOLE_CURSOR_X, 0);
@@ -5361,7 +6312,7 @@ fn _start() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
 
-    // Line 0: "Genesis Kernel v0.0.11"
+    // Line 0: "Genesis Kernel v0.0.12"
     vga_write_char(0, 0, 71, green);   // G
     vga_write_char(1, 0, 101, green);  // e
     vga_write_char(2, 0, 110, green);  // n
@@ -5383,7 +6334,7 @@ fn _start() {
     vga_write_char(18, 0, 48, white);  // 0
     vga_write_char(19, 0, 46, white);  // .
     vga_write_char(20, 0, 49, white);  // 1
-    vga_write_char(21, 0, 49, white);  // 1
+    vga_write_char(21, 0, 50, white);  // 2
 
     serial_out(118); // v
     serial_out(48);  // 0
@@ -5391,12 +6342,21 @@ fn _start() {
     serial_out(48);  // 0
     serial_out(46);  // .
     serial_out(49);  // 1
-    serial_out(49);  // 1
+    serial_out(50);  // 2
     serial_newline();
 
     // Initialize memory
     let mb_info_addr: i64 = 0;
     let mm_ok = init_memory(mb_info_addr);
+
+    // Initialize ATA disk driver
+    ata_init();
+
+    // Test PCI 32-bit port I/O
+    test_pci_ports();
+
+    // Test memory operations (L2)
+    test_memory_ops();
 
     // Initialize processes BEFORE interrupts (scheduler state must exist)
     init_processes();

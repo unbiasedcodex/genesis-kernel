@@ -1300,6 +1300,12 @@ fn sum_array_4(arr: [i64; 4]) -> i64 {
     sum
 }
 
+// L8.3: Function that returns an array
+fn make_array_4() -> [i64; 4] {
+    let arr: [i64; 4] = [100, 200, 300, 400];
+    arr
+}
+
 // L5: Main array test function
 fn test_array_ops() {
     // [ARR]
@@ -1472,6 +1478,28 @@ fn test_array_ops() {
         }
     } else {
         serial_out(114);  // r
+        serial_out(70);   // F
+        serial_out(49);   // 1
+        serial_out(32);   // space
+    }
+
+    // L8.3: Test array return from function
+    let returned_arr = make_array_4();
+    if returned_arr[0] == 100 {
+        if returned_arr[3] == 400 {
+            // "fOK" - function return works
+            serial_out(102);  // f
+            serial_out(79);   // O
+            serial_out(75);   // K
+            serial_out(32);   // space
+        } else {
+            serial_out(102);  // f
+            serial_out(70);   // F
+            serial_out(50);   // 2
+            serial_out(32);   // space
+        }
+    } else {
+        serial_out(102);  // f
         serial_out(70);   // F
         serial_out(49);   // 1
         serial_out(32);   // space

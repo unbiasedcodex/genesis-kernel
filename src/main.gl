@@ -1630,12 +1630,36 @@ fn test_enum_ops() {
     serial_out(93);   // ]
     serial_out(32);   // space
 
-    // L6: Enum support - COMPILER CRASHES
-    // When using enum values, compiler panics with:
-    // "Found PointerValue but expected the IntValue variant"
-    // This indicates enums are not properly implemented in codegen
-    // Output "N" (Not supported at all)
-    serial_out(78);   // N
+    // L10.1: Test enum instantiation
+    let state: ProcState = ProcState::Ready;
+
+    // Output "eOK" if enum instantiation works
+    serial_out(101);  // e
+    serial_out(79);   // O
+    serial_out(75);   // K
+    serial_out(32);   // space
+
+    // L10.2: Test enum comparison (positive)
+    if state == ProcState::Ready {
+        serial_out(99);   // c
+        serial_out(79);   // O
+        serial_out(75);   // K
+        serial_out(32);   // space
+    } else {
+        serial_out(99);   // c
+        serial_out(70);   // F
+        serial_out(32);   // space
+    }
+
+    // L10.2: Test enum comparison (negative)
+    if state == ProcState::Blocked {
+        serial_out(110);  // n
+        serial_out(70);   // F
+    } else {
+        serial_out(110);  // n
+        serial_out(79);   // O
+        serial_out(75);   // K
+    }
 
     serial_newline();
 }

@@ -1659,6 +1659,23 @@ fn test_enum_ops() {
         serial_out(110);  // n
         serial_out(79);   // O
         serial_out(75);   // K
+        serial_out(32);   // space
+    }
+
+    // L10.3: Test match with enum
+    let result = match state {
+        ProcState::Ready => 1,
+        ProcState::Running => 2,
+        ProcState::Blocked => 3,
+        ProcState::Unused => 0,
+    };
+    if result == 1 {
+        serial_out(109);  // m
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(109);  // m
+        serial_out(70);   // F
     }
 
     serial_newline();

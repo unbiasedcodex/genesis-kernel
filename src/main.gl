@@ -526,6 +526,17 @@ struct Rect {
     size: Point,
 }
 
+// L9.3: Three-level nested struct for testing deep nesting
+struct Line {
+    start: Point,
+    end: Point,
+}
+
+struct Canvas {
+    line: Line,
+    color: i64,
+}
+
 // L5.4: Struct with array field
 struct Buffer4 {
     data: [i64; 4],
@@ -1273,17 +1284,54 @@ fn test_struct_ops() {
         all_ok = 0;
     }
 
-    // Test second nested: known broken, output "n2N" (Not supported)
+    // Test second nested: now fixed!
     if sx == 100 {
         serial_out(110);  // n
         serial_out(50);   // 2
         serial_out(79);   // O
         serial_out(75);   // K
     } else {
-        // Expected: second nested struct access doesn't work
         serial_out(110);  // n
         serial_out(50);   // 2
-        serial_out(78);   // N (Not supported)
+        serial_out(70);   // F
+        all_ok = 0;
+    }
+
+    // Test three-level nesting: canvas.line.end.y
+    let start = Point { x: 10, y: 20 };
+    let end = Point { x: 30, y: 40 };
+    let line = Line { start: start, end: end };
+    let canvas = Canvas { line: line, color: 255 };
+
+    // Access three-level nested field: canvas.line.end.y (should be 40)
+    let ey = canvas.line.end.y;
+    if ey == 40 {
+        serial_out(110);  // n
+        serial_out(51);   // 3
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(110);  // n
+        serial_out(51);   // 3
+        serial_out(70);   // F
+        all_ok = 0;
+    }
+
+    // L9.4: Test nested field write
+    // Create a mutable rect and modify a nested field
+    let mut r2 = Rect { origin: Point { x: 1, y: 2 }, size: Point { x: 3, y: 4 } };
+    r2.origin.x = 99;  // Modify nested field
+    let wx = r2.origin.x;
+    if wx == 99 {
+        serial_out(32);   // space
+        serial_out(119);  // w
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(32);   // space
+        serial_out(119);  // w
+        serial_out(70);   // F
+        all_ok = 0;
     }
 
     serial_newline();
@@ -1505,16 +1553,38 @@ fn test_array_ops() {
         serial_out(32);   // space
     }
 
+    // L8.6: Test arr.len() intrinsic
+    let len_arr: [i64; 4] = [1, 2, 3, 4];
+    let len8_arr: [i64; 8] = [0; 8];
+    let len4 = len_arr.len();
+    let len8 = len8_arr.len();
+    if len4 == 4 {
+        if len8 == 8 {
+            // "lOK" - len() works
+            serial_out(108);  // l
+            serial_out(79);   // O
+            serial_out(75);   // K
+            serial_out(32);   // space
+        } else {
+            serial_out(108);  // l
+            serial_out(70);   // F
+            serial_out(50);   // 2
+            serial_out(32);   // space
+        }
+    } else {
+        serial_out(108);  // l
+        serial_out(70);   // F
+        serial_out(49);   // 1
+        serial_out(32);   // space
+    }
+
     // L5.4: Test array in struct
     let arr4: [i64; 4] = [5, 10, 15, 20];
     let buf = Buffer4 { data: arr4, len: 4 };
     let buf_len = buf.len;
     // Try to access array element through struct
-    // This may or may not work given other compiler limitations
     if buf_len == 4 {
         // Length field access works
-        // Note: Accessing buf.data[0] directly is likely not supported
-        // Output "sOK" for struct with array works
         serial_out(115);  // s
         serial_out(79);   // O
         serial_out(75);   // K
@@ -1523,6 +1593,24 @@ fn test_array_ops() {
         serial_out(115);  // s
         serial_out(70);   // F
         serial_out(32);   // space
+    }
+
+    // L8.4: Test struct.array[i] access
+    // This was previously broken due to struct type tracking issues
+    let el0 = buf.data[0];  // Should be 5
+    let el2 = buf.data[2];  // Should be 15
+    if el0 == 5 {
+        if el2 == 15 {
+            serial_out(97);   // a
+            serial_out(79);   // O
+            serial_out(75);   // K
+        } else {
+            serial_out(97);   // a
+            serial_out(70);   // F
+        }
+    } else {
+        serial_out(97);   // a
+        serial_out(70);   // F
     }
 
     serial_newline();

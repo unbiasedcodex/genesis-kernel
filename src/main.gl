@@ -1293,6 +1293,13 @@ fn test_struct_ops() {
 // L5: Array Testing
 // ============================================================
 
+// L5.5: Helper function that takes array as parameter
+// This tests passing arrays to functions (L8.1 fix)
+fn sum_array_4(arr: [i64; 4]) -> i64 {
+    let sum = arr[0] + arr[1] + arr[2] + arr[3];
+    sum
+}
+
 // L5: Main array test function
 fn test_array_ops() {
     // [ARR]
@@ -1390,13 +1397,23 @@ fn test_array_ops() {
         serial_out(32);   // space
     }
 
-    // L5.5: Test array as function parameter - NOT SUPPORTED
-    // Compiler bug: array as function parameter causes LLVM error
-    // "Call parameter type does not match function signature"
-    // Output "pN" (Not supported)
-    serial_out(112);  // p
-    serial_out(78);   // N
-    serial_out(32);   // space
+    // L5.5: Test array as function parameter (L8.1 fix)
+    // Previously: LLVM error "Call parameter type does not match"
+    // Now: Arrays passed by pointer, should work!
+    let test_arr: [i64; 4] = [10, 20, 30, 40];
+    let sum_result = sum_array_4(test_arr);
+    if sum_result == 100 {
+        // "pOK" - parameter works!
+        serial_out(112);  // p
+        serial_out(79);   // O
+        serial_out(75);   // K
+        serial_out(32);   // space
+    } else {
+        // "pF" - parameter failed
+        serial_out(112);  // p
+        serial_out(70);   // F
+        serial_out(32);   // space
+    }
 
     // L5.6: Test larger arrays
     // Test an 8-element array (64 bytes)

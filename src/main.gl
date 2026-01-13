@@ -1673,8 +1673,42 @@ fn test_enum_ops() {
         serial_out(109);  // m
         serial_out(79);   // O
         serial_out(75);   // K
+        serial_out(32);   // space
     } else {
         serial_out(109);  // m
+        serial_out(70);   // F
+        serial_out(32);   // space
+    }
+
+    // L10.4: Test Option with payload
+    let opt: Option<i64> = Option::Some(42);
+    let val = match opt {
+        Option::Some(x) => x,
+        Option::None => 0,
+    };
+    if val == 42 {
+        serial_out(111);  // o
+        serial_out(79);   // O
+        serial_out(75);   // K
+        serial_out(32);   // space
+    } else {
+        serial_out(111);  // o
+        serial_out(70);   // F
+        serial_out(32);   // space
+    }
+
+    // L10.4: Test Option::None
+    let none_opt: Option<i64> = Option::None;
+    let none_val = match none_opt {
+        Option::Some(x) => x,
+        Option::None => 99,
+    };
+    if none_val == 99 {
+        serial_out(78);   // N
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(78);   // N
         serial_out(70);   // F
     }
 

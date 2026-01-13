@@ -532,6 +532,14 @@ struct Buffer4 {
     len: i64,
 }
 
+// L6.1: Simple enum definition
+enum ProcState {
+    Unused,
+    Ready,
+    Running,
+    Blocked,
+}
+
 // ============================================================
 // Bitwise Operations Helper Functions
 // ============================================================
@@ -1434,6 +1442,30 @@ fn test_array_ops() {
         serial_out(70);   // F
         serial_out(32);   // space
     }
+
+    serial_newline();
+}
+
+// ============================================================
+// L6: Enum Testing
+// ============================================================
+
+// L6: Main enum test function
+fn test_enum_ops() {
+    // [ENM]
+    serial_out(91);   // [
+    serial_out(69);   // E
+    serial_out(78);   // N
+    serial_out(77);   // M
+    serial_out(93);   // ]
+    serial_out(32);   // space
+
+    // L6: Enum support - COMPILER CRASHES
+    // When using enum values, compiler panics with:
+    // "Found PointerValue but expected the IntValue variant"
+    // This indicates enums are not properly implemented in codegen
+    // Output "N" (Not supported at all)
+    serial_out(78);   // N
 
     serial_newline();
 }
@@ -6797,6 +6829,9 @@ fn _start() {
 
     // Test array operations (L5)
     test_array_ops();
+
+    // Test enum operations (L6)
+    test_enum_ops();
 
     // Initialize processes BEFORE interrupts (scheduler state must exist)
     init_processes();

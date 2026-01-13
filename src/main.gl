@@ -1440,6 +1440,43 @@ fn test_array_ops() {
         serial_out(32);   // space
     }
 
+    // L8.2: Test array repeat syntax [value; count]
+    let zeros: [i64; 4] = [0; 4];
+    let ones: [i64; 8] = [1; 8];
+    if zeros[0] == 0 {
+        if zeros[3] == 0 {
+            if ones[0] == 1 {
+                if ones[7] == 1 {
+                    // "rOK" - repeat works
+                    serial_out(114);  // r
+                    serial_out(79);   // O
+                    serial_out(75);   // K
+                    serial_out(32);   // space
+                } else {
+                    serial_out(114);  // r
+                    serial_out(70);   // F
+                    serial_out(52);   // 4
+                    serial_out(32);   // space
+                }
+            } else {
+                serial_out(114);  // r
+                serial_out(70);   // F
+                serial_out(51);   // 3
+                serial_out(32);   // space
+            }
+        } else {
+            serial_out(114);  // r
+            serial_out(70);   // F
+            serial_out(50);   // 2
+            serial_out(32);   // space
+        }
+    } else {
+        serial_out(114);  // r
+        serial_out(70);   // F
+        serial_out(49);   // 1
+        serial_out(32);   // space
+    }
+
     // L5.4: Test array in struct
     let arr4: [i64; 4] = [5, 10, 15, 20];
     let buf = Buffer4 { data: arr4, len: 4 };

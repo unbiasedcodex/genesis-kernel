@@ -2646,65 +2646,37 @@ pub fn isr_handler(frame_ptr: i64) {
 // ============================================================
 
 fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> i64 {
-    let mut result: i64 = -1;
-
-    if num == SYS_YIELD {
-        result = syscall_yield(frame_ptr);
-    } else if num == SYS_GETPID {
-        result = syscall_getpid();
-    } else if num == SYS_PRINT {
-        result = syscall_print(arg1);
-    } else if num == SYS_SEND {
-        result = syscall_send(arg1, arg2);
-    } else if num == SYS_RECV {
-        result = syscall_recv(arg1);
-    } else if num == SYS_EXIT {
-        result = syscall_exit();
-    } else if num == SYS_OPEN {
-        result = syscall_open(arg1);
-    } else if num == SYS_READ {
-        result = syscall_read(arg1, arg2);
-    } else if num == SYS_WRITE {
-        result = syscall_write(arg1, arg2);
-    } else if num == SYS_CLOSE {
-        result = syscall_close(arg1);
-    } else if num == SYS_FSTAT {
-        result = syscall_fstat(arg1);
-    } else if num == SYS_CAP_CREATE {
-        result = syscall_cap_create(arg1, arg2, arg3);
-    } else if num == SYS_CAP_DERIVE {
-        result = syscall_cap_derive(arg1, arg2);
-    } else if num == SYS_CAP_GRANT {
-        result = syscall_cap_grant(arg1, arg2);
-    } else if num == SYS_CAP_REVOKE {
-        result = syscall_cap_revoke(arg1);
-    } else if num == SYS_CAP_LIST {
-        result = syscall_cap_list(arg1);
-    } else if num == SYS_KB_READ {
-        result = syscall_kb_read();
-    } else if num == SYS_KB_AVAIL {
-        result = syscall_kb_avail();
-    } else if num == SYS_EXEC {
-        result = syscall_exec(arg1);
-    } else if num == SYS_KILL {
-        result = syscall_kill(arg1, arg2);
-    } else if num == SYS_WAIT {
-        result = syscall_wait(arg1, frame_ptr);
-    } else if num == SYS_GETPPID {
-        result = syscall_getppid();
-    } else if num == SYS_SHMGET {
-        result = syscall_shmget(arg1, arg2);
-    } else if num == SYS_SHMAT {
-        result = syscall_shmat(arg1);
-    } else if num == SYS_SHMDT {
-        result = syscall_shmdt(arg1);
-    } else if num == SYS_DISK_READ {
-        result = syscall_disk_read(arg1, arg2, arg3);
-    } else if num == SYS_DISK_INFO {
-        result = syscall_disk_info(arg1);
+    // L14: Syscall dispatch using match expression
+    match num {
+        0 => syscall_yield(frame_ptr),          // SYS_YIELD
+        1 => syscall_getpid(),                  // SYS_GETPID
+        2 => syscall_print(arg1),               // SYS_PRINT
+        3 => syscall_send(arg1, arg2),          // SYS_SEND
+        4 => syscall_recv(arg1),                // SYS_RECV
+        5 => syscall_exit(),                    // SYS_EXIT
+        6 => syscall_open(arg1),                // SYS_OPEN
+        7 => syscall_read(arg1, arg2),          // SYS_READ
+        8 => syscall_write(arg1, arg2),         // SYS_WRITE
+        9 => syscall_close(arg1),               // SYS_CLOSE
+        10 => syscall_fstat(arg1),              // SYS_FSTAT
+        11 => syscall_cap_create(arg1, arg2, arg3), // SYS_CAP_CREATE
+        12 => syscall_cap_derive(arg1, arg2),   // SYS_CAP_DERIVE
+        13 => syscall_cap_grant(arg1, arg2),    // SYS_CAP_GRANT
+        14 => syscall_cap_revoke(arg1),         // SYS_CAP_REVOKE
+        15 => syscall_cap_list(arg1),           // SYS_CAP_LIST
+        16 => syscall_kb_read(),                // SYS_KB_READ
+        17 => syscall_kb_avail(),               // SYS_KB_AVAIL
+        18 => syscall_exec(arg1),               // SYS_EXEC
+        19 => syscall_kill(arg1, arg2),         // SYS_KILL
+        20 => syscall_wait(arg1, frame_ptr),    // SYS_WAIT
+        21 => syscall_getppid(),                // SYS_GETPPID
+        22 => syscall_shmget(arg1, arg2),       // SYS_SHMGET
+        23 => syscall_shmat(arg1),              // SYS_SHMAT
+        24 => syscall_shmdt(arg1),              // SYS_SHMDT
+        25 => syscall_disk_read(arg1, arg2, arg3), // SYS_DISK_READ
+        26 => syscall_disk_info(arg1),          // SYS_DISK_INFO
+        _ => -1,                                // Unknown syscall
     }
-
-    result
 }
 
 // SYS_KB_READ - Read character from keyboard buffer

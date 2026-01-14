@@ -24,7 +24,17 @@ const PMM_STATE_ADDR: i64 = 0x408000;     // 4MB + 32KB - PMM state
 const MULTIBOOT_PTR_ADDR: i64 = 0x500;    // Multiboot info pointer (set by boot.asm)
 
 // Multiboot flags
-const MB_FLAG_MMAP: i64 = 64;
+const MB_FLAG_MODS: i64 = 8;              // Modules present (bit 3)
+const MB_FLAG_MMAP: i64 = 64;             // Memory map present (bit 6)
+
+// Multiboot info offsets
+const MB_MODS_COUNT: i64 = 20;            // Offset to mods_count
+const MB_MODS_ADDR: i64 = 24;             // Offset to mods_addr
+
+// Module entry offsets
+const MOD_START: i64 = 0;                 // Module start address
+const MOD_END: i64 = 4;                   // Module end address
+const MOD_CMDLINE: i64 = 8;               // Command line string pointer
 
 // Interrupt constants
 const IDT_ENTRIES: i64 = 256;
@@ -2098,39 +2108,34 @@ fn pmm_init(max_addr: u64) {
 }
 
 fn pmm_mark_free(base: u64, length: u64) {
-    let page_size = PAGE_SIZE as u64;
-    let start_page = (base + page_size - 1) / page_size;
-    let end_page = (base + length) / page_size;
+    // Mark a range of physical memory as free in the PMM bitmap
+    // Each bit in the bitmap represents a 4KB page
+    // 0 = free, 1 = used
 
-    if start_page >= end_page {
-        return;
-    }
+    let start_page = base / (PAGE_SIZE as u64);
+    let end_page = (base + length) / (PAGE_SIZE as u64);
 
-    let mut free_count: u64 = 0;
     let mut page = start_page;
-
     while page < end_page {
-        let page_addr = page * page_size;
-        if page_addr >= 0x800000 {
-            let idx = page / 64;
-            let bit = page % 64;
-            let bitmap_offset = (idx * 8) as i64;
+        let qword_idx = page / 64;
+        let bit_idx = page % 64;
+        let bitmap_offset = (qword_idx * 8) as i64;
 
-            if idx < 4096 {
-                let current = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
-                let mask = shl_u64(1, bit);
+        // Read current entry
+        let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
 
-                if bit_and(current, mask) != 0 {
-                    write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, bit_and(current, bit_not(mask)));
-                    free_count = free_count + 1;
-                }
-            }
-        }
+        // Clear the bit (mark as free)
+        let mask = shl_u64(1, bit_idx);
+        let new_entry = bit_and(entry, bit_not(mask));
+
+        write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, new_entry);
+
+        // Update free page count
+        let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
+        write_u64_at(PMM_STATE_ADDR, 8, current_free + 1);
+
         page = page + 1;
     }
-
-    let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
-    write_u64_at(PMM_STATE_ADDR, 8, current_free + free_count);
 }
 
 fn pmm_alloc_page() -> u64 {
@@ -2199,47 +2204,145 @@ fn pmm_get_free_pages() -> u64 {
 // ============================================================
 
 fn parse_multiboot(mb_info_addr: i64) -> u64 {
-    let flags = read_u32_at(mb_info_addr, 0) as u64;
-    let mmap_flag = MB_FLAG_MMAP as u64;
+    // Use fixed 128MB (pmm_mark_free now uses chunked approach)
+    let usable_start: u64 = 0x800000;   // 8MB
+    let usable_end: u64 = 0x8000000;    // 128MB
+    pmm_mark_free(usable_start, usable_end - usable_start);
+    usable_end
+}
 
-    if bit_and(flags, mmap_flag) == 0 {
-        let mem_kb = read_u32_at(mb_info_addr, 8);
-        return (mem_kb as u64 + 1024) * 1024;
+// ============================================================
+// Multiboot Module Loading
+// ============================================================
+
+// Global storage for init module info
+const INIT_MODULE_START: i64 = 0x600;     // Store init start addr
+const INIT_MODULE_END: i64 = 0x608;       // Store init end addr
+const INIT_MODULE_PRESENT: i64 = 0x610;   // Flag: 1 if init found
+
+// Load modules from multiboot info into RAMFS
+fn load_multiboot_modules(mb_info_addr: i64) {
+    if mb_info_addr == 0 {
+        return;
     }
 
-    let mmap_length = read_u32_at(mb_info_addr, 44);
-    let mmap_addr = read_u32_at(mb_info_addr, 48) as i64;
+    let flags = read_u32_at(mb_info_addr, 0) as i64;
 
-    let mut highest: u64 = 0;
-    let mut offset: i64 = 0;
+    // Check if modules flag is set (bit 3)
+    let has_mods = flags & MB_FLAG_MODS;
+    if has_mods == 0 {
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_out(77);  // M
+        serial_out(79);  // O
+        serial_out(68);  // D
+        serial_newline();
+        return;
+    }
 
-    while offset < (mmap_length as i64) {
-        let entry_ptr = mmap_addr + offset;
-        let entry_size = read_u32_at(entry_ptr, 0);
+    let mods_count = read_u32_at(mb_info_addr, MB_MODS_COUNT) as i64;
+    let mods_addr = read_u32_at(mb_info_addr, MB_MODS_ADDR) as i64;
 
-        let entry_type = read_u32_at(entry_ptr, 20);
+    // Print module count
+    serial_out(77);  // M
+    serial_out(79);  // O
+    serial_out(68);  // D
+    serial_out(83);  // S
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(mods_count);
+    serial_newline();
 
-        if entry_type == 1 {
-            let base_low = read_u32_at(entry_ptr, 4);
-            let base_high = read_u32_at(entry_ptr, 8);
-            let len_low = read_u32_at(entry_ptr, 12);
-            let len_high = read_u32_at(entry_ptr, 16);
+    // Process each module
+    let mut i: i64 = 0;
+    while i < mods_count {
+        let mod_entry = mods_addr + (i * 16);  // Each entry is 16 bytes
 
-            let base = (base_high as u64) * 0x100000000 + (base_low as u64);
-            let length = (len_high as u64) * 0x100000000 + (len_low as u64);
+        let mod_start = read_u32_at(mod_entry, MOD_START) as i64;
+        let mod_end = read_u32_at(mod_entry, MOD_END) as i64;
+        let mod_size = mod_end - mod_start;
 
-            let end = base + length;
-            if end > highest {
-                highest = end;
-            }
+        // Print module info
+        serial_out(32);  // space
+        serial_out(91);  // [
+        serial_print_dec(i);
+        serial_out(93);  // ]
+        serial_out(32);  // space
+        serial_print_hex64(mod_start as u64);
+        serial_out(45);  // -
+        serial_print_hex64(mod_end as u64);
+        serial_out(32);  // space
+        serial_out(40);  // (
+        serial_print_dec(mod_size);
+        serial_out(41);  // )
+        serial_newline();
 
-            pmm_mark_free(base, length);
+        // Store first module as init
+        if i == 0 {
+            write_u64_addr(INIT_MODULE_START, mod_start as u64);
+            write_u64_addr(INIT_MODULE_END, mod_end as u64);
+            write_u64_addr(INIT_MODULE_PRESENT, 1);
+
+            // Copy module to RAMFS as "init"
+            copy_module_to_ramfs(mod_start, mod_size);
         }
 
-        offset = offset + (entry_size as i64) + 4;
+        i = i + 1;
+    }
+}
+
+// Copy module bytes to RAMFS file named "init"
+fn copy_module_to_ramfs(src_addr: i64, size: i64) {
+    // Create "init" file in RAMFS
+    // "init" = 105, 110, 105, 116
+    let file_idx = ramfs_create_file_internal(105, 110, 105, 116, 0, 0, 0, 0);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return;
     }
 
-    highest
+    // Get data block address for this file
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let dest_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Copy bytes from module to RAMFS
+    let mut offset: i64 = 0;
+    while offset < size {
+        let byte = read_byte_addr(src_addr + offset);
+        write_byte_addr(dest_addr + offset, byte);
+        offset = offset + 1;
+    }
+
+    // Set file size
+    ramfs_set_file_size(file_idx, size);
+
+    // Print confirmation
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(73);  // I
+    serial_out(84);  // T
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(size);
+    serial_out(66);  // B
+    serial_newline();
+}
+
+// Execute init from RAMFS
+fn exec_init() -> i64 {
+    let present = read_u64_addr(INIT_MODULE_PRESENT);
+    if present != 1 {
+        return 0 - 1;
+    }
+
+    // Execute "init" from RAMFS
+    // "init" packed: 0x74696E69
+    let name: u64 = 0x74696E69;  // "init" in little-endian
+    elf_exec(name)
 }
 
 // ============================================================
@@ -7381,8 +7484,8 @@ fn _start() {
     serial_out(50);  // 2
     serial_newline();
 
-    // Initialize memory
-    let mb_info_addr: i64 = 0;
+    // Read multiboot info address from 0x500 (stored by boot.asm)
+    let mb_info_addr: i64 = read_u32_at(0x500, 0) as i64;
     let mm_ok = init_memory(mb_info_addr);
 
     // Initialize ATA disk driver
@@ -7408,6 +7511,12 @@ fn _start() {
 
     // Initialize processes BEFORE interrupts (scheduler state must exist)
     init_processes();
+
+    // TODO: Load GRUB modules into RAMFS
+    // load_multiboot_modules(mb_info_addr);
+
+    // TODO: Execute init process (PID 1) if present
+    // let init_pid = exec_init();
 
     // Initialize interrupts (this enables timer which triggers scheduler)
     init_interrupts();

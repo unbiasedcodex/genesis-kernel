@@ -81,14 +81,18 @@ gdt64_ptr64:
 section .bss
 align 4096
 
+; IMPORTANT: Stack must come FIRST in BSS so overflow doesn't corrupt page tables
+; Stack grows downward, so if it overflows it goes into lower addresses (unused)
+; rather than into the page tables
+
+stack_bottom:
+    resb 262144   ; 256KB stack
+stack_top:
+
+align 4096
 pml4:   resb 4096
 pdpt:   resb 4096
 pd:     resb 4096
-
-align 16
-stack_bottom:
-    resb 65536
-stack_top:
 
 ; ============================================================
 ; TSS (Task State Segment) - 64-bit

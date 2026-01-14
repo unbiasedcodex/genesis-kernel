@@ -2599,45 +2599,50 @@ pub fn isr_handler(frame_ptr: i64) {
 
     let int_num = read_stack_u64(frame_ptr, 128) as i64;
 
-    if int_num == 128 {
-        // System call (INT 0x80)
-        // Syscall ABI: RAX = syscall number, RDI = arg1, RSI = arg2, RDX = arg3
-        let syscall_num = read_stack_u64(frame_ptr, 120) as i64;  // RAX
-        let arg1 = read_stack_u64(frame_ptr, 80) as i64;          // RDI
-        let arg2 = read_stack_u64(frame_ptr, 88) as i64;          // RSI
-        let arg3 = read_stack_u64(frame_ptr, 96) as i64;          // RDX
+    // L14: Interrupt dispatch using match
+    // Categories: 0-31 = CPU exceptions, 32-47 = IRQs, 128 = syscall
+    match int_num {
+        128 => {
+            // System call (INT 0x80)
+            // Syscall ABI: RAX = syscall number, RDI = arg1, RSI = arg2, RDX = arg3
+            let syscall_num = read_stack_u64(frame_ptr, 120) as i64;  // RAX
+            let arg1 = read_stack_u64(frame_ptr, 80) as i64;          // RDI
+            let arg2 = read_stack_u64(frame_ptr, 88) as i64;          // RSI
+            let arg3 = read_stack_u64(frame_ptr, 96) as i64;          // RDX
 
-        let result = handle_syscall(syscall_num, arg1, arg2, arg3, frame_ptr);
+            let result = handle_syscall(syscall_num, arg1, arg2, arg3, frame_ptr);
 
-        // Store result in RAX on the stack (will be restored by iretq)
-        write_u64_addr(frame_ptr + 120, result as u64);
-    } else if int_num < 32 {
-        // CPU Exception
-        let error_code = read_stack_u64(frame_ptr, 136);
-        let rip = read_stack_u64(frame_ptr, 144);
-        handle_exception(int_num, error_code, rip);
-    } else if int_num < 48 {
-        // Hardware IRQ
-        let irq = int_num - 32;
-        handle_irq(irq);
+            // Store result in RAX on the stack (will be restored by iretq)
+            write_u64_addr(frame_ptr + 120, result as u64);
+        },
+        32 => {
+            // Timer interrupt (IRQ 0) - needs special handling for context switch
+            handle_irq(0);
 
-        // On timer interrupt (IRQ 0), check for context switch
-        if irq == 0 {
             let current = get_current_pid();
-
-            // Only save RSP if process was RUNNING (was scheduled before)
-            // This prevents overwriting initial RSP of idle process
             let current_state = pcb_get_state(current);
             if current_state == ProcState::Running {
                 pcb_set_rsp(current, frame_ptr);
             }
 
-            // Get next process RSP (scheduler updates current_pid)
             let new_rsp = schedule_pick_next();
             if new_rsp != 0 {
                 write_u64_addr(SWITCH_RSP_ADDR, new_rsp as u64);
             }
-        }
+        },
+        33 => handle_irq(1),  // Keyboard interrupt (IRQ 1)
+        _ => {
+            // Handle remaining cases by category
+            if int_num < 32 {
+                // CPU Exception (0-31)
+                let error_code = read_stack_u64(frame_ptr, 136);
+                let rip = read_stack_u64(frame_ptr, 144);
+                handle_exception(int_num, error_code, rip);
+            } else if int_num < 48 {
+                // Other hardware IRQs (34-47)
+                handle_irq(int_num - 32);
+            }
+        },
     }
 }
 
@@ -4807,12 +4812,11 @@ fn handle_exception(num: i64, error_code: u64, rip: u64) {
 }
 
 fn handle_irq(irq: i64) {
-    if irq == 0 {
-        // Timer interrupt
-        handle_timer();
-    } else if irq == 1 {
-        // Keyboard interrupt
-        handle_keyboard();
+    // L14: IRQ dispatch using match
+    match irq {
+        0 => handle_timer(),      // Timer interrupt (IRQ0)
+        1 => handle_keyboard(),   // Keyboard interrupt (IRQ1)
+        _ => {},                  // Other IRQs (not handled yet)
     }
 
     // Send EOI
@@ -5920,19 +5924,13 @@ fn process_vfs_server() {
             // Extract command type from message (low byte)
             let cmd = msg % 256;
 
-            // Handle VFS commands
-            if cmd == VFS_LIST {
-                // List files: respond with file count
-                vfs_handle_list();
-            } else if cmd == VFS_OPEN {
-                // Open file: extract filename from message
-                vfs_handle_open(msg);
-            } else if cmd == VFS_READ {
-                // Read file
-                vfs_handle_read(msg);
-            } else if cmd == VFS_STAT {
-                // Get file info
-                vfs_handle_stat(msg);
+            // L14: VFS command dispatch using match
+            match cmd {
+                8 => vfs_handle_list(),       // VFS_LIST
+                1 => vfs_handle_open(msg),    // VFS_OPEN
+                2 => vfs_handle_read(msg),    // VFS_READ
+                5 => vfs_handle_stat(msg),    // VFS_STAT
+                _ => {},                      // Unknown command
             }
         }
 

@@ -916,19 +916,14 @@ fn memset(dst: i64, value: i64, len: i64) {
 
 // L2.3: Compare memory blocks
 // Returns: 0 if equal, difference of first non-matching byte otherwise
-// Note: Uses result variable to avoid early return bug in compiler
 fn memcmp(a: i64, b: i64, len: i64) -> i64 {
     let mut i: i64 = 0;
     let mut result: i64 = 0;
-    let mut found_diff: bool = false;
-    while i < len {
-        if !found_diff {
-            let byte_a = read_byte_addr(a + i);
-            let byte_b = read_byte_addr(b + i);
-            if byte_a != byte_b {
-                result = byte_a - byte_b;
-                found_diff = true;
-            }
+    while i < len && result == 0 {
+        let byte_a = read_byte_addr(a + i);
+        let byte_b = read_byte_addr(b + i);
+        if byte_a != byte_b {
+            result = byte_a - byte_b;
         }
         i = i + 1;
     }

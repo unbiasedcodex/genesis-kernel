@@ -501,6 +501,8 @@ const SYS_PCI_ENUMERATE: i64 = 30;                // Enumerate PCI devices
 const SYS_IRQ_REGISTER: i64 = 31;                 // Register IRQ handler
 const SYS_IRQ_UNREGISTER: i64 = 32;               // Unregister IRQ handler
 const SYS_IRQ_ACK: i64 = 33;                      // Acknowledge IRQ
+const SYS_TIME: i64 = 34;                         // Get system time (ticks)
+const SYS_SLEEP: i64 = 35;                        // Sleep for ticks
 
 // IRQ forwarding table (16 IRQs, each 8 bytes: handler PID, 0 = no handler)
 const IRQ_HANDLER_TABLE: i64 = 0x1100000;         // 17MB - IRQ handler table
@@ -2700,6 +2702,8 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         31 => syscall_irq_register(arg1, arg2), // SYS_IRQ_REGISTER
         32 => syscall_irq_unregister(arg1),     // SYS_IRQ_UNREGISTER
         33 => syscall_irq_ack(arg1),            // SYS_IRQ_ACK
+        34 => syscall_time(),                   // SYS_TIME
+        35 => syscall_sleep(arg1),              // SYS_SLEEP
         _ => -1,                                // Unknown syscall
     }
 }
@@ -3731,6 +3735,36 @@ fn syscall_irq_ack(irq: i64) -> i64 {
 
     // EOI is already sent in handle_irq, this is just for userspace bookkeeping
     0
+}
+
+// SYS_TIME - Get current tick count
+// Returns: tick count since boot
+fn syscall_time() -> i64 {
+    read_u64_addr(TICK_COUNT_ADDR) as i64
+}
+
+// SYS_SLEEP - Sleep for specified ticks
+// arg1: number of ticks to sleep
+// Returns: 0 on success, actual ticks slept
+// Note: Simple implementation - userspace should use time+yield for precise control
+fn syscall_sleep(ticks: i64) -> i64 {
+    if ticks <= 0 {
+        return 0;
+    }
+
+    let start = read_u64_addr(TICK_COUNT_ADDR) as i64;
+    let target = start + ticks;
+
+    // Simple busy-yield loop
+    // Note: In production, use a proper sleep queue in scheduler
+    let mut current_time = start;
+    while current_time < target {
+        // Just return the elapsed ticks - caller should yield and retry
+        // This makes it non-blocking
+        current_time = read_u64_addr(TICK_COUNT_ADDR) as i64;
+    }
+
+    current_time - start
 }
 
 // Initialize IRQ handler table

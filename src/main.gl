@@ -871,7 +871,7 @@ fn test_pci_ports() {
     let vendor_device = pci_config_read(0, 0, 0, 0);
 
     // Extract vendor ID (lower 16 bits)
-    let vendor = vendor_device - ((vendor_device / 65536) * 65536);
+    let vendor = vendor_device % 65536;
 
     // 0xFFFF means no device, but we should have host bridge
     if vendor != 0xFFFF {
@@ -3136,18 +3136,14 @@ fn ata_read_alt_status() -> i64 {
 fn ata_wait_not_busy() -> i64 {
     let mut timeout: i64 = 100000;
     let mut result: i64 = ATA_ERR_TIMEOUT;
-
-    while timeout > 0 {
-        let status = ata_read_status();
-        let is_busy = status / 128;  // BSY is bit 7 (0x80)
-        if is_busy == 0 {
+    while timeout > 0 && result != ATA_OK {
+        let status = ata_read_status() as u64;
+        // BSY is bit 7 (0x80)
+        if bit_and(status, ATA_SR_BSY as u64) == 0 {
             result = ATA_OK;
-            timeout = 0;  // Exit loop
-        } else {
-            timeout = timeout - 1;
         }
+        timeout = timeout - 1;
     }
-
     result
 }
 
@@ -3156,28 +3152,19 @@ fn ata_wait_not_busy() -> i64 {
 fn ata_wait_drq() -> i64 {
     let mut timeout: i64 = 100000;
     let mut result: i64 = ATA_ERR_TIMEOUT;
-
-    while timeout > 0 {
-        let status = ata_read_status();
+    while timeout > 0 && result == ATA_ERR_TIMEOUT {
+        let status = ata_read_status() as u64;
 
         // Check ERR bit (bit 0)
-        let err_bit = status - ((status / 2) * 2);
-        if err_bit != 0 {
+        if bit_and(status, ATA_SR_ERR as u64) != 0 {
             result = ATA_ERR_IO;
-            timeout = 0;  // Exit loop
-        } else {
+        } else if bit_and(status, ATA_SR_DRQ as u64) != 0 {
             // Check DRQ bit (bit 3 = 0x08)
-            let drq_check = status / 8;
-            let drq_bit = drq_check - ((drq_check / 2) * 2);
-            if drq_bit != 0 {
-                result = ATA_OK;
-                timeout = 0;  // Exit loop
-            } else {
-                timeout = timeout - 1;
-            }
+            result = ATA_OK;
         }
-    }
 
+        timeout = timeout - 1;
+    }
     result
 }
 
@@ -3294,8 +3281,8 @@ fn ata_identify() -> i64 {
         let word = ata_read_data_word();
         let addr = ATA_IDENTIFY_ADDR + (i * 2);
         // Store as 16-bit value
-        let byte_lo = word - ((word / 256) * 256);
-        let byte_hi = word / 256;
+        let byte_lo = bit_and(word as u64, 0xFF) as i64;
+        let byte_hi = shr_u64(word as u64, 8) as i64;
         write_byte_addr(addr, byte_lo);
         write_byte_addr(addr + 1, byte_hi);
         i = i + 1;
@@ -3344,10 +3331,10 @@ fn ata_read_sectors(lba: i64, count: i64, buffer: i64) -> i64 {
     // Set sector count
     outb(ATA_PRIMARY_IO + ATA_SECCOUNT, count);
 
-    // Set LBA address (bits 0-23)
-    let lba_lo = lba - ((lba / 256) * 256);
-    let lba_mid_val = (lba / 256) - ((lba / 65536) * 256);
-    let lba_hi_val = (lba / 65536) - ((lba / 16777216) * 256);
+    // Set LBA address (bits 0-23) using bit operations
+    let lba_lo = bit_and(lba as u64, 0xFF) as i64;
+    let lba_mid_val = bit_and(shr_u64(lba as u64, 8), 0xFF) as i64;
+    let lba_hi_val = bit_and(shr_u64(lba as u64, 16), 0xFF) as i64;
 
     outb(ATA_PRIMARY_IO + ATA_LBA_LO, lba_lo);
     outb(ATA_PRIMARY_IO + ATA_LBA_MID, lba_mid_val);
@@ -3373,8 +3360,8 @@ fn ata_read_sectors(lba: i64, count: i64, buffer: i64) -> i64 {
             while word_idx < 256 {
                 let word = ata_read_data_word();
                 let byte_offset = buffer + sector_offset + (word_idx * 2);
-                let byte_lo = word - ((word / 256) * 256);
-                let byte_hi = word / 256;
+                let byte_lo = bit_and(word as u64, 0xFF) as i64;
+                let byte_hi = shr_u64(word as u64, 8) as i64;
                 write_byte_addr(byte_offset, byte_lo);
                 write_byte_addr(byte_offset + 1, byte_hi);
                 word_idx = word_idx + 1;

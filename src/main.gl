@@ -86,10 +86,7 @@ const PCB_FLAGS: i64 = 40;        // Process flags (bit 0 = user mode)
 // Process flags
 const PROC_FLAG_USER: i64 = 1;    // Process runs in user mode (ring 3)
 
-// Process states
-const PROC_UNUSED: i64 = 0;
-const PROC_READY: i64 = 1;
-const PROC_RUNNING: i64 = 2;
+// Process states: See ProcState enum and proc_state_to_i64/i64_to_proc_state
 
 // Test process counters (persistent memory)
 const PROC_A_COUNTER: i64 = 0x422000;
@@ -436,11 +433,6 @@ const PCB_CHILD_COUNT: i64 = 72;                  // Number of child processes (
 // Extended PCB size
 const PCB_SIZE_EXT: i64 = 80;
 
-// Additional process states
-const PROC_WAITING: i64 = 3;                      // Blocked waiting for child
-const PROC_ZOMBIE: i64 = 4;                       // Exited, waiting for parent to reap
-const PROC_STOPPED: i64 = 5;                      // Stopped by signal
-
 // ============================================================
 // ATA PIO Constants (Phase 12)
 // ============================================================
@@ -543,12 +535,41 @@ struct Buffer4 {
     len: i64,
 }
 
-// L6.1: Simple enum definition
+// L14.3: Process state enum (replaces PROC_* integer constants)
+// Discriminants: Unused=0, Ready=1, Running=2, Waiting=3, Zombie=4, Stopped=5
 enum ProcState {
     Unused,
     Ready,
     Running,
-    Blocked,
+    Waiting,
+    Zombie,
+    Stopped,
+}
+
+// Convert ProcState to i64 for storage in PCB memory
+fn proc_state_to_i64(state: ProcState) -> i64 {
+    match state {
+        ProcState::Unused => 0,
+        ProcState::Ready => 1,
+        ProcState::Running => 2,
+        ProcState::Waiting => 3,
+        ProcState::Zombie => 4,
+        ProcState::Stopped => 5,
+    }
+}
+
+// Convert i64 from PCB memory to ProcState
+// Returns Unused for invalid values
+fn i64_to_proc_state(n: i64) -> ProcState {
+    match n {
+        0 => ProcState::Unused,
+        1 => ProcState::Ready,
+        2 => ProcState::Running,
+        3 => ProcState::Waiting,
+        4 => ProcState::Zombie,
+        5 => ProcState::Stopped,
+        _ => ProcState::Unused,
+    }
 }
 
 // ============================================================
@@ -1636,7 +1657,7 @@ fn test_enum_ops() {
     }
 
     // L10.2: Test enum comparison (negative)
-    if state == ProcState::Blocked {
+    if state == ProcState::Waiting {
         serial_out(110);  // n
         serial_out(70);   // F
     } else {
@@ -1648,10 +1669,12 @@ fn test_enum_ops() {
 
     // L10.3: Test match with enum
     let result = match state {
+        ProcState::Unused => 0,
         ProcState::Ready => 1,
         ProcState::Running => 2,
-        ProcState::Blocked => 3,
-        ProcState::Unused => 0,
+        ProcState::Waiting => 3,
+        ProcState::Zombie => 4,
+        ProcState::Stopped => 5,
     };
     if result == 1 {
         serial_out(109);  // m
@@ -2605,7 +2628,7 @@ pub fn isr_handler(frame_ptr: i64) {
             // Only save RSP if process was RUNNING (was scheduled before)
             // This prevents overwriting initial RSP of idle process
             let current_state = pcb_get_state(current);
-            if current_state == PROC_RUNNING {
+            if current_state == ProcState::Running {
                 pcb_set_rsp(current, frame_ptr);
             }
 
@@ -2714,7 +2737,7 @@ fn syscall_yield(frame_ptr: i64) -> i64 {
 
     // Save current RSP
     let current_state = pcb_get_state(current);
-    if current_state == PROC_RUNNING {
+    if current_state == ProcState::Running {
         pcb_set_rsp(current, frame_ptr);
     }
 
@@ -2760,19 +2783,19 @@ fn syscall_exit_code(exit_code: i64) -> i64 {
     // Check if parent exists and should be notified
     if parent > 0 && proc_is_valid(parent) {
         // Become zombie - wait for parent to reap
-        pcb_set_state(current, PROC_ZOMBIE);
+        pcb_set_state(current, ProcState::Zombie);
 
         // Send SIGCHLD to parent
         pcb_add_signal(parent, SIGCHLD);
 
         // If parent is waiting, wake it up
         let parent_state = pcb_get_state(parent);
-        if parent_state == PROC_WAITING {
-            pcb_set_state(parent, PROC_READY);
+        if parent_state == ProcState::Waiting {
+            pcb_set_state(parent, ProcState::Ready);
         }
     } else {
         // No parent to notify, go directly to UNUSED
-        pcb_set_state(current, PROC_UNUSED);
+        pcb_set_state(current, ProcState::Unused);
 
         // Clean up child count for parent if any
         if parent >= 0 && proc_is_valid(parent) {
@@ -2832,7 +2855,7 @@ fn syscall_kill(target_pid: i64, signum: i64) -> i64 {
     if signum == SIGKILL {
         let target_state = pcb_get_state(target_pid);
         // Can't kill zombie or unused process
-        if target_state == PROC_ZOMBIE || target_state == PROC_UNUSED {
+        if target_state == ProcState::Zombie || target_state == ProcState::Unused {
             return SIG_ERR_NO_PROC;
         }
 
@@ -2841,14 +2864,14 @@ fn syscall_kill(target_pid: i64, signum: i64) -> i64 {
 
         let parent = pcb_get_parent(target_pid);
         if parent > 0 && proc_is_valid(parent) {
-            pcb_set_state(target_pid, PROC_ZOMBIE);
+            pcb_set_state(target_pid, ProcState::Zombie);
             pcb_add_signal(parent, SIGCHLD);
             let parent_state = pcb_get_state(parent);
-            if parent_state == PROC_WAITING {
-                pcb_set_state(parent, PROC_READY);
+            if parent_state == ProcState::Waiting {
+                pcb_set_state(parent, ProcState::Ready);
             }
         } else {
-            pcb_set_state(target_pid, PROC_UNUSED);
+            pcb_set_state(target_pid, ProcState::Unused);
         }
         return 0;
     }
@@ -2856,8 +2879,8 @@ fn syscall_kill(target_pid: i64, signum: i64) -> i64 {
     // Handle SIGSTOP - stop process
     if signum == SIGSTOP {
         let target_state = pcb_get_state(target_pid);
-        if target_state == PROC_READY || target_state == PROC_RUNNING {
-            pcb_set_state(target_pid, PROC_STOPPED);
+        if target_state == ProcState::Ready || target_state == ProcState::Running {
+            pcb_set_state(target_pid, ProcState::Stopped);
         }
         return 0;
     }
@@ -2865,8 +2888,8 @@ fn syscall_kill(target_pid: i64, signum: i64) -> i64 {
     // Handle SIGCONT - continue stopped process
     if signum == SIGCONT {
         let target_state = pcb_get_state(target_pid);
-        if target_state == PROC_STOPPED {
-            pcb_set_state(target_pid, PROC_READY);
+        if target_state == ProcState::Stopped {
+            pcb_set_state(target_pid, ProcState::Ready);
         }
         return 0;
     }
@@ -2900,7 +2923,7 @@ fn syscall_wait(wait_pid: i64, frame_ptr: i64) -> i64 {
         let parent = pcb_get_parent(i);
 
         // Check if this is our zombie child
-        if state == PROC_ZOMBIE && parent == current {
+        if state == ProcState::Zombie && parent == current {
             // If wait_pid is -1 (any child) or matches
             if wait_pid < 0 || wait_pid == i {
                 found_pid = i;
@@ -2916,7 +2939,7 @@ fn syscall_wait(wait_pid: i64, frame_ptr: i64) -> i64 {
         let exit_code = pcb_get_exit_code(found_pid);
 
         // Clean up zombie
-        pcb_set_state(found_pid, PROC_UNUSED);
+        pcb_set_state(found_pid, ProcState::Unused);
 
         // Decrement child count
         let new_children = children - 1;
@@ -2939,7 +2962,7 @@ fn syscall_wait(wait_pid: i64, frame_ptr: i64) -> i64 {
     }
 
     // No zombie found - block waiting
-    pcb_set_state(current, PROC_WAITING);
+    pcb_set_state(current, ProcState::Waiting);
     pcb_set_rsp(current, frame_ptr);
 
     // Context switch to another process
@@ -4486,7 +4509,7 @@ fn elf_create_process(entry: i64) -> i64 {
 
     // Fill PCB
     write_u64_addr(pcb + PCB_PID, pid as u64);
-    write_u64_addr(pcb + PCB_STATE, PROC_READY as u64);
+    write_u64_addr(pcb + PCB_STATE, proc_state_to_i64(ProcState::Ready) as u64);
     write_u64_addr(pcb + PCB_RSP, initial_rsp as u64);
     write_u64_addr(pcb + PCB_STACK_BASE, user_stack_base as u64);
     write_u64_addr(pcb + PCB_KSTACK_BASE, kernel_stack_base as u64);
@@ -5213,14 +5236,14 @@ fn pcb_get_pid(pid: i64) -> i64 {
     read_u64_addr(addr + PCB_PID) as i64
 }
 
-fn pcb_get_state(pid: i64) -> i64 {
+fn pcb_get_state(pid: i64) -> ProcState {
     let addr = pcb_addr(pid);
-    read_u64_addr(addr + PCB_STATE) as i64
+    i64_to_proc_state(read_u64_addr(addr + PCB_STATE) as i64)
 }
 
-fn pcb_set_state(pid: i64, state: i64) {
+fn pcb_set_state(pid: i64, state: ProcState) {
     let addr = pcb_addr(pid);
-    write_u64_addr(addr + PCB_STATE, state as u64);
+    write_u64_addr(addr + PCB_STATE, proc_state_to_i64(state) as u64);
 }
 
 fn pcb_get_rsp(pid: i64) -> i64 {
@@ -5358,7 +5381,7 @@ fn proc_is_valid(pid: i64) -> bool {
     let mut result: bool = false;
     if pid >= 0 && pid < MAX_PROCS {
         let state = pcb_get_state(pid);
-        result = state != PROC_UNUSED;
+        result = state != ProcState::Unused;
     }
     result
 }
@@ -5402,7 +5425,7 @@ fn proc_create(entry: i64) -> i64 {
 
     // Fill PCB
     write_u64_addr(pcb + PCB_PID, pid as u64);
-    write_u64_addr(pcb + PCB_STATE, PROC_READY as u64);
+    write_u64_addr(pcb + PCB_STATE, proc_state_to_i64(ProcState::Ready) as u64);
     write_u64_addr(pcb + PCB_RSP, initial_rsp as u64);
     write_u64_addr(pcb + PCB_STACK_BASE, stack_base as u64);
     write_u64_addr(pcb + PCB_KSTACK_BASE, stack_base as u64);  // Same stack for kernel processes
@@ -5444,7 +5467,7 @@ fn proc_create_user(entry: i64) -> i64 {
 
     // Fill PCB
     write_u64_addr(pcb + PCB_PID, pid as u64);
-    write_u64_addr(pcb + PCB_STATE, PROC_READY as u64);
+    write_u64_addr(pcb + PCB_STATE, proc_state_to_i64(ProcState::Ready) as u64);
     write_u64_addr(pcb + PCB_RSP, initial_rsp as u64);
     write_u64_addr(pcb + PCB_STACK_BASE, user_stack_base as u64);
     write_u64_addr(pcb + PCB_KSTACK_BASE, kernel_stack_base as u64);
@@ -5494,7 +5517,7 @@ fn schedule_pick_next() -> i64 {
 
     while checked < num_procs {
         let state = pcb_get_state(next);
-        if state == PROC_READY || state == PROC_RUNNING {
+        if state == ProcState::Ready || state == ProcState::Running {
             break;
         }
         next = (next + 1) % num_procs;
@@ -5507,11 +5530,11 @@ fn schedule_pick_next() -> i64 {
     }
 
     // Update states - preserve WAITING/STOPPED/ZOMBIE states
-    if current_state == PROC_RUNNING {
-        pcb_set_state(current, PROC_READY);
+    if current_state == ProcState::Running {
+        pcb_set_state(current, ProcState::Ready);
     }
     // Don't change state if WAITING, ZOMBIE, or STOPPED
-    pcb_set_state(next, PROC_RUNNING);
+    pcb_set_state(next, ProcState::Running);
 
     // Save current RSP will be done by caller using frame_ptr
     // Return the new RSP
@@ -6189,24 +6212,21 @@ fn cmd_ps() {
     let mut pid: i64 = 0;
     while pid < num_procs {
         let state = pcb_get_state(pid);
-        if state != PROC_UNUSED {
+        if state != ProcState::Unused {
             // Print PID
             console_putchar(48 + pid);
             console_putchar(32);
             console_putchar(32);
             console_putchar(32);
 
-            // Print state
-            if state == PROC_READY {
-                console_print_str(82, 69, 65, 68, 89, 0, 0, 0);  // READY
-            } else if state == PROC_RUNNING {
-                console_print_str(82, 85, 78, 0, 0, 0, 0, 0);  // RUN
-            } else if state == PROC_WAITING {
-                console_print_str(87, 65, 73, 84, 0, 0, 0, 0);  // WAIT
-            } else if state == PROC_ZOMBIE {
-                console_print_str(90, 79, 77, 66, 73, 69, 0, 0);  // ZOMBIE
-            } else if state == PROC_STOPPED {
-                console_print_str(83, 84, 79, 80, 0, 0, 0, 0);  // STOP
+            // Print state using match
+            match state {
+                ProcState::Unused => {},
+                ProcState::Ready => console_print_str(82, 69, 65, 68, 89, 0, 0, 0),    // READY
+                ProcState::Running => console_print_str(82, 85, 78, 0, 0, 0, 0, 0),    // RUN
+                ProcState::Waiting => console_print_str(87, 65, 73, 84, 0, 0, 0, 0),   // WAIT
+                ProcState::Zombie => console_print_str(90, 79, 77, 66, 73, 69, 0, 0),  // ZOMBIE
+                ProcState::Stopped => console_print_str(83, 84, 79, 80, 0, 0, 0, 0),   // STOP
             }
             console_putchar(10);
         }
@@ -6378,7 +6398,7 @@ fn cmd_kill() {
 
     // Check if process is valid
     let state = pcb_get_state(pid);
-    if state == PROC_UNUSED || state == PROC_ZOMBIE {
+    if state == ProcState::Unused || state == ProcState::Zombie {
         console_print_str(78, 79, 32, 80, 82, 79, 67, 0);  // "NO PROC"
         console_putchar(10);
         return;

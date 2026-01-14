@@ -98,10 +98,6 @@ const PROC_FLAG_USER: i64 = 1;    // Process runs in user mode (ring 3)
 
 // Process states: See ProcState enum and proc_state_to_i64/i64_to_proc_state
 
-// Test process counters (persistent memory)
-const PROC_A_COUNTER: i64 = 0x422000;
-const PROC_B_COUNTER: i64 = 0x422008;
-
 // Context switch RSP (set by isr_handler, read by isr.asm)
 const SWITCH_RSP_ADDR: i64 = 0x422010;
 
@@ -147,8 +143,8 @@ const MQ_MSGS: i64 = 24;           // Message array start
 // VFS and RAM Disk Constants
 // ============================================================
 
-// VFS Server PID (fixed)
-const VFS_SERVER_PID: i64 = 3;
+// VFS Server PID (Init is PID 1, VFS is PID 2)
+const VFS_SERVER_PID: i64 = 2;
 
 // RAM Disk memory layout
 const RAMFS_BASE: i64 = 0x700000;           // RAM disk base address
@@ -212,8 +208,8 @@ const FD_TABLE_SIZE: i64 = 128;             // Per-process FD table (8*16)
 const FD_FILE_IDX: i64 = 0;                 // File table index (-1 if closed)
 const FD_OFFSET: i64 = 8;                   // Current read/write offset
 
-// Console Server PID
-const CONSOLE_SERVER_PID: i64 = 4;
+// Console Server PID (Init=1, VFS=2, Console=3)
+const CONSOLE_SERVER_PID: i64 = 3;
 
 // Keyboard buffer
 const KB_BUFFER_ADDR: i64 = 0x450000;       // Keyboard input buffer
@@ -273,8 +269,8 @@ const CAP_ERR_INVALID: i64 = -13;             // Invalid capability
 // Shell and Console Constants (Phase 9)
 // ============================================================
 
-// Shell process PID
-const SHELL_PID: i64 = 5;
+// Shell process PID (Init=1, VFS=2, Console=3, Shell=4)
+const SHELL_PID: i64 = 4;
 
 // Shell line buffer
 const SHELL_LINE_ADDR: i64 = 0x470000;        // Line buffer (256 bytes)
@@ -2333,6 +2329,7 @@ fn copy_module_to_ramfs(src_addr: i64, size: i64) {
 }
 
 // Execute init from RAMFS
+// Init is loaded at its native ELF address (0x800000) since it's PID 1
 fn exec_init() -> i64 {
     let present = read_u64_addr(INIT_MODULE_PRESENT);
     if present != 1 {
@@ -2342,7 +2339,10 @@ fn exec_init() -> i64 {
     // Execute "init" from RAMFS
     // "init" packed: 0x74696E69
     let name: u64 = 0x74696E69;  // "init" in little-endian
-    elf_exec(name)
+
+    // Init is special: load at ELF_LOAD_BASE (0x800000) directly
+    // since it's the first userspace process (PID 1)
+    elf_exec_native(name)
 }
 
 // ============================================================
@@ -4874,6 +4874,131 @@ fn elf_exec(name_lo: u64) -> i64 {
     pid
 }
 
+// Execute an ELF file at its native address (no relocation)
+// Used for Init which is loaded at 0x800000 directly
+fn elf_exec_native(name_lo: u64) -> i64 {
+    // Find file in RAMFS
+    let file_idx = ramfs_find_file(name_lo);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(78);  // N
+        serial_out(70);  // F (not found)
+        serial_newline();
+        return ELF_ERR_NOT_FOUND;
+    }
+
+    // Validate ELF header
+    let valid = elf_validate(file_idx);
+    if valid != ELF_OK {
+        serial_out(69);  // E
+        serial_out(73);  // I (invalid)
+        serial_out(48 - valid);  // error code
+        serial_newline();
+        return valid;
+    }
+
+    serial_out(69);  // E
+    serial_out(76);  // L
+    serial_out(70);  // F
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    // Load ELF segments at native addresses (no relocation)
+    let entry = elf_load_segments_native(file_idx);
+    if entry < 0 {
+        return entry;
+    }
+
+    serial_out(69);  // E
+    serial_out(78);  // N
+    serial_out(84);  // T
+    serial_out(58);  // :
+    serial_hex32(entry as u64);
+    serial_newline();
+
+    // Create user process with entry point
+    let pid = elf_create_process(entry);
+
+    pid
+}
+
+// Load ELF segments at their native addresses (no relocation)
+fn elf_load_segments_native(file_idx: i64) -> i64 {
+    let phoff = elf_get_phoff(file_idx);
+    let phnum = elf_get_phnum(file_idx);
+    let phentsize = elf_get_phentsize(file_idx);
+
+    serial_out(80);  // P
+    serial_out(72);  // H
+    serial_out(58);  // :
+    serial_out(48 + phnum);
+    serial_newline();
+
+    // Load each program header
+    let mut i: i64 = 0;
+    while i < phnum {
+        let ph_offset = phoff + (i * phentsize);
+        let result = elf_load_segment_native(file_idx, ph_offset);
+        if result < 0 {
+            return ELF_ERR_LOAD_FAIL;
+        }
+        i = i + 1;
+    }
+
+    // Return entry point directly (no adjustment)
+    elf_get_entry(file_idx)
+}
+
+// Load a single ELF segment at its native address
+fn elf_load_segment_native(file_idx: i64, ph_offset: i64) -> i64 {
+    // Read segment type
+    let seg_type = elf_read_u32(file_idx, ph_offset + PH_TYPE);
+    if seg_type != PT_LOAD {
+        // Not a LOAD segment, skip
+        return 0;
+    }
+
+    // Read segment info
+    let file_offset = elf_read_u64(file_idx, ph_offset + PH_OFFSET);
+    let vaddr = elf_read_u64(file_idx, ph_offset + PH_VADDR);
+    let filesz = elf_read_u64(file_idx, ph_offset + PH_FILESZ);
+    let memsz = elf_read_u64(file_idx, ph_offset + PH_MEMSZ);
+
+    // Debug output
+    serial_out(76);  // L
+    serial_out(79);  // O
+    serial_out(65);  // A
+    serial_out(68);  // D
+    serial_out(58);  // :
+    serial_hex32(vaddr as u64);
+    serial_out(32);  // space
+    serial_hex32(filesz as u64);
+    serial_newline();
+
+    // Use vaddr directly (native address, no relocation)
+    let dest_addr = vaddr as i64;
+
+    // Copy file data to memory
+    let mut i: i64 = 0;
+    while i < filesz {
+        let byte = ramfs_read_byte(file_idx, file_offset + i);
+        if byte >= 0 {
+            write_byte_addr(dest_addr + i, byte);
+        }
+        i = i + 1;
+    }
+
+    // Zero out BSS (memsz > filesz)
+    while i < memsz {
+        write_byte_addr(dest_addr + i, 0);
+        i = i + 1;
+    }
+
+    0  // Success
+}
+
 // Create a new user process for ELF execution
 // Similar to proc_create_user but uses dynamic entry point
 fn elf_create_process(entry: i64) -> i64 {
@@ -6234,87 +6359,6 @@ fn sys_shmdt(addr: i64) -> i64 {
     result
 }
 
-// User mode server A (runs in ring 3)
-fn process_a() {
-    // Print startup message using syscalls
-    sys_print(91);   // [
-    sys_print(65);   // A
-    sys_print(93);   // ]
-    sys_print(32);   // space
-
-    // Demonstrate VFS: open and read "hello" file (index 0)
-    let fd = sys_open(0);  // Open file index 0 ("hello")
-    if fd >= 0 {
-        sys_print(70);   // F
-        sys_print(58);   // :
-
-        // Read and print file contents
-        loop {
-            let byte = sys_read(fd);
-            if byte < 0 || byte == 0 {
-                break;  // EOF or error
-            }
-            sys_print(byte);
-        }
-
-        sys_close(fd);
-        sys_print(32);   // space
-    }
-
-    // Counter for messages
-    let mut counter: i64 = 0;
-
-    loop {
-        counter = counter + 1;
-
-        // Send message to process B (PID 2) every 500 iterations
-        if counter % 500 == 0 {
-            sys_send(2, 65);  // Send 'A' character
-        }
-
-        // Check for incoming messages
-        let msg = sys_recv();
-        if msg >= 0 {
-            sys_print(60);   // <
-            sys_print(msg);  // Print the received character
-            sys_print(62);   // >
-        }
-
-        sys_yield();  // Yield CPU (user mode friendly)
-    }
-}
-
-// User mode server B (runs in ring 3)
-fn process_b() {
-    // Print startup message using syscalls
-    sys_print(91);   // [
-    sys_print(66);   // B
-    sys_print(93);   // ]
-    sys_print(32);   // space
-
-    // Counter for messages
-    let mut counter: i64 = 0;
-
-    loop {
-        counter = counter + 1;
-
-        // Send message to process A (PID 1) every 150 iterations
-        if counter % 150 == 0 {
-            sys_send(1, 66);  // Send 'B' character
-        }
-
-        // Check for incoming messages
-        let msg = sys_recv();
-        if msg >= 0 {
-            sys_print(60);   // <
-            sys_print(msg);  // Print the received character
-            sys_print(62);   // >
-        }
-
-        sys_yield();  // Yield CPU (user mode friendly)
-    }
-}
-
 fn process_idle() {
     loop {
         hlt();
@@ -6322,7 +6366,7 @@ fn process_idle() {
 }
 
 // ============================================================
-// VFS Server Process (PID 3)
+// VFS Server Process (PID 2)
 // ============================================================
 
 // VFS Server: handles file operations via IPC
@@ -6413,7 +6457,7 @@ fn vfs_handle_stat(msg: i64) {
 }
 
 // ============================================================
-// Console Server Process (PID 4)
+// Console Server Process (PID 3)
 // ============================================================
 
 // Console Server: handles keyboard input and display
@@ -6434,7 +6478,7 @@ fn process_console_server() {
 }
 
 // ============================================================
-// Shell Process (PID 5) - Phase 9
+// Shell Process (PID 4) - Phase 9
 // ============================================================
 
 // VGA Console helper: write character at cursor and advance
@@ -7180,30 +7224,6 @@ fn process_shell() {
     }
 }
 
-fn get_process_a_addr() -> i64 {
-    let mut result: i64 = 0;
-    unsafe {
-        asm!(
-            "lea process_a(%rip), %rax",
-            lateout("rax") result,
-            options(nostack, att_syntax)
-        );
-    }
-    result
-}
-
-fn get_process_b_addr() -> i64 {
-    let mut result: i64 = 0;
-    unsafe {
-        asm!(
-            "lea process_b(%rip), %rax",
-            lateout("rax") result,
-            options(nostack, att_syntax)
-        );
-    }
-    result
-}
-
 fn get_process_idle_addr() -> i64 {
     let mut result: i64 = 0;
     unsafe {
@@ -7256,9 +7276,10 @@ fn get_process_shell_addr() -> i64 {
 // Process Initialization
 // ============================================================
 
-fn init_processes() {
+// Initialize kernel state: TSS, GDT, process table, RAMFS, etc.
+// Creates PID 0 (idle) only. Init and services are created later.
+fn init_kernel_state() {
     let white = vga_color(COLOR_WHITE, COLOR_BLACK);
-    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
 
     // Line 11: "PROC init..."
     vga_write_char(0, 11, 80, white);   // P
@@ -7291,10 +7312,6 @@ fn init_processes() {
     write_u64_addr(CURRENT_PID_ADDR, 0);
     write_u64_addr(NUM_PROCS_ADDR, 0);
     write_u64_addr(SCHED_ENABLED_ADDR, 0);
-
-    // Initialize test process counters
-    write_u64_addr(PROC_A_COUNTER, 0);
-    write_u64_addr(PROC_B_COUNTER, 0);
 
     // Initialize message queues for all potential processes
     let mut mq_i: i64 = 0;
@@ -7333,28 +7350,27 @@ fn init_processes() {
     let pid0 = proc_create(idle_addr);
     set_current_pid(pid0);
 
-    // Create test process A (PID 1) - runs in USER mode (ring 3)
-    let proc_a_addr = get_process_a_addr();
-    proc_create_user(proc_a_addr);
+    // Initialize keyboard buffer
+    kb_buffer_init();
+}
 
-    // Create test process B (PID 2) - runs in USER mode (ring 3)
-    let proc_b_addr = get_process_b_addr();
-    proc_create_user(proc_b_addr);
+// Initialize kernel-embedded services (temporary until extracted to userspace)
+// Called AFTER init is loaded so Init gets PID 1
+// VFS=PID 2, Console=PID 3, Shell=PID 4
+fn init_kernel_services() {
+    let green = vga_color(COLOR_GREEN, COLOR_BLACK);
 
-    // Create VFS server (PID 3) - runs in USER mode (ring 3)
+    // Create VFS server (PID 2) - runs in USER mode (ring 3)
     let vfs_addr = get_vfs_server_addr();
     proc_create_user(vfs_addr);
 
-    // Create Console server (PID 4) - runs in USER mode (ring 3)
+    // Create Console server (PID 3) - runs in USER mode (ring 3)
     let console_addr = get_console_server_addr();
     proc_create_user(console_addr);
 
-    // Create Shell process (PID 5) - runs in USER mode (ring 3)
+    // Create Shell process (PID 4) - runs in USER mode (ring 3)
     let shell_addr = get_process_shell_addr();
     proc_create_user(shell_addr);
-
-    // Initialize keyboard buffer
-    kb_buffer_init();
 
     // ============================================================
     // Initialize Capabilities for each process
@@ -7362,27 +7378,17 @@ fn init_processes() {
 
     // PID 0 (Idle): No special capabilities needed
 
-    // PID 1 (Process A): ROOT capability (init process)
-    // ROOT allows creating and granting any capability
+    // PID 1 (Init): ROOT capability for service management
     cap_add(1, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
-    // Grant PID 1 IPC capability to send to PID 2 (Process B)
-    cap_add(1, CAP_TYPE_IPC, 2, CAP_RIGHT_SEND + CAP_RIGHT_RECV + CAP_RIGHT_DERIVE + CAP_RIGHT_DELEGATE);
+    // PID 2 (VFS Server): ROOT capability for file operations
+    cap_add(2, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
-    // Grant PID 1 FILE capability for file 0 ("hello") - read only
-    cap_add(1, CAP_TYPE_FILE, 0, CAP_RIGHT_READ + CAP_RIGHT_DERIVE);
-
-    // PID 2 (Process B): IPC capability to send to PID 1
-    cap_add(2, CAP_TYPE_IPC, 1, CAP_RIGHT_SEND + CAP_RIGHT_RECV);
-
-    // PID 3 (VFS Server): ROOT capability for file operations
+    // PID 3 (Console Server): ROOT capability
     cap_add(3, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
-    // PID 4 (Console Server): ROOT capability
+    // PID 4 (Shell): ROOT capability
     cap_add(4, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
-
-    // PID 5 (Shell): ROOT capability
-    cap_add(5, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
     // Debug: Print capability initialization status
     serial_out(67);  // C
@@ -7509,14 +7515,31 @@ fn _start() {
     // Test enum operations (L6)
     test_enum_ops();
 
-    // Initialize processes BEFORE interrupts (scheduler state must exist)
-    init_processes();
+    // Initialize kernel state (creates PID 0 idle process only)
+    init_kernel_state();
 
-    // TODO: Load GRUB modules into RAMFS
-    // load_multiboot_modules(mb_info_addr);
+    // Load GRUB modules into RAMFS (init.elf)
+    load_multiboot_modules(mb_info_addr);
 
-    // TODO: Execute init process (PID 1) if present
-    // let init_pid = exec_init();
+    // Execute init process from RAMFS (becomes PID 1)
+    let init_pid = exec_init();
+    if init_pid >= 0 {
+        serial_out(73);  // I
+        serial_out(78);  // N
+        serial_out(73);  // I
+        serial_out(84);  // T
+        serial_out(32);  // space
+        serial_out(80);  // P
+        serial_out(73);  // I
+        serial_out(68);  // D
+        serial_out(58);  // :
+        serial_print_dec(init_pid);
+        serial_newline();
+    }
+
+    // Initialize kernel-embedded services (VFS=2, Console=3, Shell=4)
+    // These are temporary until extracted to userspace in later phases
+    init_kernel_services();
 
     // Initialize interrupts (this enables timer which triggers scheduler)
     init_interrupts();

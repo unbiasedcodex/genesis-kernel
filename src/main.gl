@@ -1707,8 +1707,25 @@ fn test_enum_ops() {
         serial_out(78);   // N
         serial_out(79);   // O
         serial_out(75);   // K
+        serial_out(32);   // space
     } else {
         serial_out(78);   // N
+        serial_out(70);   // F
+        serial_out(32);   // space
+    }
+
+    // L10.5: Test Result::Ok
+    let res_ok: Result<i64, i64> = Result::Ok(100);
+    let ok_val = match res_ok {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    if ok_val == 100 {
+        serial_out(82);   // R
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(82);   // R
         serial_out(70);   // F
     }
 

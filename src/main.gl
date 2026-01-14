@@ -64,7 +64,7 @@ const TSS_SIZE: i64 = 104;            // TSS size in bytes
 const GDT_TSS_OFFSET: i64 = 0x28;     // TSS descriptor at offset 0x28
 
 // Process management
-const MAX_PROCS: i64 = 8;
+const MAX_PROCS: i64 = 32;
 const PCB_SIZE: i64 = 64;
 const PROC_TABLE_ADDR: i64 = 0x420000;    // PCB array
 const CURRENT_PID_ADDR: i64 = 0x421000;   // Current process ID
@@ -118,14 +118,14 @@ const SYSCALL_RET_ADDR: i64 = 0x422020;
 // IPC Message Constants
 // ============================================================
 
-const MSG_SIZE: i64 = 32;          // Message size (32 bytes)
-const MSG_QUEUE_SIZE: i64 = 8;     // Messages per process queue
-const MSG_QUEUE_ADDR: i64 = 0x430000;  // Message queue base address
-const MSG_QUEUE_ENTRY_SIZE: i64 = 256; // Per-process queue size (8 * 32)
+const MSG_SIZE: i64 = 256;         // Message size (256 bytes)
+const MSG_QUEUE_SIZE: i64 = 64;    // Messages per process queue
+const MSG_QUEUE_ADDR: i64 = 0x1000000; // Message queue base (16MB)
+const MSG_QUEUE_ENTRY_SIZE: i64 = 0x5000; // Per-process queue size (20KB: 24 header + 64*256 msgs)
 
 // Message structure offsets
 const MSG_SRC_PID: i64 = 0;        // Source process ID
-const MSG_DATA: i64 = 8;           // Message data (24 bytes)
+const MSG_DATA: i64 = 8;           // Message data (248 bytes)
 
 // Message queue header offsets (per process)
 const MQ_HEAD: i64 = 0;            // Queue head index
@@ -494,6 +494,16 @@ const ATA_LAST_ERROR: i64 = 16;                   // Last error code (8 bytes)
 // ATA syscalls
 const SYS_DISK_READ: i64 = 25;                    // Read disk sectors
 const SYS_DISK_INFO: i64 = 26;                    // Get disk information
+const SYS_DISK_WRITE: i64 = 27;                   // Write disk sectors
+const SYS_PCI_READ: i64 = 28;                     // Read PCI config space
+const SYS_PCI_WRITE: i64 = 29;                    // Write PCI config space
+const SYS_PCI_ENUMERATE: i64 = 30;                // Enumerate PCI devices
+const SYS_IRQ_REGISTER: i64 = 31;                 // Register IRQ handler
+const SYS_IRQ_UNREGISTER: i64 = 32;               // Unregister IRQ handler
+const SYS_IRQ_ACK: i64 = 33;                      // Acknowledge IRQ
+
+// IRQ forwarding table (16 IRQs, each 8 bytes: handler PID, 0 = no handler)
+const IRQ_HANDLER_TABLE: i64 = 0x1100000;         // 17MB - IRQ handler table
 
 // ATA error codes
 const ATA_OK: i64 = 0;                            // Success
@@ -854,6 +864,14 @@ fn pci_config_read(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
     let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
     outl(PCI_CONFIG_ADDR, addr);
     inl(PCI_CONFIG_DATA)
+}
+
+// Write PCI configuration space (32-bit)
+// bus: 0-255, device: 0-31, func: 0-7, offset: 0-252 (must be 4-byte aligned)
+fn pci_config_write(bus: i64, device: i64, func: i64, offset: i64, value: i64) {
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    outl(PCI_CONFIG_ADDR, addr);
+    outl(PCI_CONFIG_DATA, value);
 }
 
 // Test PCI config ports (L1.5)
@@ -2675,6 +2693,13 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         24 => syscall_shmdt(arg1),              // SYS_SHMDT
         25 => syscall_disk_read(arg1, arg2, arg3), // SYS_DISK_READ
         26 => syscall_disk_info(arg1),          // SYS_DISK_INFO
+        27 => syscall_disk_write(arg1, arg2, arg3), // SYS_DISK_WRITE
+        28 => syscall_pci_read(arg1, arg2),     // SYS_PCI_READ
+        29 => syscall_pci_write(arg1, arg2, arg3), // SYS_PCI_WRITE
+        30 => syscall_pci_enumerate(arg1, arg2), // SYS_PCI_ENUMERATE
+        31 => syscall_irq_register(arg1, arg2), // SYS_IRQ_REGISTER
+        32 => syscall_irq_unregister(arg1),     // SYS_IRQ_UNREGISTER
+        33 => syscall_irq_ack(arg1),            // SYS_IRQ_ACK
         _ => -1,                                // Unknown syscall
     }
 }
@@ -3235,6 +3260,18 @@ fn ata_read_data_word() -> i64 {
     result
 }
 
+// Write 16-bit word to ATA data port
+fn ata_write_data_word(word: i64) {
+    unsafe {
+        asm!(
+            "out %ax, %dx",
+            in("dx") ATA_PRIMARY_IO + ATA_DATA,
+            in("ax") word,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
 // Send IDENTIFY command and read drive info
 // Returns: total sectors, or negative error
 fn ata_identify() -> i64 {
@@ -3379,6 +3416,91 @@ fn ata_read_sectors(lba: i64, count: i64, buffer: i64) -> i64 {
     total_bytes
 }
 
+// Write sectors to disk using PIO mode (LBA28)
+// lba: starting sector (28-bit)
+// count: number of sectors to write (1-255)
+// buffer: source address
+// Returns: bytes written, or negative error
+fn ata_write_sectors(lba: i64, count: i64, buffer: i64) -> i64 {
+    // Validate parameters
+    if count <= 0 || count > 255 {
+        return ATA_ERR_INVALID;
+    }
+
+    // Check drive is present
+    let present = read_u64_addr(ATA_STATE_ADDR + ATA_PRESENT) as i64;
+    if present == 0 {
+        return ATA_ERR_NO_DRIVE;
+    }
+
+    // Wait for drive ready
+    let wait_result = ata_wait_not_busy();
+    if wait_result != ATA_OK {
+        return wait_result;
+    }
+
+    // Select drive and set LBA mode (bits 24-27 of LBA + drive select)
+    let lba_high_bits = lba / 16777216;  // bits 24-27
+    let drive_byte = ATA_MASTER + lba_high_bits;
+    outb(ATA_PRIMARY_IO + ATA_DRIVE, drive_byte);
+
+    // Set sector count
+    outb(ATA_PRIMARY_IO + ATA_SECCOUNT, count);
+
+    // Set LBA address (bits 0-23) using bit operations
+    let lba_lo = bit_and(lba as u64, 0xFF) as i64;
+    let lba_mid_val = bit_and(shr_u64(lba as u64, 8), 0xFF) as i64;
+    let lba_hi_val = bit_and(shr_u64(lba as u64, 16), 0xFF) as i64;
+
+    outb(ATA_PRIMARY_IO + ATA_LBA_LO, lba_lo);
+    outb(ATA_PRIMARY_IO + ATA_LBA_MID, lba_mid_val);
+    outb(ATA_PRIMARY_IO + ATA_LBA_HI, lba_hi_val);
+
+    // Send WRITE SECTORS command
+    outb(ATA_PRIMARY_IO + ATA_COMMAND, ATA_CMD_WRITE_PIO);
+
+    // Write each sector
+    let mut sector: i64 = 0;
+    let mut total_bytes: i64 = 0;
+    let mut error: i64 = 0;
+
+    while sector < count && error == 0 {
+        // Wait for DRQ
+        let drq_result = ata_wait_drq();
+        if drq_result != ATA_OK {
+            error = drq_result;
+        } else {
+            // Write 256 words (512 bytes)
+            let sector_offset = sector * ATA_SECTOR_SIZE;
+            let mut word_idx: i64 = 0;
+            while word_idx < 256 {
+                let byte_offset = buffer + sector_offset + (word_idx * 2);
+                let byte_lo = read_byte_addr(byte_offset);
+                let byte_hi = read_byte_addr(byte_offset + 1);
+                let word = byte_lo + (byte_hi * 256);
+                ata_write_data_word(word);
+                word_idx = word_idx + 1;
+            }
+            total_bytes = total_bytes + ATA_SECTOR_SIZE;
+            sector = sector + 1;
+        }
+    }
+
+    if error != 0 {
+        write_u64_addr(ATA_STATE_ADDR + ATA_LAST_ERROR, error as u64);
+        return error;
+    }
+
+    // Flush cache after write
+    outb(ATA_PRIMARY_IO + ATA_COMMAND, ATA_CMD_FLUSH);
+    let flush_result = ata_wait_not_busy();
+    if flush_result != ATA_OK {
+        return flush_result;
+    }
+
+    total_bytes
+}
+
 // Initialize ATA driver and detect drive
 // Returns: total sectors if drive found, 0 otherwise
 fn ata_init() -> i64 {
@@ -3460,6 +3582,180 @@ fn syscall_disk_info(info_type: i64) -> i64 {
         read_u64_addr(ATA_STATE_ADDR + ATA_LAST_ERROR) as i64
     } else {
         ATA_ERR_INVALID
+    }
+}
+
+// SYS_DISK_WRITE - Write sectors to disk
+// arg1: LBA (sector number)
+// arg2: count (number of sectors, 1-128)
+// arg3: source buffer address
+// Returns: bytes written, or negative error
+fn syscall_disk_write(lba: i64, count: i64, buffer: i64) -> i64 {
+    // Validate count (max 128 sectors = 64KB)
+    if count <= 0 || count > 128 {
+        return ATA_ERR_INVALID;
+    }
+
+    // Validate buffer address (must be in safe range)
+    if buffer < ATA_BUFFER_ADDR && buffer < PROC_STACK_BASE {
+        return ATA_ERR_INVALID;
+    }
+
+    ata_write_sectors(lba, count, buffer)
+}
+
+// SYS_PCI_READ - Read PCI configuration space
+// arg1: bus (0-255), arg2: packed device/func/offset (device << 16 | func << 8 | offset)
+// Returns: 32-bit value from config space
+fn syscall_pci_read(bus: i64, packed: i64) -> i64 {
+    let device = packed / 65536;
+    let func = (packed / 256) % 256;
+    let offset = packed % 256;
+
+    // Validate parameters
+    if bus < 0 || bus > 255 || device > 31 || func > 7 || offset > 252 {
+        return -1;
+    }
+
+    pci_config_read(bus, device, func, offset)
+}
+
+// SYS_PCI_WRITE - Write PCI configuration space
+// arg1: bus (0-255), arg2: packed device/func/offset, arg3: value
+// Returns: 0 on success, -1 on error
+fn syscall_pci_write(bus: i64, packed: i64, value: i64) -> i64 {
+    let device = packed / 65536;
+    let func = (packed / 256) % 256;
+    let offset = packed % 256;
+
+    // Validate parameters
+    if bus < 0 || bus > 255 || device > 31 || func > 7 || offset > 252 {
+        return -1;
+    }
+
+    pci_config_write(bus, device, func, offset, value);
+    0
+}
+
+// SYS_PCI_ENUMERATE - Enumerate PCI devices
+// arg1: buffer address to write device info
+// arg2: max entries in buffer
+// Each entry: 8 bytes (bus:8, device:8, func:8, class:8, vendor:16, device_id:16)
+// Returns: number of devices found
+fn syscall_pci_enumerate(buffer: i64, max_entries: i64) -> i64 {
+    let mut count: i64 = 0;
+    let mut bus: i64 = 0;
+
+    while bus < 256 && count < max_entries {
+        let mut device: i64 = 0;
+        while device < 32 && count < max_entries {
+            let vendor_device = pci_config_read(bus, device, 0, 0);
+            let vendor = vendor_device % 65536;
+
+            if vendor != 0xFFFF && vendor != 0 {
+                // Device present
+                let device_id = vendor_device / 65536;
+                let class_rev = pci_config_read(bus, device, 0, 8);
+                let class_code = class_rev / 16777216; // bits 24-31
+
+                // Pack and write entry: bus | device << 8 | class << 16 | vendor << 24 | device_id << 40
+                let entry_addr = buffer + (count * 8);
+                let entry_lo = bus + (device * 256) + (class_code * 65536);
+                let entry_hi = vendor + (device_id * 65536);
+                write_u64_addr(entry_addr, (entry_lo + entry_hi * 16777216) as u64);
+
+                count = count + 1;
+            }
+            device = device + 1;
+        }
+        bus = bus + 1;
+    }
+
+    count
+}
+
+// SYS_IRQ_REGISTER - Register to receive IRQ as signal
+// arg1: IRQ number (0-15)
+// arg2: signal to send (default SIGUSR1 = 10)
+// Returns: 0 on success, -1 on error
+fn syscall_irq_register(irq: i64, signal: i64) -> i64 {
+    // Validate IRQ number
+    if irq < 0 || irq > 15 {
+        return -1;
+    }
+
+    // Don't allow hijacking timer or keyboard
+    if irq == 0 || irq == 1 {
+        return -1;
+    }
+
+    let current = get_current_pid();
+
+    // Store handler PID in table (also store signal in upper bits)
+    let entry_addr = IRQ_HANDLER_TABLE + (irq * 8);
+    let packed = current + (signal * 65536);
+    write_u64_addr(entry_addr, packed as u64);
+
+    0
+}
+
+// SYS_IRQ_UNREGISTER - Unregister IRQ handler
+// arg1: IRQ number (0-15)
+// Returns: 0 on success, -1 on error
+fn syscall_irq_unregister(irq: i64) -> i64 {
+    if irq < 0 || irq > 15 {
+        return -1;
+    }
+
+    let entry_addr = IRQ_HANDLER_TABLE + (irq * 8);
+    let current = get_current_pid();
+    let packed = read_u64_addr(entry_addr) as i64;
+    let handler_pid = packed % 65536;
+
+    // Only allow owner to unregister
+    if handler_pid != current {
+        return -1;
+    }
+
+    write_u64_addr(entry_addr, 0);
+    0
+}
+
+// SYS_IRQ_ACK - Acknowledge IRQ (re-enable it)
+// arg1: IRQ number
+// Returns: 0 on success, -1 on error
+fn syscall_irq_ack(irq: i64) -> i64 {
+    if irq < 0 || irq > 15 {
+        return -1;
+    }
+
+    // EOI is already sent in handle_irq, this is just for userspace bookkeeping
+    0
+}
+
+// Initialize IRQ handler table
+fn irq_handler_table_init() {
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_u64_addr(IRQ_HANDLER_TABLE + (i * 8), 0);
+        i = i + 1;
+    }
+}
+
+// Check if an IRQ has a userspace handler and forward if so
+// Returns true if forwarded, false otherwise
+fn irq_forward_to_userspace(irq: i64) -> bool {
+    let entry_addr = IRQ_HANDLER_TABLE + (irq * 8);
+    let packed = read_u64_addr(entry_addr) as i64;
+    let handler_pid = packed % 65536;
+    let signal = packed / 65536;
+
+    if handler_pid > 0 {
+        // Send signal to handler process
+        pcb_add_signal(handler_pid, signal);
+        true
+    } else {
+        false
     }
 }
 
@@ -4798,7 +5094,10 @@ fn handle_irq(irq: i64) {
     match irq {
         0 => handle_timer(),      // Timer interrupt (IRQ0)
         1 => handle_keyboard(),   // Keyboard interrupt (IRQ1)
-        _ => {},                  // Other IRQs (not handled yet)
+        _ => {
+            // Check if userspace handler registered
+            irq_forward_to_userspace(irq);
+        },
     }
 
     // Send EOI
@@ -6886,6 +7185,9 @@ fn init_processes() {
 
     // Initialize shared memory table (Phase 11)
     shm_init();
+
+    // Initialize IRQ handler table (Pre-Runtime K2.7)
+    irq_handler_table_init();
 
     // Create idle process (PID 0) - runs in KERNEL mode
     // Note: PID 0 starts as READY, not RUNNING

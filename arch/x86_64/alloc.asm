@@ -58,3 +58,31 @@ malloc:
 global free
 free:
     ret
+
+; pmm_clear_bitmap_asm(start_idx, end_idx)
+; Clears bitmap entries from start_idx to end_idx (exclusive)
+; Input: rdi = start_idx, rsi = end_idx
+; Bitmap is at 0x400000, each entry is 8 bytes
+global pmm_clear_bitmap_asm
+pmm_clear_bitmap_asm:
+    ; Calculate addresses
+    ; entry_addr = 0x400000 + idx * 8
+    mov rax, rdi
+    shl rax, 3              ; start_idx * 8
+    add rax, 0x400000       ; start address
+
+    mov rcx, rsi
+    shl rcx, 3              ; end_idx * 8
+    add rcx, 0x400000       ; end address
+
+    xor edx, edx            ; value to write (0)
+
+.loop:
+    cmp rax, rcx
+    jge .done
+    mov qword [rax], 0      ; Clear entry
+    add rax, 8              ; Next entry
+    jmp .loop
+
+.done:
+    ret

@@ -591,75 +591,78 @@ fn bit_not(a: u64) -> u64 {
 
 // Convert PS/2 scancode (set 1) to ASCII character
 // Returns: ASCII value, or 0 if not printable, or -1 if key release
+// L12/L14: Refactored to use match expression with integer literals
 fn scancode_to_ascii(scancode: i64) -> i64 {
-    let mut result: i64 = 0;
-
-    // Key release (high bit set) - ignore
+    // Key release (high bit set) - early return
     if scancode >= 128 {
-        result = -1;
+        return -1;
     }
-    // Numbers row (scancodes 0x02-0x0D)
-    else if scancode == 0x02 { result = 49; }       // 1
-    else if scancode == 0x03 { result = 50; }  // 2
-    else if scancode == 0x04 { result = 51; }  // 3
-    else if scancode == 0x05 { result = 52; }  // 4
-    else if scancode == 0x06 { result = 53; }  // 5
-    else if scancode == 0x07 { result = 54; }  // 6
-    else if scancode == 0x08 { result = 55; }  // 7
-    else if scancode == 0x09 { result = 56; }  // 8
-    else if scancode == 0x0A { result = 57; }  // 9
-    else if scancode == 0x0B { result = 48; }  // 0
-    else if scancode == 0x0C { result = 45; }  // -
-    else if scancode == 0x0D { result = 61; }  // =
 
-    // QWERTY row (scancodes 0x10-0x1B)
-    else if scancode == 0x10 { result = 113; } // q
-    else if scancode == 0x11 { result = 119; } // w
-    else if scancode == 0x12 { result = 101; } // e
-    else if scancode == 0x13 { result = 114; } // r
-    else if scancode == 0x14 { result = 116; } // t
-    else if scancode == 0x15 { result = 121; } // y
-    else if scancode == 0x16 { result = 117; } // u
-    else if scancode == 0x17 { result = 105; } // i
-    else if scancode == 0x18 { result = 111; } // o
-    else if scancode == 0x19 { result = 112; } // p
-    else if scancode == 0x1A { result = 91; }  // [
-    else if scancode == 0x1B { result = 93; }  // ]
+    match scancode {
+        // Numbers row (0x02-0x0D)
+        0x02 => 49,   // 1
+        0x03 => 50,   // 2
+        0x04 => 51,   // 3
+        0x05 => 52,   // 4
+        0x06 => 53,   // 5
+        0x07 => 54,   // 6
+        0x08 => 55,   // 7
+        0x09 => 56,   // 8
+        0x0A => 57,   // 9
+        0x0B => 48,   // 0
+        0x0C => 45,   // -
+        0x0D => 61,   // =
 
-    // ASDF row (scancodes 0x1E-0x28)
-    else if scancode == 0x1E { result = 97; }  // a
-    else if scancode == 0x1F { result = 115; } // s
-    else if scancode == 0x20 { result = 100; } // d
-    else if scancode == 0x21 { result = 102; } // f
-    else if scancode == 0x22 { result = 103; } // g
-    else if scancode == 0x23 { result = 104; } // h
-    else if scancode == 0x24 { result = 106; } // j
-    else if scancode == 0x25 { result = 107; } // k
-    else if scancode == 0x26 { result = 108; } // l
-    else if scancode == 0x27 { result = 59; }  // ;
-    else if scancode == 0x28 { result = 39; }  // '
+        // QWERTY row (0x10-0x1B)
+        0x10 => 113,  // q
+        0x11 => 119,  // w
+        0x12 => 101,  // e
+        0x13 => 114,  // r
+        0x14 => 116,  // t
+        0x15 => 121,  // y
+        0x16 => 117,  // u
+        0x17 => 105,  // i
+        0x18 => 111,  // o
+        0x19 => 112,  // p
+        0x1A => 91,   // [
+        0x1B => 93,   // ]
 
-    // ZXCV row (scancodes 0x2C-0x35)
-    else if scancode == 0x2C { result = 122; } // z
-    else if scancode == 0x2D { result = 120; } // x
-    else if scancode == 0x2E { result = 99; }  // c
-    else if scancode == 0x2F { result = 118; } // v
-    else if scancode == 0x30 { result = 98; }  // b
-    else if scancode == 0x31 { result = 110; } // n
-    else if scancode == 0x32 { result = 109; } // m
-    else if scancode == 0x33 { result = 44; }  // ,
-    else if scancode == 0x34 { result = 46; }  // .
-    else if scancode == 0x35 { result = 47; }  // /
+        // ASDF row (0x1E-0x28)
+        0x1E => 97,   // a
+        0x1F => 115,  // s
+        0x20 => 100,  // d
+        0x21 => 102,  // f
+        0x22 => 103,  // g
+        0x23 => 104,  // h
+        0x24 => 106,  // j
+        0x25 => 107,  // k
+        0x26 => 108,  // l
+        0x27 => 59,   // ;
+        0x28 => 39,   // '
 
-    // Special keys
-    else if scancode == 0x01 { result = KEY_ESC; }       // Escape
-    else if scancode == 0x0E { result = KEY_BACKSPACE; } // Backspace
-    else if scancode == 0x0F { result = 9; }             // Tab
-    else if scancode == 0x1C { result = KEY_ENTER; }     // Enter
-    else if scancode == 0x39 { result = 32; }            // Space
-    else if scancode == 0x29 { result = 96; }            // `
+        // ZXCV row (0x2C-0x35)
+        0x2C => 122,  // z
+        0x2D => 120,  // x
+        0x2E => 99,   // c
+        0x2F => 118,  // v
+        0x30 => 98,   // b
+        0x31 => 110,  // n
+        0x32 => 109,  // m
+        0x33 => 44,   // ,
+        0x34 => 46,   // .
+        0x35 => 47,   // /
 
-    result
+        // Special keys
+        0x01 => KEY_ESC,        // Escape
+        0x0E => KEY_BACKSPACE,  // Backspace
+        0x0F => 9,              // Tab
+        0x1C => KEY_ENTER,      // Enter
+        0x39 => 32,             // Space
+        0x29 => 96,             // `
+
+        // Unknown scancode
+        _ => 0,
+    }
 }
 
 // Read byte from address
@@ -1156,8 +1159,6 @@ fn test_struct_ops() {
     serial_out(93);   // ]
     serial_out(32);   // space
 
-    let mut all_ok: i64 = 1;
-
     // L4.2: Test struct instantiation
     let p = Point { x: 10, y: 20 };
 
@@ -1174,23 +1175,19 @@ fn test_struct_ops() {
             serial_out(105);  // i
             serial_out(70);   // F
             serial_out(32);   // space
-            all_ok = 0;
         }
     } else {
         serial_out(105);  // i
         serial_out(70);   // F
         serial_out(32);   // space
-        all_ok = 0;
     }
 
-    // L4.4: Test struct field write
-    // NOTE: This is a known compiler limitation - field write doesn't work
+    // L4.4: Test struct field write (L7 fix: now works!)
     let mut p2 = Point { x: 0, y: 0 };
     p2.x = 30;
     p2.y = 40;
     let p2x = p2.x;
     let p2y = p2.y;
-    // Field write doesn't work - values remain 0
     if p2x == 30 {
         if p2y == 40 {
             serial_out(119);  // w
@@ -1201,12 +1198,10 @@ fn test_struct_ops() {
             serial_out(119);  // w
             serial_out(70);   // F
             serial_out(32);   // space
-            all_ok = 0;
         }
     } else {
-        // Expected: field write doesn't work
         serial_out(119);  // w
-        serial_out(78);   // N (Not supported)
+        serial_out(70);   // F
         serial_out(32);   // space
     }
 
@@ -1222,7 +1217,6 @@ fn test_struct_ops() {
         serial_out(112);  // p
         serial_out(70);   // F
         serial_out(32);   // space
-        all_ok = 0;
     }
 
     // L4.6: Test struct as return value
@@ -1237,27 +1231,23 @@ fn test_struct_ops() {
             serial_out(114);  // r
             serial_out(70);   // F
             serial_out(32);   // space
-            all_ok = 0;
         }
     } else {
         serial_out(114);  // r
         serial_out(70);   // F
         serial_out(32);   // space
-        all_ok = 0;
     }
 
-    // L4.7: Test nested structs
-    // NOTE: Only the first nested struct field works correctly
-    // Second nested struct fields return 0 (compiler bug)
+    // L4.7: Test nested structs (L9 fix: all nested access works!)
     let origin = Point { x: 0, y: 0 };
     let size = Point { x: 100, y: 50 };
     let rect = Rect { origin: origin, size: size };
 
-    // Test first nested struct (works)
+    // Test first nested struct
     let ox = rect.origin.x;
     let oy = rect.origin.y;
 
-    // Test second nested struct (broken - returns 0)
+    // Test second nested struct
     let sx = rect.size.x;
     let sy = rect.size.y;
 
@@ -1274,14 +1264,12 @@ fn test_struct_ops() {
             serial_out(49);   // 1
             serial_out(70);   // F
             serial_out(32);   // space
-            all_ok = 0;
         }
     } else {
         serial_out(110);  // n
         serial_out(49);   // 1
         serial_out(70);   // F
         serial_out(32);   // space
-        all_ok = 0;
     }
 
     // Test second nested: now fixed!
@@ -1294,7 +1282,6 @@ fn test_struct_ops() {
         serial_out(110);  // n
         serial_out(50);   // 2
         serial_out(70);   // F
-        all_ok = 0;
     }
 
     // Test three-level nesting: canvas.line.end.y
@@ -1314,7 +1301,6 @@ fn test_struct_ops() {
         serial_out(110);  // n
         serial_out(51);   // 3
         serial_out(70);   // F
-        all_ok = 0;
     }
 
     // L9.4: Test nested field write
@@ -1331,7 +1317,6 @@ fn test_struct_ops() {
         serial_out(32);   // space
         serial_out(119);  // w
         serial_out(70);   // F
-        all_ok = 0;
     }
 
     serial_newline();
@@ -1595,8 +1580,7 @@ fn test_array_ops() {
         serial_out(32);   // space
     }
 
-    // L8.4: Test struct.array[i] access
-    // This was previously broken due to struct type tracking issues
+    // L8.4: Test struct.array[i] access (L8 fix: now works!)
     let el0 = buf.data[0];  // Should be 5
     let el2 = buf.data[2];  // Should be 15
     if el0 == 5 {
@@ -1726,6 +1710,25 @@ fn test_enum_ops() {
         serial_out(75);   // K
     } else {
         serial_out(82);   // R
+        serial_out(70);   // F
+    }
+
+    // L12.1: Test match on integer literals
+    let test_int: i64 = 42;
+    let int_result = match test_int {
+        0 => 0,
+        1 => 1,
+        42 => 42,
+        _ => -1,
+    };
+    if int_result == 42 {
+        serial_out(32);   // space
+        serial_out(73);   // I
+        serial_out(79);   // O
+        serial_out(75);   // K
+    } else {
+        serial_out(32);   // space
+        serial_out(73);   // I
         serial_out(70);   // F
     }
 

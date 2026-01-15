@@ -510,6 +510,12 @@ const SYS_IRQ_ACK: i64 = 33;                      // Acknowledge IRQ
 const SYS_TIME: i64 = 34;                         // Get system time (ticks)
 const SYS_SLEEP: i64 = 35;                        // Sleep for ticks
 
+// VGA syscalls (for Console Server in userspace)
+const SYS_VGA_PUTCHAR: i64 = 36;                  // Write char at position with color
+const SYS_VGA_SETCURSOR: i64 = 37;                // Set hardware cursor position
+const SYS_VGA_CLEAR: i64 = 38;                    // Clear screen region
+const SYS_VGA_SCROLL: i64 = 39;                   // Scroll screen region
+
 // RAMFS syscalls (for VFS Server in userspace)
 const SYS_RAMFS_FILE_COUNT: i64 = 40;             // Get number of files in RAMFS
 const SYS_RAMFS_FILE_INFO: i64 = 41;              // Get file flags (0=unused, 1=regular)
@@ -2294,6 +2300,11 @@ fn load_multiboot_modules(mb_info_addr: i64) {
             copy_vfs_module_to_ramfs(mod_start, mod_size);
         }
 
+        // Store third module as console
+        if i == 2 {
+            copy_console_module_to_ramfs(mod_start, mod_size);
+        }
+
         i = i + 1;
     }
 }
@@ -2379,6 +2390,46 @@ fn copy_vfs_module_to_ramfs(src_addr: i64, size: i64) {
     serial_newline();
 }
 
+// Copy module bytes to RAMFS file named "console"
+fn copy_console_module_to_ramfs(src_addr: i64, size: i64) {
+    // Create "console" file in RAMFS
+    // "console" = 99, 111, 110, 115, 111, 108, 101
+    let file_idx = ramfs_create_file_internal(99, 111, 110, 115, 111, 108, 101, 0);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return;
+    }
+
+    // Get data block address for this file
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let dest_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Copy bytes from module to RAMFS
+    let mut offset: i64 = 0;
+    while offset < size {
+        let byte = read_byte_addr(src_addr + offset);
+        write_byte_addr(dest_addr + offset, byte);
+        offset = offset + 1;
+    }
+
+    // Set file size
+    ramfs_set_file_size(file_idx, size);
+
+    // Print confirmation
+    serial_out(67);  // C
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(size);
+    serial_out(66);  // B
+    serial_newline();
+}
+
 // Execute init from RAMFS
 // Init is loaded at its native ELF address (0x800000) since it's PID 1
 fn exec_init() -> i64 {
@@ -2414,6 +2465,27 @@ fn exec_vfs() -> i64 {
     }
 
     // VFS Server loads at 0x900000 (after Init at 0x800000)
+    elf_exec_native(name)
+}
+
+// Execute Console server from RAMFS (Phase 2: Console in userspace)
+// Console Server loads at 0xA00000 and becomes PID 3
+fn exec_console() -> i64 {
+    // Execute "console" from RAMFS
+    // "console" packed: little-endian c=0x63, o=0x6F, n=0x6E, s=0x73, o=0x6F, l=0x6C, e=0x65
+    let name: u64 = 0x656C6F736E6F63;  // "console" in little-endian
+
+    // Find file in RAMFS
+    let file_idx = ramfs_find_file(name);
+    if file_idx < 0 {
+        serial_out(67);  // C
+        serial_out(78);  // N
+        serial_out(70);  // F (not found)
+        serial_newline();
+        return -1;
+    }
+
+    // Console Server loads at 0xA00000
     elf_exec_native(name)
 }
 
@@ -2963,6 +3035,10 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         33 => syscall_irq_ack(arg1),            // SYS_IRQ_ACK
         34 => syscall_time(),                   // SYS_TIME
         35 => syscall_sleep(arg1),              // SYS_SLEEP
+        36 => syscall_vga_putchar(arg1, arg2, arg3, frame_ptr), // SYS_VGA_PUTCHAR
+        37 => syscall_vga_setcursor(arg1, arg2), // SYS_VGA_SETCURSOR
+        38 => syscall_vga_clear(arg1, arg2, arg3), // SYS_VGA_CLEAR
+        39 => syscall_vga_scroll(arg1, arg2, arg3), // SYS_VGA_SCROLL
         40 => syscall_ramfs_file_count(),       // SYS_RAMFS_FILE_COUNT
         41 => syscall_ramfs_file_info(arg1),    // SYS_RAMFS_FILE_INFO
         42 => syscall_ramfs_read_byte(arg1, arg2), // SYS_RAMFS_READ_BYTE
@@ -4028,6 +4104,110 @@ fn syscall_sleep(ticks: i64) -> i64 {
     }
 
     current_time - start
+}
+
+// ============================================================
+// VGA Syscalls (for Console Server in userspace)
+// ============================================================
+
+// SYS_VGA_PUTCHAR - Write character at position with color
+// arg1: x (column 0-79)
+// arg2: y (row 0-24)
+// arg3: character (ASCII)
+// arg4 (from frame_ptr): color attribute
+// Returns: 0 on success, -1 on error
+fn syscall_vga_putchar(x: i64, y: i64, ch: i64, frame_ptr: i64) -> i64 {
+    // Read arg4 (color) from r10 saved on stack
+    // r10 is at offset 80 in our interrupt frame
+    let color = read_u64_addr(frame_ptr + 80) as i64;
+
+    if x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT {
+        return -1;
+    }
+    vga_write_char_color(x, y, ch, color);
+    0
+}
+
+// SYS_VGA_SETCURSOR - Set hardware cursor position
+// arg1: x (column 0-79)
+// arg2: y (row 0-24)
+// Returns: 0 on success, -1 on error
+fn syscall_vga_setcursor(x: i64, y: i64) -> i64 {
+    if x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT {
+        return -1;
+    }
+
+    let pos = (y * VGA_WIDTH + x) as u64;
+
+    // VGA cursor position: low byte to port 0x3D5 (index 0x0F)
+    //                      high byte to port 0x3D5 (index 0x0E)
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (pos % 256) as i64);
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, ((pos / 256) % 256) as i64);
+
+    0
+}
+
+// SYS_VGA_CLEAR - Clear screen region
+// arg1: y_start (first row)
+// arg2: y_end (last row, exclusive)
+// arg3: color attribute for cleared cells
+// Returns: 0 on success, -1 on error
+fn syscall_vga_clear(y_start: i64, y_end: i64, color: i64) -> i64 {
+    if y_start < 0 || y_end > VGA_HEIGHT || y_start >= y_end {
+        return -1;
+    }
+
+    let mut y = y_start;
+    while y < y_end {
+        let mut x: i64 = 0;
+        while x < VGA_WIDTH {
+            vga_write_char_color(x, y, 32, color);  // Space character
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    0
+}
+
+// SYS_VGA_SCROLL - Scroll screen region up by one line
+// arg1: y_start (first row)
+// arg2: y_end (last row, exclusive)
+// arg3: color attribute for new blank line
+// Returns: 0 on success, -1 on error
+fn syscall_vga_scroll(y_start: i64, y_end: i64, color: i64) -> i64 {
+    if y_start < 0 || y_end > VGA_HEIGHT || y_start >= y_end {
+        return -1;
+    }
+
+    // Copy each line up
+    let mut y = y_start;
+    while y < y_end - 1 {
+        let mut x: i64 = 0;
+        while x < VGA_WIDTH {
+            // Read character and attribute from line below
+            let src_offset = ((y + 1) * VGA_WIDTH + x) * 2;
+            let ch = read_byte_addr(VGA_BUFFER + src_offset);
+            let attr = read_byte_addr(VGA_BUFFER + src_offset + 1);
+
+            // Write to current line
+            let dst_offset = (y * VGA_WIDTH + x) * 2;
+            write_byte_addr(VGA_BUFFER + dst_offset, ch);
+            write_byte_addr(VGA_BUFFER + dst_offset + 1, attr);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    // Clear last line
+    let mut x: i64 = 0;
+    while x < VGA_WIDTH {
+        vga_write_char_color(x, y_end - 1, 32, color);
+        x = x + 1;
+    }
+
+    0
 }
 
 // ============================================================
@@ -7685,7 +7865,10 @@ fn init_kernel_services() {
     // PID 2 (VFS Server): ROOT capability for file operations
     cap_add(2, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
-    // Console (PID 3) and Shell (PID 4) will be added in Phase 2/3
+    // PID 3 (Console Server): ROOT capability for VGA/keyboard operations
+    cap_add(3, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
+
+    // Shell (PID 4) will be added in Phase 3
 
     // Debug: Print capability initialization status
     serial_out(67);  // C
@@ -7849,7 +8032,22 @@ fn _start() {
         serial_newline();
     }
 
-    // Initialize kernel-embedded services (Console=3, Shell=4)
+    // Execute Console server from RAMFS (becomes PID 3) - Phase 2
+    let console_pid = exec_console();
+    if console_pid >= 0 {
+        serial_out(67);  // C
+        serial_out(79);  // O
+        serial_out(78);  // N
+        serial_out(32);  // space
+        serial_out(80);  // P
+        serial_out(73);  // I
+        serial_out(68);  // D
+        serial_out(58);  // :
+        serial_print_dec(console_pid);
+        serial_newline();
+    }
+
+    // Initialize kernel-embedded services (Shell=4)
     // VFS is now loaded from RAMFS above (Phase 1)
     init_kernel_services();
 

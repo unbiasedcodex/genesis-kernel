@@ -510,6 +510,12 @@ const SYS_IRQ_ACK: i64 = 33;                      // Acknowledge IRQ
 const SYS_TIME: i64 = 34;                         // Get system time (ticks)
 const SYS_SLEEP: i64 = 35;                        // Sleep for ticks
 
+// RAMFS syscalls (for VFS Server in userspace)
+const SYS_RAMFS_FILE_COUNT: i64 = 40;             // Get number of files in RAMFS
+const SYS_RAMFS_FILE_INFO: i64 = 41;              // Get file flags (0=unused, 1=regular)
+const SYS_RAMFS_READ_BYTE: i64 = 42;              // Read byte from file at offset
+const SYS_RAMFS_FILE_SIZE: i64 = 43;              // Get file size
+
 // IRQ forwarding table (16 IRQs, each 8 bytes: handler PID, 0 = no handler)
 const IRQ_HANDLER_TABLE: i64 = 0x1100000;         // 17MB - IRQ handler table
 
@@ -2283,6 +2289,11 @@ fn load_multiboot_modules(mb_info_addr: i64) {
             copy_module_to_ramfs(mod_start, mod_size);
         }
 
+        // Store second module as vfs
+        if i == 1 {
+            copy_vfs_module_to_ramfs(mod_start, mod_size);
+        }
+
         i = i + 1;
     }
 }
@@ -2328,6 +2339,46 @@ fn copy_module_to_ramfs(src_addr: i64, size: i64) {
     serial_newline();
 }
 
+// Copy module bytes to RAMFS file named "vfs"
+fn copy_vfs_module_to_ramfs(src_addr: i64, size: i64) {
+    // Create "vfs" file in RAMFS
+    // "vfs" = 118, 102, 115
+    let file_idx = ramfs_create_file_internal(118, 102, 115, 0, 0, 0, 0, 0);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return;
+    }
+
+    // Get data block address for this file
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let dest_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Copy bytes from module to RAMFS
+    let mut offset: i64 = 0;
+    while offset < size {
+        let byte = read_byte_addr(src_addr + offset);
+        write_byte_addr(dest_addr + offset, byte);
+        offset = offset + 1;
+    }
+
+    // Set file size
+    ramfs_set_file_size(file_idx, size);
+
+    // Print confirmation
+    serial_out(86);  // V
+    serial_out(70);  // F
+    serial_out(83);  // S
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(size);
+    serial_out(66);  // B
+    serial_newline();
+}
+
 // Execute init from RAMFS
 // Init is loaded at its native ELF address (0x800000) since it's PID 1
 fn exec_init() -> i64 {
@@ -2342,6 +2393,27 @@ fn exec_init() -> i64 {
 
     // Init is special: load at ELF_LOAD_BASE (0x800000) directly
     // since it's the first userspace process (PID 1)
+    elf_exec_native(name)
+}
+
+// Execute VFS server from RAMFS (Phase 1: VFS in userspace)
+// VFS Server loads at 0x900000 and becomes PID 2
+fn exec_vfs() -> i64 {
+    // Execute "vfs" from RAMFS
+    // "vfs\0" packed: 0x00736676 (little-endian: 'v'=0x76, 'f'=0x66, 's'=0x73, '\0'=0x00)
+    let name: u64 = 0x00736676;
+
+    // Find file in RAMFS
+    let file_idx = ramfs_find_file(name);
+    if file_idx < 0 {
+        serial_out(86);  // V
+        serial_out(78);  // N
+        serial_out(70);  // F (not found)
+        serial_newline();
+        return -1;
+    }
+
+    // VFS Server loads at 0x900000 (after Init at 0x800000)
     elf_exec_native(name)
 }
 
@@ -2728,7 +2800,80 @@ pub fn isr_handler(frame_ptr: i64) {
             let arg2 = read_stack_u64(frame_ptr, 88) as i64;          // RSI
             let arg3 = read_stack_u64(frame_ptr, 96) as i64;          // RDX
 
+            // Debug: print RIP before syscall
+            let rip_before = read_stack_u64(frame_ptr, 144);
+            serial_out(60);  // <
+            serial_hex32(rip_before);
+
             let result = handle_syscall(syscall_num, arg1, arg2, arg3, frame_ptr);
+
+            // Debug: print RIP and user RSP after syscall
+            let rip_after = read_stack_u64(frame_ptr, 144);
+            serial_out(62);  // >
+            serial_hex32(rip_after);
+            // Also print user RSP (offset 168) - what iretq will restore
+            let user_rsp = read_stack_u64(frame_ptr, 168);
+            serial_out(83);  // S
+            serial_hex32(user_rsp);
+            // Debug: print bytes at multiple VFS syscall locations
+            // Syscall 1 at 0x90019A, Syscall 2 at 0x9001A6, Syscall 3 at 0x9001B2
+            // All should show CD 80
+
+            // Check syscall 1 location (0x90019A)
+            serial_out(49);  // 1
+            serial_out(58);  // :
+            let c1 = read_u64_addr(0x90019A);
+            let b1a = c1 % 256;
+            let b1b = (c1 / 256) % 256;
+            serial_out(if (b1a / 16) < 10 { 48 + (b1a / 16) as i64 } else { 55 + (b1a / 16) as i64 });
+            serial_out(if (b1a % 16) < 10 { 48 + (b1a % 16) as i64 } else { 55 + (b1a % 16) as i64 });
+            serial_out(if (b1b / 16) < 10 { 48 + (b1b / 16) as i64 } else { 55 + (b1b / 16) as i64 });
+            serial_out(if (b1b % 16) < 10 { 48 + (b1b % 16) as i64 } else { 55 + (b1b % 16) as i64 });
+            serial_out(32);  // space
+
+            // Check syscall 2 location (0x9001A6)
+            serial_out(50);  // 2
+            serial_out(58);  // :
+            let c2 = read_u64_addr(0x9001A6);
+            let b2a = c2 % 256;
+            let b2b = (c2 / 256) % 256;
+            serial_out(if (b2a / 16) < 10 { 48 + (b2a / 16) as i64 } else { 55 + (b2a / 16) as i64 });
+            serial_out(if (b2a % 16) < 10 { 48 + (b2a % 16) as i64 } else { 55 + (b2a % 16) as i64 });
+            serial_out(if (b2b / 16) < 10 { 48 + (b2b / 16) as i64 } else { 55 + (b2b / 16) as i64 });
+            serial_out(if (b2b % 16) < 10 { 48 + (b2b % 16) as i64 } else { 55 + (b2b % 16) as i64 });
+            serial_out(32);  // space
+
+            // Check syscall 3 location (0x9001B2)
+            serial_out(51);  // 3
+            serial_out(58);  // :
+            let c3 = read_u64_addr(0x9001B2);
+            let b3a = c3 % 256;
+            let b3b = (c3 / 256) % 256;
+            serial_out(if (b3a / 16) < 10 { 48 + (b3a / 16) as i64 } else { 55 + (b3a / 16) as i64 });
+            serial_out(if (b3a % 16) < 10 { 48 + (b3a % 16) as i64 } else { 55 + (b3a % 16) as i64 });
+            serial_out(if (b3b / 16) < 10 { 48 + (b3b / 16) as i64 } else { 55 + (b3b / 16) as i64 });
+            serial_out(if (b3b % 16) < 10 { 48 + (b3b % 16) as i64 } else { 55 + (b3b % 16) as i64 });
+            serial_out(32);  // space
+
+            // Check locations in between (0x90019C, 0x9001A0, 0x9001A8)
+            serial_out(88);  // X
+            let ca = read_u64_addr(0x90019C);
+            let cb = read_u64_addr(0x9001A0);
+            let cc = read_u64_addr(0x9001A4);
+            let cd = read_u64_addr(0x9001A8);
+            // Print first byte of each as hex
+            serial_out(if ((ca % 256) / 16) < 10 { 48 + ((ca % 256) / 16) as i64 } else { 55 + ((ca % 256) / 16) as i64 });
+            serial_out(if ((ca % 256) % 16) < 10 { 48 + ((ca % 256) % 16) as i64 } else { 55 + ((ca % 256) % 16) as i64 });
+            serial_out(45);  // -
+            serial_out(if ((cb % 256) / 16) < 10 { 48 + ((cb % 256) / 16) as i64 } else { 55 + ((cb % 256) / 16) as i64 });
+            serial_out(if ((cb % 256) % 16) < 10 { 48 + ((cb % 256) % 16) as i64 } else { 55 + ((cb % 256) % 16) as i64 });
+            serial_out(45);  // -
+            serial_out(if ((cc % 256) / 16) < 10 { 48 + ((cc % 256) / 16) as i64 } else { 55 + ((cc % 256) / 16) as i64 });
+            serial_out(if ((cc % 256) % 16) < 10 { 48 + ((cc % 256) % 16) as i64 } else { 55 + ((cc % 256) % 16) as i64 });
+            serial_out(45);  // -
+            serial_out(if ((cd % 256) / 16) < 10 { 48 + ((cd % 256) / 16) as i64 } else { 55 + ((cd % 256) / 16) as i64 });
+            serial_out(if ((cd % 256) % 16) < 10 { 48 + ((cd % 256) % 16) as i64 } else { 55 + ((cd % 256) % 16) as i64 });
+            serial_out(32);  // space
 
             // Store result in RAX on the stack (will be restored by iretq)
             write_u64_addr(frame_ptr + 120, result as u64);
@@ -2740,6 +2885,17 @@ pub fn isr_handler(frame_ptr: i64) {
             let current = get_current_pid();
             let current_state = pcb_get_state(current);
             if current_state == ProcState::Running {
+                // Debug: print saved RSP and RIP
+                serial_out(70);  // F
+                serial_out(61);  // =
+                serial_hex32(frame_ptr as u64);
+                serial_out(32);  // space
+                // Print RIP from frame (offset 144)
+                let saved_rip = read_stack_u64(frame_ptr, 144);
+                serial_out(73);  // I
+                serial_out(61);  // =
+                serial_hex32(saved_rip);
+                serial_out(32);  // space
                 pcb_set_rsp(current, frame_ptr);
             }
 
@@ -2807,6 +2963,10 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         33 => syscall_irq_ack(arg1),            // SYS_IRQ_ACK
         34 => syscall_time(),                   // SYS_TIME
         35 => syscall_sleep(arg1),              // SYS_SLEEP
+        40 => syscall_ramfs_file_count(),       // SYS_RAMFS_FILE_COUNT
+        41 => syscall_ramfs_file_info(arg1),    // SYS_RAMFS_FILE_INFO
+        42 => syscall_ramfs_read_byte(arg1, arg2), // SYS_RAMFS_READ_BYTE
+        43 => syscall_ramfs_file_size(arg1),    // SYS_RAMFS_FILE_SIZE
         _ => -1,                                // Unknown syscall
     }
 }
@@ -3870,6 +4030,34 @@ fn syscall_sleep(ticks: i64) -> i64 {
     current_time - start
 }
 
+// ============================================================
+// RAMFS Syscalls (for VFS Server in userspace)
+// ============================================================
+
+// SYS_RAMFS_FILE_COUNT - Get number of used files in RAMFS
+fn syscall_ramfs_file_count() -> i64 {
+    read_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES) as i64
+}
+
+// SYS_RAMFS_FILE_INFO - Get file flags (0=unused, 1=regular)
+fn syscall_ramfs_file_info(file_idx: i64) -> i64 {
+    if file_idx < 0 || file_idx >= RAMFS_MAX_FILES {
+        return -1;
+    }
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    read_u64_addr(entry_addr + FE_FLAGS) as i64
+}
+
+// SYS_RAMFS_READ_BYTE - Read a byte from file at offset
+fn syscall_ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
+    ramfs_read_byte(file_idx, offset)
+}
+
+// SYS_RAMFS_FILE_SIZE - Get file size in bytes
+fn syscall_ramfs_file_size(file_idx: i64) -> i64 {
+    ramfs_file_size(file_idx)
+}
+
 // Initialize IRQ handler table
 fn irq_handler_table_init() {
     let mut i: i64 = 0;
@@ -4523,19 +4711,8 @@ fn ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
             let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
             let data_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
 
-            // Read the byte at offset
-            let byte_offset = offset % 8;
-            let qword_offset = (offset / 8) * 8;
-            let qword = read_u64_addr(data_addr + qword_offset);
-
-            // Extract byte using division (avoid bitwise issues)
-            let mut shift_val = qword;
-            let mut bi: i64 = 0;
-            while bi < byte_offset {
-                shift_val = shift_val / 256;
-                bi = bi + 1;
-            }
-            result = (shift_val % 256) as i64;
+            // Read byte directly using read_byte_addr for simplicity
+            result = read_byte_addr(data_addr + offset);
         }
     }
 
@@ -4911,10 +5088,16 @@ fn elf_exec_native(name_lo: u64) -> i64 {
         return entry;
     }
 
+    // Debug: print entry point value safely
     serial_out(69);  // E
     serial_out(78);  // N
     serial_out(84);  // T
     serial_out(58);  // :
+    // Print as simple decimal first to avoid complex hex function
+    serial_print_dec(entry);
+    serial_out(32);  // space
+    // Now try hex
+    serial_out(72);  // H
     serial_hex32(entry as u64);
     serial_newline();
 
@@ -5315,21 +5498,41 @@ fn handle_exception(num: i64, error_code: u64, rip: u64) {
     serial_out(48 + (num % 10));
     serial_newline();
 
-    // Print error code
+    // Print error code (use serial_hex32 for reliability)
     serial_out(69); serial_out(82); serial_out(82); serial_out(58); // ERR:
-    serial_print_hex64(error_code);
+    serial_hex32(error_code);
     serial_newline();
 
     // Print RIP
     serial_out(82); serial_out(73); serial_out(80); serial_out(58); // RIP:
-    serial_print_hex64(rip);
+    serial_hex32(rip);
     serial_newline();
 
     // Page fault: print CR2
     if num == 14 {
         let cr2 = read_cr2();
         serial_out(67); serial_out(82); serial_out(50); serial_out(58); // CR2:
-        serial_print_hex64(cr2);
+        // Print CR2 manually to avoid potential issues
+        let cr2_lo = cr2 % 0x100000000;
+        serial_hex32(cr2_lo);
+        serial_newline();
+        // Also print error code bits
+        serial_out(66); serial_out(73); serial_out(84); serial_out(58); // BIT:
+        let p = error_code % 2;  // bit 0 - present
+        let w = (error_code / 2) % 2;  // bit 1 - write
+        let u = (error_code / 4) % 2;  // bit 2 - user
+        let r = (error_code / 8) % 2;  // bit 3 - reserved
+        let i = (error_code / 16) % 2;  // bit 4 - instruction
+        serial_out(80);  // P
+        serial_out(48 + (p as i64));
+        serial_out(87);  // W
+        serial_out(48 + (w as i64));
+        serial_out(85);  // U
+        serial_out(48 + (u as i64));
+        serial_out(82);  // R
+        serial_out(48 + (r as i64));
+        serial_out(73);  // I
+        serial_out(48 + (i as i64));
         serial_newline();
     }
 
@@ -5343,6 +5546,51 @@ fn handle_exception(num: i64, error_code: u64, rip: u64) {
 
     // Halt on fatal exceptions
     if num == 8 || num == 13 || num == 14 {
+        // Debug: dump TSS.RSP0 at fault time
+        serial_out(84); serial_out(82); serial_out(48); serial_out(61);  // TR0=
+        let tss_rsp0 = tss_get_kernel_stack();
+        serial_hex32(tss_rsp0 as u64);
+        serial_newline();
+
+        // Debug: dump TSS address
+        serial_out(84); serial_out(65); serial_out(61);  // TA=
+        let tss_addr = get_tss64_addr();
+        serial_hex32(tss_addr as u64);
+        serial_newline();
+
+        // Debug: directly read 8 bytes at TSS+4 (RSP0 location)
+        serial_out(82); serial_out(65); serial_out(87); serial_out(61);  // RAW=
+        let raw_rsp0 = read_u64_addr(tss_addr + 4);
+        serial_hex32(raw_rsp0);
+        serial_newline();
+
+        // Debug: read TR register
+        serial_out(84); serial_out(82); serial_out(61);  // TR=
+        let tr_val = read_tr();
+        serial_hex32(tr_val as u64);
+        serial_newline();
+
+        // Debug: read GDT base from TSS descriptor (at GDT + 0x28)
+        let gdt_base = get_gdt64_addr();
+        let tss_desc_addr = gdt_base + 0x28;  // TSS selector offset
+        serial_out(71); serial_out(84); serial_out(68); serial_out(61);  // GTD=
+        let desc_word0 = read_u64_addr(tss_desc_addr);
+        let desc_word1 = read_u64_addr(tss_desc_addr + 8);
+        serial_hex32(desc_word0);
+        serial_out(32);
+        serial_hex32(desc_word1);
+        serial_newline();
+
+        // Extract base from TSS descriptor
+        let base_lo = (desc_word0 / 0x10000) % 0x10000;  // bits 16-31
+        let base_mid = (desc_word0 / 0x100000000) % 0x100;  // bits 32-39
+        let base_hi = (desc_word0 / 0x1000000000000) % 0x100;  // bits 48-55
+        let base_upper = desc_word1 % 0x100000000;  // bits 0-31 of second qword
+        let tss_base = base_lo + (base_mid * 0x10000) + (base_hi * 0x1000000) + (base_upper * 0x100000000);
+        serial_out(84); serial_out(66); serial_out(61);  // TB=
+        serial_hex32(tss_base);
+        serial_newline();
+
         serial_out(72); serial_out(65); serial_out(76); serial_out(84); // HALT
         serial_newline();
         loop {
@@ -5444,6 +5692,104 @@ fn init_interrupts() {
 
     // Initialize IDT with ISR stubs
     idt_init();
+
+    // DEBUG: Dump IDT entry 128 to verify syscall handler setup
+    {
+        let entry_addr = IDT_ADDR + (128 * IDT_ENTRY_SIZE);
+        serial_out(73);  // I
+        serial_out(68);  // D
+        serial_out(84);  // T
+        serial_out(49);  // 1
+        serial_out(50);  // 2
+        serial_out(56);  // 8
+        serial_out(58);  // :
+        // Read and print key parts using 32-bit reads
+        let lo = read_u32_at(entry_addr, 0) as u64;  // offset_low + selector
+        let hi = read_u32_at(entry_addr, 4) as u64;  // type_attr + offset_mid
+        let top = read_u32_at(entry_addr, 8) as u64; // offset_high
+        serial_hex32(lo);
+        serial_out(32);
+        serial_hex32(hi);
+        serial_out(32);
+        serial_hex32(top);
+        serial_newline();
+        // Also print expected syscall handler address
+        let syscall_ptr = get_syscall_stub_ptr();
+        let syscall_handler = read_u64_addr(syscall_ptr);
+        serial_out(72);  // H
+        serial_out(68);  // D
+        serial_out(76);  // L
+        serial_out(82);  // R
+        serial_out(58);  // :
+        serial_hex32(syscall_handler as u64);
+        serial_newline();
+    }
+
+    // DEBUG: Dump TSS info
+    {
+        let tss_addr = get_tss64_addr();
+        let rsp0 = tss_get_kernel_stack();
+        serial_out(84);  // T
+        serial_out(83);  // S
+        serial_out(83);  // S
+        serial_out(64);  // @
+        serial_hex32(tss_addr as u64);
+        serial_out(32);
+        serial_out(82);  // R
+        serial_out(48);  // 0
+        serial_out(61);  // =
+        serial_hex32(rsp0 as u64);
+        serial_newline();
+        // Dump GDT TSS descriptor
+        let gdt_base = get_gdt64_addr();
+        let tss_desc_addr = gdt_base + GDT_TSS_OFFSET;
+        serial_out(71);  // G
+        serial_out(68);  // D
+        serial_out(84);  // T
+        serial_out(64);  // @
+        serial_hex32(gdt_base as u64);
+        serial_out(32);
+        serial_out(68);  // D
+        serial_out(61);  // =
+        // TSS descriptor is 16 bytes
+        let desc_lo = read_u64_addr(tss_desc_addr);
+        let desc_hi = read_u64_addr(tss_desc_addr + 8);
+        serial_hex32((desc_lo % 0x100000000) as u64);
+        serial_out(32);
+        serial_hex32((desc_lo / 0x100000000) as u64);
+        serial_out(32);
+        serial_hex32((desc_hi % 0x100000000) as u64);
+        serial_newline();
+    }
+
+    // TEST: Verify page 0 is mapped by reading from address 0
+    {
+        let test_val = read_u64_addr(0);  // Read from address 0
+        serial_out(80);  // P
+        serial_out(71);  // G
+        serial_out(48);  // 0
+        serial_out(58);  // :
+        serial_hex32((test_val % 0x100000000) as u64);
+        serial_newline();
+    }
+
+    // TEST: Try syscall from kernel mode BEFORE enabling interrupts
+    serial_out(84);  // T
+    serial_out(69);  // E
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_out(58);  // :
+    unsafe {
+        asm!(
+            "mov $$2, %rax
+             mov $$42, %rdi
+             int $$0x80",
+            options(att_syntax)
+        );
+    }
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
 
     // Enable interrupts
     sti();
@@ -5588,11 +5934,24 @@ fn get_gdt64_addr() -> i64 {
     result
 }
 
+
 fn get_tss64_addr() -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
             "lea tss64(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn read_tr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "str %ax",
             lateout("rax") result,
             options(nostack, att_syntax)
         );
@@ -5689,6 +6048,25 @@ fn init_process_stack_user(user_stack_top: i64, kernel_stack_top: i64, entry: i6
     // 2. Load user segments and jump to entry point
     // 3. Switch to user stack (RSP from frame)
 
+    // Debug: print stack setup info
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_out(75);  // K
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_out(75);  // K
+    serial_out(61);  // =
+    serial_hex32(kernel_stack_top as u64);
+    serial_out(32);  // space
+    serial_out(85);  // U
+    serial_out(61);  // =
+    serial_hex32(user_stack_top as u64);
+    serial_out(32);  // space
+    serial_out(69);  // E
+    serial_out(61);  // =
+    serial_hex32(entry as u64);
+    serial_newline();
+
     let mut ptr = kernel_stack_top;
 
     // Push SS (user data segment with RPL=3)
@@ -5730,6 +6108,14 @@ fn init_process_stack_user(user_stack_top: i64, kernel_stack_top: i64, entry: i6
     // Push DS (user data segment)
     ptr = ptr - 8;
     write_u64_addr(ptr, USER_DS as u64);
+
+    // Debug: print final RSP
+    serial_out(82);  // R
+    serial_out(83);  // S
+    serial_out(80);  // P
+    serial_out(61);  // =
+    serial_hex32(ptr as u64);
+    serial_newline();
 
     ptr
 }
@@ -6059,6 +6445,21 @@ fn schedule_pick_next() -> i64 {
     // Return the new RSP
     let new_rsp = pcb_get_rsp(next);
 
+    // Debug: Print context switch info with restored RSP
+    serial_out(83);  // S
+    serial_out(87);  // W
+    serial_out(58);  // :
+    serial_out(48 + current);  // from PID
+    serial_out(45);  // -
+    serial_out(62);  // >
+    serial_out(48 + next);  // to PID
+    serial_out(32);  // space
+    // Print new_rsp being restored
+    serial_out(82);  // R
+    serial_out(61);  // =
+    serial_hex32(new_rsp as u64);
+    serial_out(32);  // space
+
     // Update TSS.RSP0 for the next process
     // This is critical for ring 3 -> ring 0 transitions
     if pcb_is_user_mode(next) {
@@ -6066,7 +6467,12 @@ fn schedule_pick_next() -> i64 {
         let kstack_base = pcb_get_kstack(next);
         let kstack_top = kstack_base + KSTACK_SIZE;
         tss_set_kernel_stack(kstack_top);
+        // Debug: verify TSS was set
+        serial_out(84);  // T
+        serial_out(61);  // =
+        serial_hex32(tss_get_kernel_stack() as u64);
     }
+    serial_newline();
 
     // Update current PID
     set_current_pid(next);
@@ -6366,98 +6772,8 @@ fn process_idle() {
 }
 
 // ============================================================
-// VFS Server Process (PID 2)
-// ============================================================
-
-// VFS Server: handles file operations via IPC
-fn process_vfs_server() {
-    // Print startup message
-    sys_print(91);   // [
-    sys_print(86);   // V
-    sys_print(70);   // F
-    sys_print(83);   // S
-    sys_print(93);   // ]
-    sys_print(32);   // space
-
-    loop {
-        // Check for incoming VFS requests
-        let msg = sys_recv();
-        if msg >= 0 {
-            // Extract command type from message (low byte)
-            let cmd = msg % 256;
-
-            // L14: VFS command dispatch using match
-            match cmd {
-                8 => vfs_handle_list(),       // VFS_LIST
-                1 => vfs_handle_open(msg),    // VFS_OPEN
-                2 => vfs_handle_read(msg),    // VFS_READ
-                5 => vfs_handle_stat(msg),    // VFS_STAT
-                _ => {},                      // Unknown command
-            }
-        }
-
-        sys_yield();
-    }
-}
-
-// VFS Handler: list files
-fn vfs_handle_list() {
-    // Get number of files in filesystem
-    let used = read_u64_addr(RAMFS_SUPERBLOCK + SB_USED_FILES) as i64;
-
-    // Print to serial for debugging
-    sys_print(76);   // L
-    sys_print(58);   // :
-    sys_print(48 + used);  // file count
-    sys_print(32);   // space
-}
-
-// VFS Handler: open file (simplified - just return file index)
-fn vfs_handle_open(msg: i64) {
-    // For now, treat msg as file index directly (simplified)
-    // In real implementation, would parse filename from IPC message buffer
-    let file_idx = (msg / 256) % 256;  // Second byte is file index
-
-    if file_idx >= 0 && file_idx < RAMFS_MAX_FILES {
-        let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
-        let flags = read_u64_addr(entry_addr + FE_FLAGS) as i64;
-
-        if flags != FILE_UNUSED {
-            sys_print(79);   // O
-            sys_print(58);   // :
-            sys_print(48 + file_idx);  // file index
-            sys_print(32);   // space
-        }
-    }
-}
-
-// VFS Handler: read file
-fn vfs_handle_read(msg: i64) {
-    // Parse: byte 1 = file_idx, byte 2 = offset
-    let file_idx = (msg / 256) % 256;
-    let offset = (msg / 65536) % 256;
-
-    let byte = ramfs_read_byte(file_idx, offset);
-    if byte >= 0 && byte != 0 {
-        sys_print(byte);  // Output the byte read
-    }
-}
-
-// VFS Handler: get file stat (size)
-fn vfs_handle_stat(msg: i64) {
-    let file_idx = (msg / 256) % 256;
-    let size = ramfs_file_size(file_idx);
-
-    sys_print(83);   // S
-    sys_print(58);   // :
-    if size >= 0 {
-        sys_print(48 + (size % 10));
-    }
-    sys_print(32);   // space
-}
-
-// ============================================================
 // Console Server Process (PID 3)
+// VFS Server moved to genesis-runtime/src/fs/ (Phase 1)
 // ============================================================
 
 // Console Server: handles keyboard input and display
@@ -7236,17 +7552,7 @@ fn get_process_idle_addr() -> i64 {
     result
 }
 
-fn get_vfs_server_addr() -> i64 {
-    let mut result: i64 = 0;
-    unsafe {
-        asm!(
-            "lea process_vfs_server(%rip), %rax",
-            lateout("rax") result,
-            options(nostack, att_syntax)
-        );
-    }
-    result
-}
+// get_vfs_server_addr() removed - VFS Server now in userspace (Phase 1)
 
 fn get_console_server_addr() -> i64 {
     let mut result: i64 = 0;
@@ -7360,17 +7666,12 @@ fn init_kernel_state() {
 fn init_kernel_services() {
     let green = vga_color(COLOR_GREEN, COLOR_BLACK);
 
-    // Create VFS server (PID 2) - runs in USER mode (ring 3)
-    let vfs_addr = get_vfs_server_addr();
-    proc_create_user(vfs_addr);
+    // VFS Server (PID 2) is loaded via exec_vfs() from RAMFS
+    // after Init is loaded - see kmain()
 
-    // Create Console server (PID 3) - runs in USER mode (ring 3)
-    let console_addr = get_console_server_addr();
-    proc_create_user(console_addr);
-
-    // Create Shell process (PID 4) - runs in USER mode (ring 3)
-    let shell_addr = get_process_shell_addr();
-    proc_create_user(shell_addr);
+    // Console and Shell are NOT created as userspace processes yet.
+    // They will be extracted in Phase 2 (Console) and Phase 3 (Shell).
+    // For now, VFS handles file operations and Init receives IPC messages.
 
     // ============================================================
     // Initialize Capabilities for each process
@@ -7384,11 +7685,7 @@ fn init_kernel_services() {
     // PID 2 (VFS Server): ROOT capability for file operations
     cap_add(2, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
 
-    // PID 3 (Console Server): ROOT capability
-    cap_add(3, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
-
-    // PID 4 (Shell): ROOT capability
-    cap_add(4, CAP_TYPE_ROOT, 0, CAP_RIGHT_ALL);
+    // Console (PID 3) and Shell (PID 4) will be added in Phase 2/3
 
     // Debug: Print capability initialization status
     serial_out(67);  // C
@@ -7537,8 +7834,23 @@ fn _start() {
         serial_newline();
     }
 
-    // Initialize kernel-embedded services (VFS=2, Console=3, Shell=4)
-    // These are temporary until extracted to userspace in later phases
+    // Execute VFS server from RAMFS (becomes PID 2) - Phase 1
+    let vfs_pid = exec_vfs();
+    if vfs_pid >= 0 {
+        serial_out(86);  // V
+        serial_out(70);  // F
+        serial_out(83);  // S
+        serial_out(32);  // space
+        serial_out(80);  // P
+        serial_out(73);  // I
+        serial_out(68);  // D
+        serial_out(58);  // :
+        serial_print_dec(vfs_pid);
+        serial_newline();
+    }
+
+    // Initialize kernel-embedded services (Console=3, Shell=4)
+    // VFS is now loaded from RAMFS above (Phase 1)
     init_kernel_services();
 
     // Initialize interrupts (this enables timer which triggers scheduler)

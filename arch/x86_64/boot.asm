@@ -251,6 +251,35 @@ _start_asm:
 bits 64
 
 realm64:
+    ; Debug: print 'R64' immediately at 64-bit entry
+    mov dx, 0x3F8
+    mov al, 'R'
+    out dx, al
+    mov al, '6'
+    out dx, al
+    mov al, '4'
+    out dx, al
+    mov al, 10
+    out dx, al
+
+    ; CRITICAL: Reload GDT with proper 64-bit pointer
+    ; The previous LGDT in 32-bit mode only loaded a 32-bit base.
+    ; The upper 32 bits of GDTR.base may be garbage, causing
+    ; the CPU to read wrong addresses for GDT entries.
+    lea rax, [rel gdt64_ptr64]
+    lgdt [rax]
+
+    ; Debug: print 'GDT' after LGDT
+    mov dx, 0x3F8
+    mov al, 'G'
+    out dx, al
+    mov al, 'D'
+    out dx, al
+    mov al, 'T'
+    out dx, al
+    mov al, 10
+    out dx, al
+
     mov ax, 0x10
     mov ds, ax
     mov es, ax

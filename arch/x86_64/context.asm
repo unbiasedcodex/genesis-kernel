@@ -93,20 +93,17 @@ asm_init_stack:
     sub rax, 8
     mov qword [rax], 0
 
-    ; Push all GPRs (16 regs * 8 bytes = 128 bytes)
-    ; Order: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15
-    mov rcx, 15             ; 15 registers (rax already used)
+    ; Push all 15 GPRs (rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15)
+    ; This matches the ISR push order (15 GPRs + DS = 16 total)
+    mov rcx, 15
 .push_gpr:
     sub rax, 8
     mov qword [rax], 0
     dec rcx
     jnz .push_gpr
 
-    ; Push one more for rax
-    sub rax, 8
-    mov qword [rax], 0
-
-    ; Push DS
+    ; Push DS (kernel data segment)
+    ; Note: ISR does "push rax" after "mov rax, ds", so DS is 16th push
     sub rax, 8
     mov qword [rax], 0x10
 
@@ -173,7 +170,8 @@ asm_init_stack_user:
     sub rax, 8
     mov qword [rax], 0
 
-    ; Push all GPRs (15 registers)
+    ; Push all 15 GPRs (rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15)
+    ; This matches the ISR push order
     mov rcx, 15
 .push_gpr_user:
     sub rax, 8
@@ -181,11 +179,8 @@ asm_init_stack_user:
     dec rcx
     jnz .push_gpr_user
 
-    ; Push one more for rax
-    sub rax, 8
-    mov qword [rax], 0
-
     ; Push DS (user data segment)
+    ; Note: ISR does "push rax" after "mov rax, ds", so DS is 16th push
     sub rax, 8
     mov qword [rax], 0x23
 

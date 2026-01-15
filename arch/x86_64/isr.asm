@@ -109,6 +109,21 @@ IRQ 15, 47          ; Secondary ATA
 
 global isr128
 isr128:
+    ; DEBUG: Print "S80" to serial to confirm we reached syscall handler
+    push rax
+    push rdx
+    mov dx, 0x3F8           ; COM1 port
+    mov al, 'S'
+    out dx, al
+    mov al, '8'
+    out dx, al
+    mov al, '0'
+    out dx, al
+    mov al, 10              ; newline
+    out dx, al
+    pop rdx
+    pop rax
+    ; END DEBUG
     push qword 0                ; Dummy error code
     push qword 128              ; Syscall interrupt number (0x80)
     jmp isr_common
@@ -146,6 +161,236 @@ isr_common:
     mov es, ax
     mov fs, ax
     mov gs, ax
+
+    ; DEBUG: Print interrupt number and RIP for ALL interrupts
+    push rdx
+    push rax
+    mov dx, 0x3F8
+    ; Print 'I' and interrupt number as hex byte
+    mov al, 'I'
+    out dx, al
+    mov rax, [rsp + 128 + 16]    ; int_num (+16 for our pushes)
+    ; Print low byte as 2 hex digits
+    push rax
+    shr al, 4
+    add al, '0'
+    cmp al, '9'
+    jle .i_hi_ok
+    add al, 7
+.i_hi_ok:
+    out dx, al
+    pop rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .i_lo_ok
+    add al, 7
+.i_lo_ok:
+    out dx, al
+    ; Print '@' and low 2 bytes of RIP
+    mov al, '@'
+    out dx, al
+    mov rax, [rsp + 144 + 16]    ; RIP (+16 for our pushes)
+    ; Print byte 1 (bits 15-8)
+    push rax
+    shr rax, 8
+    push rax
+    shr al, 4
+    add al, '0'
+    cmp al, '9'
+    jle .rip_b1_hi_ok
+    add al, 7
+.rip_b1_hi_ok:
+    out dx, al
+    pop rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .rip_b1_lo_ok
+    add al, 7
+.rip_b1_lo_ok:
+    out dx, al
+    pop rax
+    ; Print byte 0 (bits 7-0)
+    push rax
+    shr al, 4
+    add al, '0'
+    cmp al, '9'
+    jle .rip_b0_hi_ok
+    add al, 7
+.rip_b0_hi_ok:
+    out dx, al
+    pop rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .rip_b0_lo_ok
+    add al, 7
+.rip_b0_lo_ok:
+    out dx, al
+    mov al, ' '
+    out dx, al
+    pop rax
+    pop rdx
+
+    ; DEBUG: If page fault (int 14), print CR2 and saved RSP immediately
+    mov rax, [rsp + 128]    ; interrupt number
+    cmp rax, 14
+    jne .skip_cr2_debug
+    ; Print "!CR2:" to serial
+    push rdx
+    push rax
+    ; First print TR register value
+    mov dx, 0x3F8
+    mov al, '!'
+    out dx, al
+    mov al, 'T'
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, '!'
+    out dx, al
+    mov al, ':'
+    out dx, al
+    str ax              ; Store TR into AX
+    ; Print 4 hex digits
+    mov rcx, 4
+.tr_loop:
+    rol ax, 4
+    push rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .tr_print
+    add al, 7
+.tr_print:
+    out dx, al
+    pop rax
+    dec rcx
+    jnz .tr_loop
+    mov al, 10
+    out dx, al
+    ; Then print the current RSP (kernel stack we're on)
+    mov al, '!'
+    out dx, al
+    mov al, 'K'
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, 'S'
+    out dx, al
+    mov al, 'P'
+    out dx, al
+    mov al, ':'
+    out dx, al
+    ; Get the RSP value (need to account for our pushes)
+    lea rax, [rsp + 16]     ; +16 for our two pushes
+    mov rcx, 16
+.krsp_loop:
+    rol rax, 4
+    push rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .krsp_print
+    add al, 7
+.krsp_print:
+    out dx, al
+    pop rax
+    dec rcx
+    jnz .krsp_loop
+    mov al, 10
+    out dx, al
+    mov dx, 0x3F8
+    mov al, '!'
+    out dx, al
+    mov al, 'C'
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, '2'
+    out dx, al
+    mov al, ':'
+    out dx, al
+    ; Read CR2 and print as hex
+    mov rax, cr2
+    ; Print 16 hex digits
+    mov rcx, 16
+.cr2_loop:
+    rol rax, 4              ; Rotate left to get next nibble
+    push rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .cr2_print
+    add al, 7               ; 'A' - '9' - 1 = 7
+.cr2_print:
+    out dx, al
+    pop rax
+    dec rcx
+    jnz .cr2_loop
+    ; Newline
+    mov al, 10
+    out dx, al
+    ; Also print saved RSP from frame (at RSP+168)
+    mov al, '!'
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, 'S'
+    out dx, al
+    mov al, 'P'
+    out dx, al
+    mov al, ':'
+    out dx, al
+    mov rax, [rsp + 168 + 16]    ; +16 for the two pushes we did
+    mov rcx, 16
+.rsp_loop:
+    rol rax, 4
+    push rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .rsp_print
+    add al, 7
+.rsp_print:
+    out dx, al
+    pop rax
+    dec rcx
+    jnz .rsp_loop
+    mov al, 10
+    out dx, al
+    ; Also print saved RIP from frame (at RSP+144)
+    mov al, '!'
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, 'I'
+    out dx, al
+    mov al, 'P'
+    out dx, al
+    mov al, ':'
+    out dx, al
+    mov rax, [rsp + 144 + 16]    ; +16 for the two pushes
+    mov rcx, 16
+.rip_loop:
+    rol rax, 4
+    push rax
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .rip_print
+    add al, 7
+.rip_print:
+    out dx, al
+    pop rax
+    dec rcx
+    jnz .rip_loop
+    mov al, 10
+    out dx, al
+    pop rax
+    pop rdx
+.skip_cr2_debug:
 
     ; Call Genesis handler with pointer to stack frame
     ; Stack layout at this point (from RSP):

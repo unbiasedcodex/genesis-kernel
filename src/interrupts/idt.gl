@@ -16,6 +16,7 @@ const IDTR_ADDR: i64 = 0x411000; // IDTR structure (10 bytes)
 // Gate types
 const GATE_INTERRUPT: i64 = 0x8E;  // Present + DPL0 + Interrupt Gate (0xE)
 const GATE_TRAP: i64 = 0x8F;       // Present + DPL0 + Trap Gate (0xF)
+const GATE_SYSCALL: i64 = 0xEE;    // Present + DPL3 + Interrupt Gate (for user mode INT 0x80)
 
 // Code segment selector
 const KERNEL_CS: i64 = 0x08;
@@ -142,6 +143,11 @@ pub fn idt_init() {
         i = i + 1;
     }
 
+    // Set up syscall handler (INT 0x80 = vector 128)
+    // Must use GATE_SYSCALL (DPL=3) to allow user mode access
+    let syscall_handler = get_isr_syscall_ptr();
+    idt_set_gate(128, syscall_handler, GATE_SYSCALL);
+
     // Load the IDT
     idt_load();
 }
@@ -152,6 +158,20 @@ fn get_isr_stub_ptr() -> i64 {
     unsafe {
         asm!(
             "lea isr_stub_table(%rip), %rax",
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+/// Get pointer to syscall ISR (isr128)
+fn get_isr_syscall_ptr() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "lea isr_syscall_ptr(%rip), %rax",
+            "movq (%rax), %rax",
             lateout("rax") result,
             options(nostack, att_syntax)
         );

@@ -287,6 +287,18 @@ realm64:
     mov gs, ax
     mov ss, ax
 
+    ; Enable SSE/SSE2 for userspace programs
+    ; Step 1: Clear CR0.EM (bit 2), set CR0.MP (bit 1)
+    mov rax, cr0
+    and ax, 0xFFFB      ; Clear EM (bit 2)
+    or ax, 0x0002       ; Set MP (bit 1)
+    mov cr0, rax
+
+    ; Step 2: Set CR4.OSFXSR (bit 9) and CR4.OSXMMEXCPT (bit 10)
+    mov rax, cr4
+    or rax, (1 << 9) | (1 << 10)
+    mov cr4, rax
+
     mov rsp, stack_top
 
     ; Debug: write 'OK 64' to VGA to confirm 64-bit mode works

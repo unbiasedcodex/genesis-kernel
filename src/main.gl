@@ -155,8 +155,8 @@ const RAMFS_DATA_BLOCKS: i64 = 0x701000;    // Data blocks start
 // RAM Disk limits
 const RAMFS_MAX_FILES: i64 = 32;            // Maximum number of files
 const RAMFS_FILE_ENTRY_SIZE: i64 = 64;      // Size of file table entry
-const RAMFS_BLOCK_SIZE: i64 = 512;          // Data block size
-const RAMFS_MAX_BLOCKS: i64 = 256;          // Maximum data blocks (128KB)
+const RAMFS_BLOCK_SIZE: i64 = 65536;        // Data block size (64KB per file)
+const RAMFS_MAX_BLOCKS: i64 = 8;            // Maximum data blocks (512KB total)
 const RAMFS_NAME_MAX: i64 = 15;             // Max filename length
 
 // Superblock offsets (512 bytes total)
@@ -7426,50 +7426,8 @@ fn _start() {
         serial_newline();
     }
 
-    // Execute VFS server from RAMFS (becomes PID 2) - Phase 1
-    let vfs_pid = exec_vfs();
-    if vfs_pid >= 0 {
-        serial_out(86);  // V
-        serial_out(70);  // F
-        serial_out(83);  // S
-        serial_out(32);  // space
-        serial_out(80);  // P
-        serial_out(73);  // I
-        serial_out(68);  // D
-        serial_out(58);  // :
-        serial_print_dec(vfs_pid);
-        serial_newline();
-    }
-
-    // Execute Console server from RAMFS (becomes PID 3) - Phase 2
-    let console_pid = exec_console();
-    if console_pid >= 0 {
-        serial_out(67);  // C
-        serial_out(79);  // O
-        serial_out(78);  // N
-        serial_out(32);  // space
-        serial_out(80);  // P
-        serial_out(73);  // I
-        serial_out(68);  // D
-        serial_out(58);  // :
-        serial_print_dec(console_pid);
-        serial_newline();
-    }
-
-    // Execute Shell server from RAMFS (becomes PID 4) - Phase 3
-    let shell_pid = exec_shell();
-    if shell_pid >= 0 {
-        serial_out(83);  // S
-        serial_out(72);  // H
-        serial_out(76);  // L
-        serial_out(32);  // space
-        serial_out(80);  // P
-        serial_out(73);  // I
-        serial_out(68);  // D
-        serial_out(58);  // :
-        serial_print_dec(shell_pid);
-        serial_newline();
-    }
+    // Phase 4: Init spawns VFS, Console, Shell via exec() syscall
+    // Kernel only creates init process, services are spawned by init
 
     // Initialize kernel capabilities for all services
     init_kernel_services();

@@ -75,7 +75,7 @@ const GDT_TSS_OFFSET: i64 = 0x28;     // TSS descriptor at offset 0x28
 
 // Process management
 const MAX_PROCS: i64 = 32;
-const PCB_SIZE: i64 = 64;
+const PCB_SIZE: i64 = 80;  // Must match PCB_SIZE_EXT to include all PCB fields
 const PROC_TABLE_ADDR: i64 = 0x420000;    // PCB array
 const CURRENT_PID_ADDR: i64 = 0x421000;   // Current process ID
 const NUM_PROCS_ADDR: i64 = 0x421008;     // Number of active processes
@@ -386,7 +386,7 @@ const SIG_MAX: i64 = 32;
 
 // Signal syscalls
 const SYS_KILL: i64 = 19;                         // Send signal to process
-const SYS_WAIT: i64 = 20;                         // Wait for child process
+const SYS_WAIT: i64 = 20;                         // Wait for child process (arg2: flags, WAIT_NOHANG=1)
 const SYS_GETPPID: i64 = 21;                      // Get parent process ID
 
 // Wait options
@@ -3090,7 +3090,7 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         17 => syscall_kb_avail(),               // SYS_KB_AVAIL
         18 => syscall_exec(arg1),               // SYS_EXEC
         19 => syscall_kill(arg1, arg2),         // SYS_KILL
-        20 => syscall_wait(arg1, frame_ptr),    // SYS_WAIT
+        20 => syscall_wait(arg1, arg2, frame_ptr),    // SYS_WAIT (arg2=flags)
         21 => syscall_getppid(),                // SYS_GETPPID
         22 => syscall_shmget(arg1, arg2),       // SYS_SHMGET
         23 => syscall_shmat(arg1),              // SYS_SHMAT
@@ -3337,9 +3337,10 @@ fn syscall_kill(target_pid: i64, signum: i64) -> i64 {
 
 // SYS_WAIT - Wait for child process to terminate
 // arg1: PID to wait for (-1 for any child)
+// arg2: flags (WAIT_NOHANG=1 for non-blocking)
 // frame_ptr: current stack frame for context switch
-// Returns: PID of exited child, or negative error
-fn syscall_wait(wait_pid: i64, frame_ptr: i64) -> i64 {
+// Returns: PID of exited child, 0 if NOHANG and no zombie, or negative error
+fn syscall_wait(wait_pid: i64, flags: i64, frame_ptr: i64) -> i64 {
     let current = get_current_pid();
     let children = pcb_get_child_count(current);
 
@@ -3396,7 +3397,13 @@ fn syscall_wait(wait_pid: i64, frame_ptr: i64) -> i64 {
         return found_pid;
     }
 
-    // No zombie found - block waiting
+    // No zombie found - check WAIT_NOHANG flag
+    if flags == WAIT_NOHANG {
+        // Non-blocking: return 0 to indicate no child exited yet
+        return 0;
+    }
+
+    // Blocking wait: put process in WAITING state
     pcb_set_state(current, ProcState::Waiting);
     pcb_set_rsp(current, frame_ptr);
 

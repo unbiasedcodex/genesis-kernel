@@ -2943,80 +2943,7 @@ pub fn isr_handler(frame_ptr: i64) {
             let arg2 = read_stack_u64(frame_ptr, 88) as i64;          // RSI
             let arg3 = read_stack_u64(frame_ptr, 96) as i64;          // RDX
 
-            // Debug: print RIP before syscall
-            let rip_before = read_stack_u64(frame_ptr, 144);
-            serial_out(60);  // <
-            serial_hex32(rip_before);
-
             let result = handle_syscall(syscall_num, arg1, arg2, arg3, frame_ptr);
-
-            // Debug: print RIP and user RSP after syscall
-            let rip_after = read_stack_u64(frame_ptr, 144);
-            serial_out(62);  // >
-            serial_hex32(rip_after);
-            // Also print user RSP (offset 168) - what iretq will restore
-            let user_rsp = read_stack_u64(frame_ptr, 168);
-            serial_out(83);  // S
-            serial_hex32(user_rsp);
-            // Debug: print bytes at multiple VFS syscall locations
-            // Syscall 1 at 0x90019A, Syscall 2 at 0x9001A6, Syscall 3 at 0x9001B2
-            // All should show CD 80
-
-            // Check syscall 1 location (0x90019A)
-            serial_out(49);  // 1
-            serial_out(58);  // :
-            let c1 = read_u64_addr(0x90019A);
-            let b1a = c1 % 256;
-            let b1b = (c1 / 256) % 256;
-            serial_out(if (b1a / 16) < 10 { 48 + (b1a / 16) as i64 } else { 55 + (b1a / 16) as i64 });
-            serial_out(if (b1a % 16) < 10 { 48 + (b1a % 16) as i64 } else { 55 + (b1a % 16) as i64 });
-            serial_out(if (b1b / 16) < 10 { 48 + (b1b / 16) as i64 } else { 55 + (b1b / 16) as i64 });
-            serial_out(if (b1b % 16) < 10 { 48 + (b1b % 16) as i64 } else { 55 + (b1b % 16) as i64 });
-            serial_out(32);  // space
-
-            // Check syscall 2 location (0x9001A6)
-            serial_out(50);  // 2
-            serial_out(58);  // :
-            let c2 = read_u64_addr(0x9001A6);
-            let b2a = c2 % 256;
-            let b2b = (c2 / 256) % 256;
-            serial_out(if (b2a / 16) < 10 { 48 + (b2a / 16) as i64 } else { 55 + (b2a / 16) as i64 });
-            serial_out(if (b2a % 16) < 10 { 48 + (b2a % 16) as i64 } else { 55 + (b2a % 16) as i64 });
-            serial_out(if (b2b / 16) < 10 { 48 + (b2b / 16) as i64 } else { 55 + (b2b / 16) as i64 });
-            serial_out(if (b2b % 16) < 10 { 48 + (b2b % 16) as i64 } else { 55 + (b2b % 16) as i64 });
-            serial_out(32);  // space
-
-            // Check syscall 3 location (0x9001B2)
-            serial_out(51);  // 3
-            serial_out(58);  // :
-            let c3 = read_u64_addr(0x9001B2);
-            let b3a = c3 % 256;
-            let b3b = (c3 / 256) % 256;
-            serial_out(if (b3a / 16) < 10 { 48 + (b3a / 16) as i64 } else { 55 + (b3a / 16) as i64 });
-            serial_out(if (b3a % 16) < 10 { 48 + (b3a % 16) as i64 } else { 55 + (b3a % 16) as i64 });
-            serial_out(if (b3b / 16) < 10 { 48 + (b3b / 16) as i64 } else { 55 + (b3b / 16) as i64 });
-            serial_out(if (b3b % 16) < 10 { 48 + (b3b % 16) as i64 } else { 55 + (b3b % 16) as i64 });
-            serial_out(32);  // space
-
-            // Check locations in between (0x90019C, 0x9001A0, 0x9001A8)
-            serial_out(88);  // X
-            let ca = read_u64_addr(0x90019C);
-            let cb = read_u64_addr(0x9001A0);
-            let cc = read_u64_addr(0x9001A4);
-            let cd = read_u64_addr(0x9001A8);
-            // Print first byte of each as hex
-            serial_out(if ((ca % 256) / 16) < 10 { 48 + ((ca % 256) / 16) as i64 } else { 55 + ((ca % 256) / 16) as i64 });
-            serial_out(if ((ca % 256) % 16) < 10 { 48 + ((ca % 256) % 16) as i64 } else { 55 + ((ca % 256) % 16) as i64 });
-            serial_out(45);  // -
-            serial_out(if ((cb % 256) / 16) < 10 { 48 + ((cb % 256) / 16) as i64 } else { 55 + ((cb % 256) / 16) as i64 });
-            serial_out(if ((cb % 256) % 16) < 10 { 48 + ((cb % 256) % 16) as i64 } else { 55 + ((cb % 256) % 16) as i64 });
-            serial_out(45);  // -
-            serial_out(if ((cc % 256) / 16) < 10 { 48 + ((cc % 256) / 16) as i64 } else { 55 + ((cc % 256) / 16) as i64 });
-            serial_out(if ((cc % 256) % 16) < 10 { 48 + ((cc % 256) % 16) as i64 } else { 55 + ((cc % 256) % 16) as i64 });
-            serial_out(45);  // -
-            serial_out(if ((cd % 256) / 16) < 10 { 48 + ((cd % 256) / 16) as i64 } else { 55 + ((cd % 256) / 16) as i64 });
-            serial_out(if ((cd % 256) % 16) < 10 { 48 + ((cd % 256) % 16) as i64 } else { 55 + ((cd % 256) % 16) as i64 });
-            serial_out(32);  // space
 
             // Store result in RAX on the stack (will be restored by iretq)
             write_u64_addr(frame_ptr + 120, result as u64);
@@ -3028,17 +2955,6 @@ pub fn isr_handler(frame_ptr: i64) {
             let current = get_current_pid();
             let current_state = pcb_get_state(current);
             if current_state == ProcState::Running {
-                // Debug: print saved RSP and RIP
-                serial_out(70);  // F
-                serial_out(61);  // =
-                serial_hex32(frame_ptr as u64);
-                serial_out(32);  // space
-                // Print RIP from frame (offset 144)
-                let saved_rip = read_stack_u64(frame_ptr, 144);
-                serial_out(73);  // I
-                serial_out(61);  // =
-                serial_hex32(saved_rip);
-                serial_out(32);  // space
                 pcb_set_rsp(current, frame_ptr);
             }
 
@@ -4677,31 +4593,11 @@ fn syscall_send(dst_pid: i64, data: i64) -> i64 {
 
     // Check capability to send to destination
     if !cap_check_ipc_send(src_pid, dst_pid) {
-        // Debug output for denied send
-        serial_out(67);  // C
-        serial_out(65);  // A
-        serial_out(80);  // P
-        serial_out(33);  // !
-        serial_out(src_pid + 48);
-        serial_out(45);  // -
-        serial_out(62);  // >
-        serial_out(dst_pid + 48);
-        serial_newline();
         return CAP_ERR_DENIED;
     }
 
     // Try to enqueue the message
     if mq_enqueue(dst_pid, src_pid, data) {
-        // Debug output
-        serial_out(83);  // S
-        serial_out(78);  // N
-        serial_out(68);  // D
-        serial_out(58);  // :
-        serial_out(src_pid + 48);
-        serial_out(45);  // -
-        serial_out(62);  // >
-        serial_out(dst_pid + 48);
-        serial_newline();
         0
     } else {
         -2  // Queue full
@@ -5961,15 +5857,8 @@ fn handle_timer() {
     let ticks = read_u64_addr(TICK_COUNT_ADDR);
     write_u64_addr(TICK_COUNT_ADDR, ticks + 1);
 
-    // Every 100 ticks (~1 second), print TICK
+    // Every 100 ticks (~1 second), update VGA timer display
     if (ticks + 1) % 100 == 0 {
-        serial_out(84);  // T
-        serial_out(73);  // I
-        serial_out(67);  // C
-        serial_out(75);  // K
-        serial_newline();
-
-        // Update VGA tick counter (row 10)
         let seconds = ((ticks + 1) / 100) as i64;
         let green: i64 = 0x0A;
         vga_write_char_color(0, 10, 84, green);  // T
@@ -5988,25 +5877,13 @@ fn handle_timer() {
 fn handle_keyboard() {
     let scancode = inb(0x60);
 
-    // Debug: print scancode to serial
-    serial_out(75);  // K
-    serial_out(66);  // B
-    serial_out(58);  // :
-    serial_print_hex64(scancode as u64);
-
     // Translate scancode to ASCII
     let ch = scancode_to_ascii(scancode);
 
     // If valid character, add to keyboard buffer
     if ch > 0 {
         kb_buffer_push(ch);
-
-        // Debug: print character
-        serial_out(61);  // =
-        serial_out(ch);
     }
-
-    serial_newline();
 }
 
 // ============================================================
@@ -6788,21 +6665,6 @@ fn schedule_pick_next() -> i64 {
     // Return the new RSP
     let new_rsp = pcb_get_rsp(next);
 
-    // Debug: Print context switch info with restored RSP
-    serial_out(83);  // S
-    serial_out(87);  // W
-    serial_out(58);  // :
-    serial_out(48 + current);  // from PID
-    serial_out(45);  // -
-    serial_out(62);  // >
-    serial_out(48 + next);  // to PID
-    serial_out(32);  // space
-    // Print new_rsp being restored
-    serial_out(82);  // R
-    serial_out(61);  // =
-    serial_hex32(new_rsp as u64);
-    serial_out(32);  // space
-
     // Update TSS.RSP0 for the next process
     // This is critical for ring 3 -> ring 0 transitions
     if pcb_is_user_mode(next) {
@@ -6810,12 +6672,7 @@ fn schedule_pick_next() -> i64 {
         let kstack_base = pcb_get_kstack(next);
         let kstack_top = kstack_base + KSTACK_SIZE;
         tss_set_kernel_stack(kstack_top);
-        // Debug: verify TSS was set
-        serial_out(84);  // T
-        serial_out(61);  // =
-        serial_hex32(tss_get_kernel_stack() as u64);
     }
-    serial_newline();
 
     // Update current PID
     set_current_pid(next);

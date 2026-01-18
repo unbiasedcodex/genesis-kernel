@@ -1,0 +1,1007 @@
+// Genesis Kernel - TCP Protocol
+// Transmission Control Protocol (RFC 793)
+
+// ============================================================
+// TCP Constants
+// ============================================================
+
+// TCP Header Size (minimum, no options)
+const TCP_MIN_HEADER_SIZE: i64 = 20;
+const TCP_MAX_HEADER_SIZE: i64 = 60;
+
+// TCP Header Offsets
+const TCP_SRC_PORT: i64 = 0;      // Source port (2 bytes)
+const TCP_DST_PORT: i64 = 2;      // Destination port (2 bytes)
+const TCP_SEQ_NUM: i64 = 4;       // Sequence number (4 bytes)
+const TCP_ACK_NUM: i64 = 8;       // Acknowledgment number (4 bytes)
+const TCP_DATA_OFF: i64 = 12;     // Data offset (4 bits) + reserved
+const TCP_FLAGS: i64 = 13;        // Flags (8 bits)
+const TCP_WINDOW: i64 = 14;       // Window size (2 bytes)
+const TCP_CHECKSUM: i64 = 16;     // Checksum (2 bytes)
+const TCP_URG_PTR: i64 = 18;      // Urgent pointer (2 bytes)
+const TCP_OPTIONS: i64 = 20;      // Options start here
+
+// TCP Flags
+const TCP_FIN: i64 = 0x01;
+const TCP_SYN: i64 = 0x02;
+const TCP_RST: i64 = 0x04;
+const TCP_PSH: i64 = 0x08;
+const TCP_ACK: i64 = 0x10;
+const TCP_URG: i64 = 0x20;
+
+// TCP States
+const TCP_STATE_CLOSED: i64 = 0;
+const TCP_STATE_LISTEN: i64 = 1;
+const TCP_STATE_SYN_SENT: i64 = 2;
+const TCP_STATE_SYN_RECEIVED: i64 = 3;
+const TCP_STATE_ESTABLISHED: i64 = 4;
+const TCP_STATE_FIN_WAIT_1: i64 = 5;
+const TCP_STATE_FIN_WAIT_2: i64 = 6;
+const TCP_STATE_CLOSE_WAIT: i64 = 7;
+const TCP_STATE_CLOSING: i64 = 8;
+const TCP_STATE_LAST_ACK: i64 = 9;
+const TCP_STATE_TIME_WAIT: i64 = 10;
+
+// TCP Socket Table
+const TCP_SOCKET_TABLE_ADDR: i64 = 0xB24000;
+const MAX_TCP_SOCKETS: i64 = 32;
+const TCP_SOCKET_SIZE: i64 = 256;
+
+// TCP Socket Offsets
+const TCP_SOCK_STATE: i64 = 0;          // State (1 byte)
+const TCP_SOCK_LOCAL_PORT: i64 = 2;     // Local port (2 bytes)
+const TCP_SOCK_LOCAL_IP: i64 = 4;       // Local IP (4 bytes)
+const TCP_SOCK_REMOTE_PORT: i64 = 8;    // Remote port (2 bytes)
+const TCP_SOCK_REMOTE_IP: i64 = 10;     // Remote IP (4 bytes)
+const TCP_SOCK_OWNER_PID: i64 = 16;     // Owner PID (8 bytes)
+
+// Send sequence space
+const TCP_SOCK_SND_UNA: i64 = 24;       // Send unacknowledged (4 bytes)
+const TCP_SOCK_SND_NXT: i64 = 28;       // Send next (4 bytes)
+const TCP_SOCK_SND_WND: i64 = 32;       // Send window (2 bytes)
+const TCP_SOCK_ISS: i64 = 34;           // Initial send sequence (4 bytes)
+
+// Receive sequence space
+const TCP_SOCK_RCV_NXT: i64 = 40;       // Receive next (4 bytes)
+const TCP_SOCK_RCV_WND: i64 = 44;       // Receive window (2 bytes)
+const TCP_SOCK_IRS: i64 = 46;           // Initial receive sequence (4 bytes)
+
+// Timers
+const TCP_SOCK_RTO: i64 = 52;           // Retransmission timeout (4 bytes)
+const TCP_SOCK_LAST_ACT: i64 = 56;      // Last activity tick (8 bytes)
+
+// Buffers
+const TCP_SOCK_RX_BUF: i64 = 64;        // RX buffer pointer (8 bytes)
+const TCP_SOCK_RX_LEN: i64 = 72;        // RX buffer length (4 bytes)
+const TCP_SOCK_RX_HEAD: i64 = 76;       // RX buffer head (4 bytes)
+const TCP_SOCK_RX_TAIL: i64 = 80;       // RX buffer tail (4 bytes)
+const TCP_SOCK_TX_BUF: i64 = 84;        // TX buffer pointer (8 bytes)
+const TCP_SOCK_TX_LEN: i64 = 92;        // TX buffer length (4 bytes)
+const TCP_SOCK_TX_HEAD: i64 = 96;       // TX buffer head (4 bytes)
+const TCP_SOCK_TX_TAIL: i64 = 100;      // TX buffer tail (4 bytes)
+
+// Accept queue (for listening sockets)
+const TCP_SOCK_BACKLOG: i64 = 104;      // Backlog size (2 bytes)
+const TCP_SOCK_ACCEPT_HEAD: i64 = 106;  // Accept queue head (2 bytes)
+const TCP_SOCK_ACCEPT_TAIL: i64 = 108;  // Accept queue tail (2 bytes)
+const TCP_SOCK_ACCEPT_QUEUE: i64 = 112; // Accept queue (8 entries * 4 bytes)
+
+// Buffer sizes
+const TCP_RX_BUFFER_SIZE: i64 = 8192;
+const TCP_TX_BUFFER_SIZE: i64 = 8192;
+const TCP_BUFFER_POOL_ADDR: i64 = 0xB28000;  // Buffer pool start
+
+// TCP TX buffer
+const TCP_TX_BUF: i64 = 0xB38000;      // TX packet buffer (2KB)
+
+// Default values
+const TCP_DEFAULT_WINDOW: i64 = 8192;
+const TCP_DEFAULT_RTO: i64 = 300;       // 3 seconds at 100Hz
+const TCP_MSL: i64 = 12000;             // 2 minutes at 100Hz
+const TCP_MAX_RETRIES: i64 = 5;
+
+// Ephemeral ports
+const TCP_EPHEMERAL_START: i64 = 49152;
+const TCP_EPHEMERAL_END: i64 = 65535;
+
+// ============================================================
+// TCP Socket Management
+// ============================================================
+
+// Initialize TCP subsystem
+pub fn tcp_init() {
+    tcp_memset(TCP_SOCKET_TABLE_ADDR, 0, MAX_TCP_SOCKETS * TCP_SOCKET_SIZE);
+    tcp_memset(TCP_BUFFER_POOL_ADDR, 0, TCP_RX_BUFFER_SIZE * MAX_TCP_SOCKETS);
+}
+
+// Get socket address
+fn tcp_get_socket_addr(socket_id: i64) -> i64 {
+    TCP_SOCKET_TABLE_ADDR + (socket_id * TCP_SOCKET_SIZE)
+}
+
+// Get buffer address for socket
+fn tcp_get_rx_buffer(socket_id: i64) -> i64 {
+    TCP_BUFFER_POOL_ADDR + (socket_id * (TCP_RX_BUFFER_SIZE + TCP_TX_BUFFER_SIZE))
+}
+
+fn tcp_get_tx_buffer(socket_id: i64) -> i64 {
+    tcp_get_rx_buffer(socket_id) + TCP_RX_BUFFER_SIZE
+}
+
+// Create TCP socket
+pub fn tcp_socket_create() -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_TCP_SOCKETS {
+        let sock = tcp_get_socket_addr(i);
+        let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+        if state == TCP_STATE_CLOSED {
+            // Initialize socket
+            tcp_memset(sock, 0, TCP_SOCKET_SIZE);
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+            tcp_write_u64(sock + TCP_SOCK_OWNER_PID, tcp_get_current_pid() as u64);
+
+            // Set up buffers
+            let rx_buf = tcp_get_rx_buffer(i);
+            let tx_buf = tcp_get_tx_buffer(i);
+            tcp_write_u64(sock + TCP_SOCK_RX_BUF, rx_buf as u64);
+            tcp_write_u32(sock + TCP_SOCK_RX_LEN, TCP_RX_BUFFER_SIZE as u64);
+            tcp_write_u64(sock + TCP_SOCK_TX_BUF, tx_buf as u64);
+            tcp_write_u32(sock + TCP_SOCK_TX_LEN, TCP_TX_BUFFER_SIZE as u64);
+
+            // Default values
+            tcp_write_u16(sock + TCP_SOCK_RCV_WND, TCP_DEFAULT_WINDOW as u64);
+            tcp_write_u32(sock + TCP_SOCK_RTO, TCP_DEFAULT_RTO as u64);
+
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+// Allocate ephemeral port
+fn tcp_alloc_ephemeral_port() -> i64 {
+    let mut port = TCP_EPHEMERAL_START;
+    while port <= TCP_EPHEMERAL_END {
+        if tcp_port_in_use(port) == 0 {
+            return port;
+        }
+        port = port + 1;
+    }
+    0
+}
+
+// Check if port in use
+fn tcp_port_in_use(port: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_TCP_SOCKETS {
+        let sock = tcp_get_socket_addr(i);
+        let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+        if state != TCP_STATE_CLOSED {
+            let sock_port = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT) as i64;
+            if sock_port == port {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    0
+}
+
+// Bind socket to port
+pub fn tcp_socket_bind(socket_id: i64, port: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_CLOSED {
+        return -2;
+    }
+
+    let actual_port = if port == 0 {
+        tcp_alloc_ephemeral_port()
+    } else {
+        if tcp_port_in_use(port) == 1 {
+            return -3;
+        }
+        port
+    };
+
+    if actual_port == 0 {
+        return -4;
+    }
+
+    tcp_write_u16(sock + TCP_SOCK_LOCAL_PORT, actual_port as u64);
+    tcp_write_u32(sock + TCP_SOCK_LOCAL_IP, 0);
+
+    0
+}
+
+// Listen for connections
+pub fn tcp_socket_listen(socket_id: i64, backlog: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_CLOSED {
+        return -2;
+    }
+
+    let local_port = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT);
+    if local_port == 0 {
+        return -3;  // Not bound
+    }
+
+    let actual_backlog = if backlog > 8 { 8 } else { backlog };
+    tcp_write_u16(sock + TCP_SOCK_BACKLOG, actual_backlog as u64);
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_LISTEN);
+
+    0
+}
+
+// Accept connection
+pub fn tcp_socket_accept(socket_id: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_LISTEN {
+        return -2;
+    }
+
+    let head = tcp_read_u16(sock + TCP_SOCK_ACCEPT_HEAD) as i64;
+    let tail = tcp_read_u16(sock + TCP_SOCK_ACCEPT_TAIL) as i64;
+
+    if head == tail {
+        return -3;  // No pending connections
+    }
+
+    // Get connection from queue
+    let entry_addr = sock + TCP_SOCK_ACCEPT_QUEUE + (head * 4);
+    let new_socket_id = tcp_read_u32(entry_addr) as i64;
+
+    // Update queue head
+    let new_head = (head + 1) % 8;
+    tcp_write_u16(sock + TCP_SOCK_ACCEPT_HEAD, new_head as u64);
+
+    new_socket_id
+}
+
+// Connect to remote
+pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_CLOSED {
+        return -2;
+    }
+
+    // Auto-bind if needed
+    let local_port = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT);
+    if local_port == 0 {
+        let port = tcp_alloc_ephemeral_port();
+        if port == 0 {
+            return -3;
+        }
+        tcp_write_u16(sock + TCP_SOCK_LOCAL_PORT, port as u64);
+    }
+
+    // Set remote address
+    tcp_write_u32(sock + TCP_SOCK_REMOTE_IP, remote_ip as u64);
+    tcp_write_u16(sock + TCP_SOCK_REMOTE_PORT, remote_port as u64);
+
+    // Generate ISS
+    let iss = tcp_gen_iss();
+    tcp_write_u32(sock + TCP_SOCK_ISS, iss as u64);
+    tcp_write_u32(sock + TCP_SOCK_SND_UNA, iss as u64);
+    tcp_write_u32(sock + TCP_SOCK_SND_NXT, (iss + 1) as u64);
+
+    // Send SYN
+    tcp_send_segment(socket_id, TCP_SYN, 0, 0);
+
+    // Update state
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_SYN_SENT);
+    tcp_write_u64(sock + TCP_SOCK_LAST_ACT, tcp_get_ticks() as u64);
+
+    0
+}
+
+// Close socket
+pub fn tcp_socket_close(socket_id: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    match state {
+        0 => {
+            // Already closed
+            0
+        }
+        1 => {
+            // LISTEN -> CLOSED
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+            0
+        }
+        2 => {
+            // SYN_SENT -> CLOSED
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+            0
+        }
+        3 => {
+            // SYN_RECEIVED -> FIN_WAIT_1
+            tcp_send_segment(socket_id, TCP_FIN + TCP_ACK, 0, 0);
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_FIN_WAIT_1);
+            0
+        }
+        4 => {
+            // ESTABLISHED -> FIN_WAIT_1
+            tcp_send_segment(socket_id, TCP_FIN + TCP_ACK, 0, 0);
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_FIN_WAIT_1);
+            0
+        }
+        7 => {
+            // CLOSE_WAIT -> LAST_ACK
+            tcp_send_segment(socket_id, TCP_FIN + TCP_ACK, 0, 0);
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_LAST_ACK);
+            0
+        }
+        _ => {
+            // Other states, mark for closing
+            -2
+        }
+    }
+}
+
+// ============================================================
+// TCP Send Functions
+// ============================================================
+
+// Generate initial sequence number
+fn tcp_gen_iss() -> i64 {
+    // Use tick count for pseudo-randomness
+    let ticks = tcp_get_ticks();
+    (ticks * 1103515245 + 12345) % 0x100000000
+}
+
+// Calculate TCP checksum
+fn tcp_checksum(src_ip: i64, dst_ip: i64, tcp_data: i64, tcp_len: i64) -> i64 {
+    let mut sum: i64 = 0;
+
+    // Pseudo-header
+    sum = sum + ((src_ip / 65536) % 65536);
+    sum = sum + (src_ip % 65536);
+    sum = sum + ((dst_ip / 65536) % 65536);
+    sum = sum + (dst_ip % 65536);
+    sum = sum + 6;  // TCP protocol
+    sum = sum + tcp_len;
+
+    // TCP segment
+    let mut i: i64 = 0;
+    while i < tcp_len - 1 {
+        let word = (tcp_read_byte(tcp_data + i) * 256) +
+                    tcp_read_byte(tcp_data + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    if tcp_len % 2 == 1 {
+        sum = sum + (tcp_read_byte(tcp_data + tcp_len - 1) * 256);
+    }
+
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    (65535 - sum) % 65536
+}
+
+// Send TCP segment
+fn tcp_send_segment(socket_id: i64, flags: i64, data: i64, data_len: i64) -> i64 {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    let local_port = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT) as i64;
+    let remote_ip = tcp_read_u32(sock + TCP_SOCK_REMOTE_IP) as i64;
+    let remote_port = tcp_read_u16(sock + TCP_SOCK_REMOTE_PORT) as i64;
+    let seq_num = tcp_read_u32(sock + TCP_SOCK_SND_NXT) as i64;
+    let ack_num = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+    let window = tcp_read_u16(sock + TCP_SOCK_RCV_WND) as i64;
+
+    let pkt = TCP_TX_BUF;
+    let header_len = TCP_MIN_HEADER_SIZE;
+
+    // Build header
+    tcp_write_u16_be(pkt + TCP_SRC_PORT, local_port);
+    tcp_write_u16_be(pkt + TCP_DST_PORT, remote_port);
+    tcp_write_u32_be(pkt + TCP_SEQ_NUM, seq_num);
+    tcp_write_u32_be(pkt + TCP_ACK_NUM, ack_num);
+
+    // Data offset (5 = 20 bytes) in high 4 bits
+    tcp_write_byte(pkt + TCP_DATA_OFF, (header_len / 4) * 16);
+
+    // Flags
+    tcp_write_byte(pkt + TCP_FLAGS, flags);
+
+    // Window
+    tcp_write_u16_be(pkt + TCP_WINDOW, window);
+
+    // Checksum (will calculate)
+    tcp_write_u16_be(pkt + TCP_CHECKSUM, 0);
+
+    // Urgent pointer
+    tcp_write_u16_be(pkt + TCP_URG_PTR, 0);
+
+    // Copy data
+    if data_len > 0 && data != 0 {
+        tcp_memcpy(pkt + header_len, data, data_len);
+    }
+
+    let total_len = header_len + data_len;
+
+    // Calculate checksum
+    let src_ip = tcp_net_get_ip();
+    let checksum = tcp_checksum(src_ip, remote_ip, pkt, total_len);
+    tcp_write_u16_be(pkt + TCP_CHECKSUM, checksum);
+
+    // Update SND.NXT
+    let seq_advance = if (flags % 2) == 1 || ((flags / 2) % 2) == 1 {
+        // FIN or SYN consume sequence number
+        data_len + 1
+    } else {
+        data_len
+    };
+    tcp_write_u32(sock + TCP_SOCK_SND_NXT, (seq_num + seq_advance) as u64);
+
+    // Send via IP
+    tcp_ip_send(remote_ip, 6, pkt, total_len)
+}
+
+// Send data on established connection
+pub fn tcp_socket_send(socket_id: i64, data: i64, length: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_ESTABLISHED {
+        return -2;
+    }
+
+    // Limit to MSS
+    let max_data = 1460;  // Ethernet MTU - IP header - TCP header
+    let send_len = if length > max_data { max_data } else { length };
+
+    tcp_send_segment(socket_id, TCP_ACK + TCP_PSH, data, send_len)
+}
+
+// ============================================================
+// TCP Receive Functions
+// ============================================================
+
+// Find socket for incoming packet
+fn tcp_find_socket(local_port: i64, remote_ip: i64, remote_port: i64) -> i64 {
+    // First, look for exact match (established connections)
+    let mut i: i64 = 0;
+    while i < MAX_TCP_SOCKETS {
+        let sock = tcp_get_socket_addr(i);
+        let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+        if state != TCP_STATE_CLOSED && state != TCP_STATE_LISTEN {
+            let lp = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT) as i64;
+            let rip = tcp_read_u32(sock + TCP_SOCK_REMOTE_IP) as i64;
+            let rp = tcp_read_u16(sock + TCP_SOCK_REMOTE_PORT) as i64;
+
+            if lp == local_port && rip == remote_ip && rp == remote_port {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Then, look for listening socket
+    i = 0;
+    while i < MAX_TCP_SOCKETS {
+        let sock = tcp_get_socket_addr(i);
+        let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+        if state == TCP_STATE_LISTEN {
+            let lp = tcp_read_u16(sock + TCP_SOCK_LOCAL_PORT) as i64;
+            if lp == local_port {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+
+    -1
+}
+
+// Handle incoming TCP packet
+pub fn tcp_handle_packet(ip_header: i64, payload: i64, length: i64) {
+    if length < TCP_MIN_HEADER_SIZE {
+        return;
+    }
+
+    let src_port = tcp_read_u16_be(payload + TCP_SRC_PORT) as i64;
+    let dst_port = tcp_read_u16_be(payload + TCP_DST_PORT) as i64;
+    let seq_num = tcp_read_u32_be(payload + TCP_SEQ_NUM);
+    let ack_num = tcp_read_u32_be(payload + TCP_ACK_NUM);
+    let data_off = (tcp_read_byte(payload + TCP_DATA_OFF) / 16) * 4;
+    let flags = tcp_read_byte(payload + TCP_FLAGS);
+
+    let src_ip = tcp_ip_get_src(ip_header);
+
+    let socket_id = tcp_find_socket(dst_port, src_ip, src_port);
+    if socket_id < 0 {
+        // No socket, send RST if not RST
+        if (flags % 8) / 4 == 0 {  // RST bit not set
+            tcp_send_rst(src_ip, src_port, dst_port, ack_num as i64);
+        }
+        return;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    // Update last activity
+    tcp_write_u64(sock + TCP_SOCK_LAST_ACT, tcp_get_ticks() as u64);
+
+    // Data payload
+    let data_len = length - data_off;
+    let data_addr = payload + data_off;
+
+    // State machine
+    match state {
+        1 => tcp_handle_listen(socket_id, src_ip, src_port, seq_num, flags),
+        2 => tcp_handle_syn_sent(socket_id, seq_num, ack_num, flags),
+        3 => tcp_handle_syn_received(socket_id, ack_num, flags),
+        4 => tcp_handle_established(socket_id, seq_num, ack_num, flags, data_addr, data_len),
+        5 => tcp_handle_fin_wait_1(socket_id, seq_num, ack_num, flags),
+        6 => tcp_handle_fin_wait_2(socket_id, seq_num, flags),
+        7 => tcp_handle_close_wait(socket_id, ack_num, flags),
+        8 => tcp_handle_closing(socket_id, ack_num, flags),
+        9 => tcp_handle_last_ack(socket_id, ack_num, flags),
+        10 => tcp_handle_time_wait(socket_id),
+        _ => {}
+    }
+}
+
+// Send RST segment
+fn tcp_send_rst(dst_ip: i64, dst_port: i64, src_port: i64, seq: i64) {
+    let pkt = TCP_TX_BUF;
+
+    tcp_write_u16_be(pkt + TCP_SRC_PORT, src_port);
+    tcp_write_u16_be(pkt + TCP_DST_PORT, dst_port);
+    tcp_write_u32_be(pkt + TCP_SEQ_NUM, seq);
+    tcp_write_u32_be(pkt + TCP_ACK_NUM, 0);
+    tcp_write_byte(pkt + TCP_DATA_OFF, 0x50);  // 5 * 4 = 20 bytes
+    tcp_write_byte(pkt + TCP_FLAGS, TCP_RST);
+    tcp_write_u16_be(pkt + TCP_WINDOW, 0);
+    tcp_write_u16_be(pkt + TCP_CHECKSUM, 0);
+    tcp_write_u16_be(pkt + TCP_URG_PTR, 0);
+
+    let src_ip = tcp_net_get_ip();
+    let checksum = tcp_checksum(src_ip, dst_ip, pkt, TCP_MIN_HEADER_SIZE);
+    tcp_write_u16_be(pkt + TCP_CHECKSUM, checksum);
+
+    tcp_ip_send(dst_ip, 6, pkt, TCP_MIN_HEADER_SIZE);
+}
+
+// State handlers
+fn tcp_handle_listen(socket_id: i64, src_ip: i64, src_port: i64, seq: u64, flags: i64) {
+    // Only accept SYN
+    if (flags % 4) / 2 != 1 {  // SYN bit not set
+        return;
+    }
+
+    let listen_sock = tcp_get_socket_addr(socket_id);
+
+    // Create new socket for this connection
+    let new_socket_id = tcp_socket_create();
+    if new_socket_id < 0 {
+        return;  // No sockets available
+    }
+
+    let sock = tcp_get_socket_addr(new_socket_id);
+
+    // Copy local port
+    let local_port = tcp_read_u16(listen_sock + TCP_SOCK_LOCAL_PORT);
+    tcp_write_u16(sock + TCP_SOCK_LOCAL_PORT, local_port);
+
+    // Set remote
+    tcp_write_u32(sock + TCP_SOCK_REMOTE_IP, src_ip as u64);
+    tcp_write_u16(sock + TCP_SOCK_REMOTE_PORT, src_port as u64);
+
+    // Set sequence numbers
+    let iss = tcp_gen_iss();
+    tcp_write_u32(sock + TCP_SOCK_ISS, iss as u64);
+    tcp_write_u32(sock + TCP_SOCK_SND_UNA, iss as u64);
+    tcp_write_u32(sock + TCP_SOCK_SND_NXT, (iss + 1) as u64);
+    tcp_write_u32(sock + TCP_SOCK_IRS, seq as u64);
+    tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (seq + 1) as u64);
+
+    // Send SYN+ACK
+    tcp_send_segment(new_socket_id, TCP_SYN + TCP_ACK, 0, 0);
+
+    // Set state
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_SYN_RECEIVED);
+
+    // Add to accept queue
+    let tail = tcp_read_u16(listen_sock + TCP_SOCK_ACCEPT_TAIL) as i64;
+    let entry_addr = listen_sock + TCP_SOCK_ACCEPT_QUEUE + (tail * 4);
+    tcp_write_u32(entry_addr, new_socket_id as u64);
+    let new_tail = (tail + 1) % 8;
+    tcp_write_u16(listen_sock + TCP_SOCK_ACCEPT_TAIL, new_tail as u64);
+}
+
+fn tcp_handle_syn_sent(socket_id: i64, seq: u64, ack: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    // Expect SYN+ACK
+    if (flags % 4) / 2 != 1 {  // SYN not set
+        return;
+    }
+
+    if (flags % 32) / 16 != 1 {  // ACK not set
+        // Simultaneous open
+        tcp_write_u32(sock + TCP_SOCK_IRS, seq as u64);
+        tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (seq + 1) as u64);
+        tcp_send_segment(socket_id, TCP_SYN + TCP_ACK, 0, 0);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_SYN_RECEIVED);
+        return;
+    }
+
+    // Normal SYN+ACK
+    tcp_write_u32(sock + TCP_SOCK_IRS, seq as u64);
+    tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (seq + 1) as u64);
+    tcp_write_u32(sock + TCP_SOCK_SND_UNA, ack as u64);
+
+    // Send ACK
+    tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+
+    // Established!
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_ESTABLISHED);
+}
+
+fn tcp_handle_syn_received(socket_id: i64, ack: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    if (flags % 32) / 16 != 1 {  // ACK not set
+        return;
+    }
+
+    // ACK of our SYN
+    tcp_write_u32(sock + TCP_SOCK_SND_UNA, ack as u64);
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_ESTABLISHED);
+}
+
+fn tcp_handle_established(socket_id: i64, seq: u64, ack: u64, flags: i64, data: i64, data_len: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    // Update SND.UNA
+    if (flags % 32) / 16 == 1 {  // ACK set
+        tcp_write_u32(sock + TCP_SOCK_SND_UNA, ack as u64);
+    }
+
+    // Handle incoming data
+    if data_len > 0 {
+        // Copy to RX buffer
+        let rx_buf = tcp_read_u64(sock + TCP_SOCK_RX_BUF) as i64;
+        let rx_tail = tcp_read_u32(sock + TCP_SOCK_RX_TAIL) as i64;
+        let rx_len = tcp_read_u32(sock + TCP_SOCK_RX_LEN) as i64;
+
+        let copy_len = if data_len > rx_len { rx_len } else { data_len };
+        let mut i: i64 = 0;
+        while i < copy_len {
+            let dst = (rx_tail + i) % rx_len;
+            tcp_write_byte(rx_buf + dst, tcp_read_byte(data + i));
+            i = i + 1;
+        }
+        tcp_write_u32(sock + TCP_SOCK_RX_TAIL, ((rx_tail + copy_len) % rx_len) as u64);
+
+        // Update RCV.NXT
+        let rcv_nxt = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+        tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (rcv_nxt + data_len) as u64);
+
+        // Send ACK
+        tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+    }
+
+    // Check for FIN
+    if flags % 2 == 1 {  // FIN set
+        let rcv_nxt = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+        tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (rcv_nxt + 1) as u64);
+        tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSE_WAIT);
+    }
+}
+
+fn tcp_handle_fin_wait_1(socket_id: i64, seq: u64, ack: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    if (flags % 32) / 16 == 1 {  // ACK
+        tcp_write_u32(sock + TCP_SOCK_SND_UNA, ack as u64);
+
+        if flags % 2 == 1 {  // FIN+ACK
+            let rcv_nxt = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+            tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (rcv_nxt + 1) as u64);
+            tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_TIME_WAIT);
+        } else {
+            tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_FIN_WAIT_2);
+        }
+    } else if flags % 2 == 1 {  // FIN only (simultaneous close)
+        let rcv_nxt = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+        tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (rcv_nxt + 1) as u64);
+        tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSING);
+    }
+}
+
+fn tcp_handle_fin_wait_2(socket_id: i64, seq: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    if flags % 2 == 1 {  // FIN
+        let rcv_nxt = tcp_read_u32(sock + TCP_SOCK_RCV_NXT) as i64;
+        tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (rcv_nxt + 1) as u64);
+        tcp_send_segment(socket_id, TCP_ACK, 0, 0);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_TIME_WAIT);
+    }
+}
+
+fn tcp_handle_close_wait(socket_id: i64, ack: u64, flags: i64) {
+    // Waiting for application to close
+}
+
+fn tcp_handle_closing(socket_id: i64, ack: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    if (flags % 32) / 16 == 1 {  // ACK
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_TIME_WAIT);
+    }
+}
+
+fn tcp_handle_last_ack(socket_id: i64, ack: u64, flags: i64) {
+    let sock = tcp_get_socket_addr(socket_id);
+
+    if (flags % 32) / 16 == 1 {  // ACK
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+    }
+}
+
+fn tcp_handle_time_wait(socket_id: i64) {
+    // Wait for 2*MSL then close
+    let sock = tcp_get_socket_addr(socket_id);
+    let last_act = tcp_read_u64(sock + TCP_SOCK_LAST_ACT) as i64;
+    let now = tcp_get_ticks();
+
+    if now - last_act > TCP_MSL * 2 {
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+    }
+}
+
+// Receive data from socket
+pub fn tcp_socket_recv(socket_id: i64, buffer: i64, max_len: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_TCP_SOCKETS {
+        return -1;
+    }
+
+    let sock = tcp_get_socket_addr(socket_id);
+    let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+    if state != TCP_STATE_ESTABLISHED && state != TCP_STATE_CLOSE_WAIT {
+        return -2;
+    }
+
+    let rx_buf = tcp_read_u64(sock + TCP_SOCK_RX_BUF) as i64;
+    let rx_head = tcp_read_u32(sock + TCP_SOCK_RX_HEAD) as i64;
+    let rx_tail = tcp_read_u32(sock + TCP_SOCK_RX_TAIL) as i64;
+    let rx_len = tcp_read_u32(sock + TCP_SOCK_RX_LEN) as i64;
+
+    if rx_head == rx_tail {
+        return 0;  // No data
+    }
+
+    let available = if rx_tail >= rx_head {
+        rx_tail - rx_head
+    } else {
+        rx_len - rx_head + rx_tail
+    };
+
+    let copy_len = if available < max_len { available } else { max_len };
+    let mut i: i64 = 0;
+    while i < copy_len {
+        let src = (rx_head + i) % rx_len;
+        tcp_write_byte(buffer + i, tcp_read_byte(rx_buf + src));
+        i = i + 1;
+    }
+
+    tcp_write_u32(sock + TCP_SOCK_RX_HEAD, ((rx_head + copy_len) % rx_len) as u64);
+
+    copy_len
+}
+
+// Timer tick (retransmission, TIME_WAIT cleanup)
+pub fn tcp_timer_tick() {
+    let mut i: i64 = 0;
+    while i < MAX_TCP_SOCKETS {
+        let sock = tcp_get_socket_addr(i);
+        let state = tcp_read_byte(sock + TCP_SOCK_STATE);
+
+        if state == TCP_STATE_TIME_WAIT {
+            tcp_handle_time_wait(i);
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn tcp_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn tcp_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn tcp_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_read_u16_be(addr: i64) -> u64 {
+    let hi = tcp_read_byte(addr) as u64;
+    let lo = tcp_read_byte(addr + 1) as u64;
+    (hi * 256) + lo
+}
+
+fn tcp_write_u16_be(addr: i64, value: i64) {
+    tcp_write_byte(addr, value / 256);
+    tcp_write_byte(addr + 1, value % 256);
+}
+
+fn tcp_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn tcp_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_read_u32_be(addr: i64) -> u64 {
+    let b0 = tcp_read_byte(addr) as u64;
+    let b1 = tcp_read_byte(addr + 1) as u64;
+    let b2 = tcp_read_byte(addr + 2) as u64;
+    let b3 = tcp_read_byte(addr + 3) as u64;
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+fn tcp_write_u32_be(addr: i64, value: i64) {
+    tcp_write_byte(addr, (value / 16777216) % 256);
+    tcp_write_byte(addr + 1, (value / 65536) % 256);
+    tcp_write_byte(addr + 2, (value / 256) % 256);
+    tcp_write_byte(addr + 3, value % 256);
+}
+
+fn tcp_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn tcp_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        tcp_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn tcp_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        tcp_write_byte(dst + i, tcp_read_byte(src + i));
+        i = i + 1;
+    }
+}
+
+fn tcp_get_ticks() -> i64 {
+    tcp_read_u64(0x412000) as i64
+}
+
+// External functions
+fn tcp_get_current_pid() -> i64 { 0 }
+fn tcp_net_get_ip() -> i64 { 0 }
+fn tcp_ip_send(dst: i64, proto: i64, data: i64, len: i64) -> i64 { 0 }
+fn tcp_ip_get_src(packet: i64) -> i64 { 0 }

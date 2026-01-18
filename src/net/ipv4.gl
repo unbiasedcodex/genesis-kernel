@@ -1,0 +1,675 @@
+// Genesis Kernel - IPv4 Layer
+// Internet Protocol Version 4 (RFC 791)
+
+// ============================================================
+// IPv4 Constants
+// ============================================================
+
+// IP Header Constants
+const IP_VERSION: i64 = 4;
+const IP_MIN_HEADER_LEN: i64 = 20;      // Minimum header (no options)
+const IP_MAX_HEADER_LEN: i64 = 60;      // Maximum header (with options)
+const IP_DEFAULT_TTL: i64 = 64;         // Default Time-To-Live
+const IP_MAX_PACKET_SIZE: i64 = 1500;   // Maximum packet (fits in Ethernet)
+
+// IP Protocol Numbers
+const IP_PROTO_ICMP: i64 = 1;
+const IP_PROTO_TCP: i64 = 6;
+const IP_PROTO_UDP: i64 = 17;
+
+// IP Header Flags
+const IP_FLAG_DF: i64 = 0x4000;   // Don't Fragment
+const IP_FLAG_MF: i64 = 0x2000;   // More Fragments
+const IP_FRAG_MASK: i64 = 0x1FFF; // Fragment offset mask
+
+// Network Configuration Address
+const NET_CONFIG_ADDR: i64 = 0xB21000;
+
+// Network Configuration Offsets (structure)
+const NET_CFG_IP: i64 = 0;           // Our IP address (4 bytes)
+const NET_CFG_NETMASK: i64 = 4;      // Subnet mask (4 bytes)
+const NET_CFG_GATEWAY: i64 = 8;      // Default gateway (4 bytes)
+const NET_CFG_DNS: i64 = 12;         // DNS server (4 bytes)
+const NET_CFG_CONFIGURED: i64 = 16;  // Configuration state (1 byte)
+const NET_CFG_DHCP_LEASE: i64 = 20;  // DHCP lease time (4 bytes)
+const NET_CFG_DHCP_SERVER: i64 = 24; // DHCP server IP (4 bytes)
+const NET_CFG_ID_COUNTER: i64 = 28;  // IP ID counter (2 bytes)
+
+// Configuration states
+const NET_STATE_UNCONFIGURED: i64 = 0;
+const NET_STATE_STATIC: i64 = 1;
+const NET_STATE_DHCP: i64 = 2;
+
+// IP Header Offsets
+const IP_VER_IHL: i64 = 0;      // Version (4) + IHL (4)
+const IP_TOS: i64 = 1;          // Type of Service
+const IP_TOTAL_LEN: i64 = 2;    // Total Length (2 bytes)
+const IP_ID: i64 = 4;           // Identification (2 bytes)
+const IP_FLAGS_FRAG: i64 = 6;   // Flags + Fragment Offset (2 bytes)
+const IP_TTL: i64 = 8;          // Time to Live
+const IP_PROTOCOL: i64 = 9;     // Protocol
+const IP_CHECKSUM: i64 = 10;    // Header Checksum (2 bytes)
+const IP_SRC_ADDR: i64 = 12;    // Source Address (4 bytes)
+const IP_DST_ADDR: i64 = 16;    // Destination Address (4 bytes)
+const IP_OPTIONS: i64 = 20;     // Options start here
+
+// TX/RX Buffers
+const IP_TX_BUF: i64 = 0xB32000;   // IP TX buffer (2KB)
+const IP_RX_BUF: i64 = 0xB32800;   // IP RX buffer (2KB)
+
+// Ethernet header size
+const ETH_HEADER_SIZE: i64 = 14;
+
+// ============================================================
+// Network Configuration Functions
+// ============================================================
+
+// Get our IP address
+pub fn net_get_ip() -> i64 {
+    ip_read_u32(NET_CONFIG_ADDR + NET_CFG_IP) as i64
+}
+
+// Set our IP address
+pub fn net_set_ip(ip: i64) {
+    ip_write_u32(NET_CONFIG_ADDR + NET_CFG_IP, ip as u64);
+}
+
+// Get subnet mask
+pub fn net_get_netmask() -> i64 {
+    ip_read_u32(NET_CONFIG_ADDR + NET_CFG_NETMASK) as i64
+}
+
+// Set subnet mask
+pub fn net_set_netmask(mask: i64) {
+    ip_write_u32(NET_CONFIG_ADDR + NET_CFG_NETMASK, mask as u64);
+}
+
+// Get default gateway
+pub fn net_get_gateway() -> i64 {
+    ip_read_u32(NET_CONFIG_ADDR + NET_CFG_GATEWAY) as i64
+}
+
+// Set default gateway
+pub fn net_set_gateway(gw: i64) {
+    ip_write_u32(NET_CONFIG_ADDR + NET_CFG_GATEWAY, gw as u64);
+}
+
+// Get DNS server
+pub fn net_get_dns() -> i64 {
+    ip_read_u32(NET_CONFIG_ADDR + NET_CFG_DNS) as i64
+}
+
+// Set DNS server
+pub fn net_set_dns(dns: i64) {
+    ip_write_u32(NET_CONFIG_ADDR + NET_CFG_DNS, dns as u64);
+}
+
+// Get configuration state
+pub fn net_get_state() -> i64 {
+    ip_read_byte(NET_CONFIG_ADDR + NET_CFG_CONFIGURED)
+}
+
+// Set configuration state
+pub fn net_set_state(state: i64) {
+    ip_write_byte(NET_CONFIG_ADDR + NET_CFG_CONFIGURED, state);
+}
+
+// Configure network (static IP)
+pub fn net_configure(ip: i64, mask: i64, gateway: i64, dns: i64) {
+    net_set_ip(ip);
+    net_set_netmask(mask);
+    net_set_gateway(gateway);
+    net_set_dns(dns);
+    net_set_state(NET_STATE_STATIC);
+}
+
+// Check if network is configured
+pub fn net_is_configured() -> i64 {
+    let state = net_get_state();
+    if state == NET_STATE_STATIC || state == NET_STATE_DHCP {
+        1
+    } else {
+        0
+    }
+}
+
+// Initialize network configuration
+pub fn net_config_init() {
+    ip_memset(NET_CONFIG_ADDR, 0, 64);
+}
+
+// ============================================================
+// IP Address Helper Functions
+// ============================================================
+
+// Create IP address from octets (a.b.c.d)
+pub fn ip_make(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    (a * 16777216) + (b * 65536) + (c * 256) + d
+}
+
+// Get octet from IP address
+pub fn ip_get_octet(ip: i64, n: i64) -> i64 {
+    match n {
+        0 => (ip / 16777216) % 256,
+        1 => (ip / 65536) % 256,
+        2 => (ip / 256) % 256,
+        3 => ip % 256,
+        _ => 0,
+    }
+}
+
+// Check if IP is on same subnet
+pub fn ip_same_subnet(ip1: i64, ip2: i64, mask: i64) -> i64 {
+    let net1 = ip_and(ip1, mask);
+    let net2 = ip_and(ip2, mask);
+    if net1 == net2 { 1 } else { 0 }
+}
+
+// Bitwise AND for IP addresses
+fn ip_and(a: i64, b: i64) -> i64 {
+    // Perform AND on each octet
+    let r0 = ((a / 16777216) % 256) * ((b / 16777216) % 256) / 255 * 255;
+    let r1 = ((a / 65536) % 256) * ((b / 65536) % 256) / 255 * 255;
+    let r2 = ((a / 256) % 256) * ((b / 256) % 256) / 255 * 255;
+    let r3 = (a % 256) * (b % 256) / 255 * 255;
+
+    // Actually compute proper AND
+    let mut result: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 32 {
+        let bit_a = (a / ip_pow2(i)) % 2;
+        let bit_b = (b / ip_pow2(i)) % 2;
+        if bit_a == 1 && bit_b == 1 {
+            result = result + ip_pow2(i);
+        }
+        i = i + 1;
+    }
+    result
+}
+
+fn ip_pow2(n: i64) -> i64 {
+    let mut result: i64 = 1;
+    let mut i: i64 = 0;
+    while i < n {
+        result = result * 2;
+        i = i + 1;
+    }
+    result
+}
+
+// ============================================================
+// IP Routing
+// ============================================================
+
+// Determine next hop for destination IP
+// Returns: next hop IP address (gateway or direct)
+pub fn ip_route(dst_ip: i64) -> i64 {
+    let our_ip = net_get_ip();
+    let mask = net_get_netmask();
+    let gateway = net_get_gateway();
+
+    // Check if on same subnet
+    if ip_same_subnet(our_ip, dst_ip, mask) == 1 {
+        // Direct delivery
+        dst_ip
+    } else {
+        // Use gateway
+        gateway
+    }
+}
+
+// ============================================================
+// IP Checksum (RFC 1071)
+// ============================================================
+
+// Calculate IP header checksum
+pub fn ip_checksum(header_addr: i64, header_len: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+
+    // Sum 16-bit words
+    while i < header_len {
+        if i == IP_CHECKSUM {
+            // Skip checksum field
+            i = i + 2;
+            continue;
+        }
+
+        let word = (ip_read_byte(header_addr + i) * 256) +
+                    ip_read_byte(header_addr + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    // Add carry
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    // One's complement
+    (65535 - sum) % 65536
+}
+
+// Verify IP checksum
+pub fn ip_verify_checksum(header_addr: i64, header_len: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+
+    // Sum all 16-bit words including checksum
+    while i < header_len {
+        let word = (ip_read_byte(header_addr + i) * 256) +
+                    ip_read_byte(header_addr + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    // Add carry
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    // Result should be 0xFFFF
+    if sum == 65535 { 1 } else { 0 }
+}
+
+// ============================================================
+// IP Packet Building
+// ============================================================
+
+// Get next packet ID
+fn ip_next_id() -> i64 {
+    let id = ip_read_u16(NET_CONFIG_ADDR + NET_CFG_ID_COUNTER) as i64;
+    ip_write_u16(NET_CONFIG_ADDR + NET_CFG_ID_COUNTER, ((id + 1) % 65536) as u64);
+    id
+}
+
+// Build IP header
+// Returns: header length
+pub fn ip_build_header(dst_ip: i64, protocol: i64, payload_len: i64) -> i64 {
+    let header = IP_TX_BUF;
+    let total_len = IP_MIN_HEADER_LEN + payload_len;
+
+    // Version (4) + IHL (5 = 20 bytes)
+    ip_write_byte(header + IP_VER_IHL, 0x45);
+
+    // Type of Service (0 = normal)
+    ip_write_byte(header + IP_TOS, 0);
+
+    // Total Length (big-endian)
+    ip_write_byte(header + IP_TOTAL_LEN, total_len / 256);
+    ip_write_byte(header + IP_TOTAL_LEN + 1, total_len % 256);
+
+    // Identification (big-endian)
+    let id = ip_next_id();
+    ip_write_byte(header + IP_ID, id / 256);
+    ip_write_byte(header + IP_ID + 1, id % 256);
+
+    // Flags + Fragment Offset (DF=1, no fragmentation)
+    ip_write_byte(header + IP_FLAGS_FRAG, 0x40);  // DF bit
+    ip_write_byte(header + IP_FLAGS_FRAG + 1, 0);
+
+    // TTL
+    ip_write_byte(header + IP_TTL, IP_DEFAULT_TTL);
+
+    // Protocol
+    ip_write_byte(header + IP_PROTOCOL, protocol);
+
+    // Checksum (set to 0 initially)
+    ip_write_byte(header + IP_CHECKSUM, 0);
+    ip_write_byte(header + IP_CHECKSUM + 1, 0);
+
+    // Source Address
+    let src_ip = net_get_ip();
+    ip_write_ip(header + IP_SRC_ADDR, src_ip);
+
+    // Destination Address
+    ip_write_ip(header + IP_DST_ADDR, dst_ip);
+
+    // Calculate checksum
+    let checksum = ip_checksum(header, IP_MIN_HEADER_LEN);
+    ip_write_byte(header + IP_CHECKSUM, checksum / 256);
+    ip_write_byte(header + IP_CHECKSUM + 1, checksum % 256);
+
+    IP_MIN_HEADER_LEN
+}
+
+// Get address for payload
+pub fn ip_get_tx_payload() -> i64 {
+    IP_TX_BUF + IP_MIN_HEADER_LEN
+}
+
+// Get TX buffer address
+pub fn ip_get_tx_buf() -> i64 {
+    IP_TX_BUF
+}
+
+// ============================================================
+// IP Packet Sending
+// ============================================================
+
+// Send IP packet
+// Returns: 1 on success, 0 on failure
+pub fn ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i64 {
+    if net_is_configured() == 0 {
+        return 0;  // Not configured
+    }
+
+    // Build IP header
+    let header_len = ip_build_header(dst_ip, protocol, payload_len);
+
+    // Copy payload to TX buffer
+    let payload_dst = IP_TX_BUF + header_len;
+    ip_memcpy(payload_dst, payload, payload_len);
+
+    let total_len = header_len + payload_len;
+
+    // Determine next hop
+    let next_hop = ip_route(dst_ip);
+
+    // Get MAC for next hop via ARP
+    let mac_buf: i64 = IP_TX_BUF - 6;  // Temporary MAC buffer
+    if arp_lookup(next_hop, mac_buf) == 0 {
+        // MAC not in cache, send ARP request
+        arp_request(next_hop);
+        return 0;  // Caller should retry
+    }
+
+    // Build Ethernet frame
+    let our_mac = net_get_mac_addr();
+    let frame = ip_eth_build_frame(mac_buf, our_mac, 0x0800);
+
+    // Copy IP packet to Ethernet payload
+    ip_memcpy(frame + ETH_HEADER_SIZE, IP_TX_BUF, total_len);
+
+    // Send via E1000
+    ip_eth_send(frame, ETH_HEADER_SIZE + total_len)
+}
+
+// ============================================================
+// IP Packet Receiving
+// ============================================================
+
+// Parse received IP packet
+// Returns: payload length, or 0 if invalid
+pub fn ip_parse(packet: i64, length: i64) -> i64 {
+    if length < IP_MIN_HEADER_LEN {
+        return 0;  // Too short
+    }
+
+    // Check version
+    let ver_ihl = ip_read_byte(packet + IP_VER_IHL);
+    let version = ver_ihl / 16;
+    let ihl = (ver_ihl % 16) * 4;
+
+    if version != IP_VERSION {
+        return 0;  // Not IPv4
+    }
+
+    if ihl < IP_MIN_HEADER_LEN || ihl > IP_MAX_HEADER_LEN {
+        return 0;  // Invalid header length
+    }
+
+    // Verify checksum
+    if ip_verify_checksum(packet, ihl) == 0 {
+        return 0;  // Checksum failed
+    }
+
+    // Get total length
+    let total_len = (ip_read_byte(packet + IP_TOTAL_LEN) * 256) +
+                     ip_read_byte(packet + IP_TOTAL_LEN + 1);
+
+    if total_len as i64 > length {
+        return 0;  // Truncated packet
+    }
+
+    // Check destination
+    let dst_ip = ip_read_ip(packet + IP_DST_ADDR);
+    let our_ip = net_get_ip();
+
+    if dst_ip != our_ip && dst_ip != 0xFFFFFFFF {
+        return 0;  // Not for us
+    }
+
+    // Return payload length
+    total_len as i64 - ihl
+}
+
+// Get protocol from IP header
+pub fn ip_get_protocol(packet: i64) -> i64 {
+    ip_read_byte(packet + IP_PROTOCOL)
+}
+
+// Get source IP from IP header
+pub fn ip_get_src(packet: i64) -> i64 {
+    ip_read_ip(packet + IP_SRC_ADDR)
+}
+
+// Get destination IP from IP header
+pub fn ip_get_dst(packet: i64) -> i64 {
+    ip_read_ip(packet + IP_DST_ADDR)
+}
+
+// Get header length from IP header
+pub fn ip_get_header_len(packet: i64) -> i64 {
+    let ver_ihl = ip_read_byte(packet + IP_VER_IHL);
+    (ver_ihl % 16) * 4
+}
+
+// Get payload address from IP packet
+pub fn ip_get_payload(packet: i64) -> i64 {
+    packet + ip_get_header_len(packet)
+}
+
+// Handle incoming IP packet
+pub fn ip_handle_packet(packet: i64, length: i64) {
+    let payload_len = ip_parse(packet, length);
+    if payload_len == 0 {
+        return;  // Invalid packet
+    }
+
+    let protocol = ip_get_protocol(packet);
+    let payload = ip_get_payload(packet);
+
+    // Dispatch to protocol handler
+    match protocol {
+        1 => icmp_handle_packet(packet, payload, payload_len),
+        6 => tcp_handle_packet(packet, payload, payload_len),
+        17 => udp_handle_packet(packet, payload, payload_len),
+        _ => {
+            // Unknown protocol, ignore
+        }
+    }
+}
+
+// ============================================================
+// IP Address Read/Write (Network Byte Order)
+// ============================================================
+
+fn ip_write_ip(addr: i64, ip: i64) {
+    ip_write_byte(addr + 0, (ip / 16777216) % 256);
+    ip_write_byte(addr + 1, (ip / 65536) % 256);
+    ip_write_byte(addr + 2, (ip / 256) % 256);
+    ip_write_byte(addr + 3, ip % 256);
+}
+
+fn ip_read_ip(addr: i64) -> i64 {
+    let b0 = ip_read_byte(addr + 0);
+    let b1 = ip_read_byte(addr + 1);
+    let b2 = ip_read_byte(addr + 2);
+    let b3 = ip_read_byte(addr + 3);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+// ============================================================
+// Debug Functions
+// ============================================================
+
+pub fn ip_debug_addr(ip: i64) {
+    ip_debug_dec((ip / 16777216) % 256);
+    ip_debug_char(46);  // '.'
+    ip_debug_dec((ip / 65536) % 256);
+    ip_debug_char(46);
+    ip_debug_dec((ip / 256) % 256);
+    ip_debug_char(46);
+    ip_debug_dec(ip % 256);
+}
+
+pub fn ip_debug_config() {
+    ip_debug_str("IP: ");
+    ip_debug_addr(net_get_ip());
+    ip_debug_char(10);
+
+    ip_debug_str("Mask: ");
+    ip_debug_addr(net_get_netmask());
+    ip_debug_char(10);
+
+    ip_debug_str("Gateway: ");
+    ip_debug_addr(net_get_gateway());
+    ip_debug_char(10);
+
+    ip_debug_str("DNS: ");
+    ip_debug_addr(net_get_dns());
+    ip_debug_char(10);
+}
+
+fn ip_debug_dec(val: i64) {
+    if val == 0 {
+        ip_debug_char(48);
+        return;
+    }
+
+    let mut num = val;
+    let mut digits: [i64; 10] = [0; 10];
+    let mut count: i64 = 0;
+
+    while num > 0 {
+        digits[count as usize] = num % 10;
+        num = num / 10;
+        count = count + 1;
+    }
+
+    while count > 0 {
+        count = count - 1;
+        ip_debug_char(48 + digits[count as usize]);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn ip_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn ip_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn ip_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn ip_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn ip_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn ip_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn ip_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        ip_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn ip_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = ip_read_byte(src + i);
+        ip_write_byte(dst + i, byte);
+        i = i + 1;
+    }
+}
+
+fn ip_debug_char(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn ip_debug_str(s: &str) {
+    for c in s.bytes() {
+        ip_debug_char(c as i64);
+    }
+}
+
+// External functions (linked from other modules)
+fn arp_lookup(ip: i64, mac_out: i64) -> i64 { 0 }
+fn arp_request(ip: i64) -> i64 { 0 }
+fn net_get_mac_addr() -> i64 { 0xB20400 + 16 }
+fn ip_eth_build_frame(dst_mac: i64, src_mac: i64, ethertype: i64) -> i64 { 0 }
+fn ip_eth_send(frame: i64, length: i64) -> i64 { 0 }
+fn icmp_handle_packet(ip_header: i64, payload: i64, length: i64) {}
+fn tcp_handle_packet(ip_header: i64, payload: i64, length: i64) {}
+fn udp_handle_packet(ip_header: i64, payload: i64, length: i64) {}

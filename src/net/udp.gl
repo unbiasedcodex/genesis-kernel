@@ -1,0 +1,643 @@
+// Genesis Kernel - UDP Protocol
+// User Datagram Protocol (RFC 768)
+
+// ============================================================
+// UDP Constants
+// ============================================================
+
+// UDP Header Size
+const UDP_HEADER_SIZE: i64 = 8;
+
+// UDP Header Offsets
+const UDP_SRC_PORT: i64 = 0;     // Source port (2 bytes)
+const UDP_DST_PORT: i64 = 2;     // Destination port (2 bytes)
+const UDP_LENGTH: i64 = 4;       // Length (2 bytes)
+const UDP_CHECKSUM: i64 = 6;     // Checksum (2 bytes)
+const UDP_DATA: i64 = 8;         // Data starts here
+
+// UDP Socket Table
+const UDP_SOCKET_TABLE_ADDR: i64 = 0xB22000;
+const MAX_UDP_SOCKETS: i64 = 32;
+const UDP_SOCKET_SIZE: i64 = 128;  // Per socket structure
+
+// Socket offsets
+const UDP_SOCK_STATE: i64 = 0;       // State (1 byte)
+const UDP_SOCK_LOCAL_PORT: i64 = 2;  // Local port (2 bytes)
+const UDP_SOCK_LOCAL_IP: i64 = 4;    // Local IP (4 bytes)
+const UDP_SOCK_REMOTE_PORT: i64 = 8; // Remote port (2 bytes) - for connected
+const UDP_SOCK_REMOTE_IP: i64 = 10;  // Remote IP (4 bytes) - for connected
+const UDP_SOCK_OWNER_PID: i64 = 16;  // Owner process ID (8 bytes)
+const UDP_SOCK_RX_HEAD: i64 = 24;    // RX queue head (2 bytes)
+const UDP_SOCK_RX_TAIL: i64 = 26;    // RX queue tail (2 bytes)
+const UDP_SOCK_RX_COUNT: i64 = 28;   // RX queue count (2 bytes)
+
+// Socket states
+const UDP_STATE_FREE: i64 = 0;
+const UDP_STATE_UNBOUND: i64 = 1;
+const UDP_STATE_BOUND: i64 = 2;
+const UDP_STATE_CONNECTED: i64 = 3;
+
+// RX Queue per socket (stored after socket header)
+const UDP_RX_QUEUE_OFFSET: i64 = 32;
+const UDP_RX_QUEUE_SIZE: i64 = 8;    // Max packets in queue
+const UDP_RX_ENTRY_SIZE: i64 = 12;   // src_ip(4) + src_port(2) + length(2) + data_offset(4)
+
+// UDP TX/RX Buffers
+const UDP_TX_BUF: i64 = 0xB34000;    // TX buffer (2KB)
+const UDP_RX_BUF: i64 = 0xB34800;    // RX buffer pool (16KB)
+const UDP_RX_BUF_SIZE: i64 = 2048;   // Per-packet buffer
+const UDP_RX_BUF_COUNT: i64 = 8;     // Number of buffers
+
+// Well-known ports
+const UDP_PORT_DNS: i64 = 53;
+const UDP_PORT_DHCP_SERVER: i64 = 67;
+const UDP_PORT_DHCP_CLIENT: i64 = 68;
+const UDP_PORT_NTP: i64 = 123;
+
+// Ephemeral port range
+const UDP_EPHEMERAL_START: i64 = 49152;
+const UDP_EPHEMERAL_END: i64 = 65535;
+
+// ============================================================
+// UDP Socket Management
+// ============================================================
+
+// Initialize UDP subsystem
+pub fn udp_init() {
+    // Clear socket table
+    udp_memset(UDP_SOCKET_TABLE_ADDR, 0, MAX_UDP_SOCKETS * UDP_SOCKET_SIZE);
+
+    // Clear RX buffer pool
+    udp_memset(UDP_RX_BUF, 0, UDP_RX_BUF_SIZE * UDP_RX_BUF_COUNT);
+}
+
+// Get socket address
+fn udp_get_socket_addr(socket_id: i64) -> i64 {
+    UDP_SOCKET_TABLE_ADDR + (socket_id * UDP_SOCKET_SIZE)
+}
+
+// Create UDP socket
+// Returns: socket_id (0-31), or -1 on error
+pub fn udp_socket_create() -> i64 {
+    // Find free socket
+    let mut i: i64 = 0;
+    while i < MAX_UDP_SOCKETS {
+        let sock = udp_get_socket_addr(i);
+        let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+        if state == UDP_STATE_FREE {
+            // Initialize socket
+            udp_memset(sock, 0, UDP_SOCKET_SIZE);
+            udp_write_byte(sock + UDP_SOCK_STATE, UDP_STATE_UNBOUND);
+            udp_write_u64(sock + UDP_SOCK_OWNER_PID, udp_get_current_pid() as u64);
+            return i;
+        }
+        i = i + 1;
+    }
+    -1  // No free sockets
+}
+
+// Allocate ephemeral port
+fn udp_alloc_ephemeral_port() -> i64 {
+    let mut port = UDP_EPHEMERAL_START;
+    while port <= UDP_EPHEMERAL_END {
+        if udp_port_in_use(port) == 0 {
+            return port;
+        }
+        port = port + 1;
+    }
+    0  // No free ports
+}
+
+// Check if port is in use
+fn udp_port_in_use(port: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_UDP_SOCKETS {
+        let sock = udp_get_socket_addr(i);
+        let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+        if state >= UDP_STATE_BOUND {
+            let sock_port = udp_read_u16(sock + UDP_SOCK_LOCAL_PORT) as i64;
+            if sock_port == port {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    0
+}
+
+// Bind socket to port
+pub fn udp_socket_bind(socket_id: i64, port: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+    if state != UDP_STATE_UNBOUND {
+        return -2;  // Already bound
+    }
+
+    // Assign port (use ephemeral if 0)
+    let actual_port = if port == 0 {
+        udp_alloc_ephemeral_port()
+    } else {
+        if udp_port_in_use(port) == 1 {
+            return -3;  // Port in use
+        }
+        port
+    };
+
+    if actual_port == 0 {
+        return -4;  // No ports available
+    }
+
+    udp_write_u16(sock + UDP_SOCK_LOCAL_PORT, actual_port as u64);
+    udp_write_u32(sock + UDP_SOCK_LOCAL_IP, 0);  // 0 = any interface
+    udp_write_byte(sock + UDP_SOCK_STATE, UDP_STATE_BOUND);
+
+    0  // Success
+}
+
+// Connect socket to remote (optional for UDP)
+pub fn udp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+    if state < UDP_STATE_UNBOUND {
+        return -2;  // Invalid state
+    }
+
+    // Auto-bind if not bound
+    if state == UDP_STATE_UNBOUND {
+        let port = udp_alloc_ephemeral_port();
+        if port == 0 {
+            return -3;
+        }
+        udp_write_u16(sock + UDP_SOCK_LOCAL_PORT, port as u64);
+    }
+
+    udp_write_u32(sock + UDP_SOCK_REMOTE_IP, remote_ip as u64);
+    udp_write_u16(sock + UDP_SOCK_REMOTE_PORT, remote_port as u64);
+    udp_write_byte(sock + UDP_SOCK_STATE, UDP_STATE_CONNECTED);
+
+    0
+}
+
+// Close socket
+pub fn udp_socket_close(socket_id: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    udp_memset(sock, 0, UDP_SOCKET_SIZE);
+
+    0
+}
+
+// ============================================================
+// UDP Checksum
+// ============================================================
+
+// Calculate UDP checksum with pseudo-header
+fn udp_checksum(src_ip: i64, dst_ip: i64, udp_data: i64, udp_len: i64) -> i64 {
+    let mut sum: i64 = 0;
+
+    // Pseudo-header
+    sum = sum + ((src_ip / 65536) % 65536);  // Source IP high
+    sum = sum + (src_ip % 65536);             // Source IP low
+    sum = sum + ((dst_ip / 65536) % 65536);  // Dest IP high
+    sum = sum + (dst_ip % 65536);             // Dest IP low
+    sum = sum + 17;                            // Protocol (UDP)
+    sum = sum + udp_len;                       // UDP length
+
+    // UDP header and data
+    let mut i: i64 = 0;
+    while i < udp_len - 1 {
+        let word = (udp_read_byte(udp_data + i) * 256) +
+                    udp_read_byte(udp_data + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    // Handle odd byte
+    if udp_len % 2 == 1 {
+        sum = sum + (udp_read_byte(udp_data + udp_len - 1) * 256);
+    }
+
+    // Fold carries
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    // One's complement
+    let checksum = (65535 - sum) % 65536;
+
+    // Return 0xFFFF if checksum is 0 (per RFC 768)
+    if checksum == 0 { 65535 } else { checksum }
+}
+
+// ============================================================
+// UDP Sending
+// ============================================================
+
+// Send UDP datagram (using socket)
+pub fn udp_socket_send(socket_id: i64, data: i64, length: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+    if state != UDP_STATE_CONNECTED {
+        return -2;  // Not connected
+    }
+
+    let remote_ip = udp_read_u32(sock + UDP_SOCK_REMOTE_IP) as i64;
+    let remote_port = udp_read_u16(sock + UDP_SOCK_REMOTE_PORT) as i64;
+    let local_port = udp_read_u16(sock + UDP_SOCK_LOCAL_PORT) as i64;
+
+    udp_send_raw(remote_ip, local_port, remote_port, data, length)
+}
+
+// Send UDP datagram to specific address (sendto)
+pub fn udp_socket_sendto(socket_id: i64, dst_ip: i64, dst_port: i64, data: i64, length: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+    if state < UDP_STATE_BOUND {
+        // Auto-bind
+        let result = udp_socket_bind(socket_id, 0);
+        if result < 0 {
+            return result;
+        }
+    }
+
+    let local_port = udp_read_u16(sock + UDP_SOCK_LOCAL_PORT) as i64;
+
+    udp_send_raw(dst_ip, local_port, dst_port, data, length)
+}
+
+// Send raw UDP packet
+pub fn udp_send_raw(dst_ip: i64, src_port: i64, dst_port: i64, data: i64, length: i64) -> i64 {
+    if length > 1472 {  // Max UDP payload in Ethernet
+        return -1;
+    }
+
+    let udp_len = UDP_HEADER_SIZE + length;
+    let pkt = UDP_TX_BUF;
+
+    // Build UDP header
+    udp_write_u16_be(pkt + UDP_SRC_PORT, src_port);
+    udp_write_u16_be(pkt + UDP_DST_PORT, dst_port);
+    udp_write_u16_be(pkt + UDP_LENGTH, udp_len);
+    udp_write_u16_be(pkt + UDP_CHECKSUM, 0);  // Will calculate
+
+    // Copy data
+    udp_memcpy(pkt + UDP_DATA, data, length);
+
+    // Calculate checksum
+    let src_ip = udp_net_get_ip();
+    let checksum = udp_checksum(src_ip, dst_ip, pkt, udp_len);
+    udp_write_u16_be(pkt + UDP_CHECKSUM, checksum);
+
+    // Send via IP layer
+    udp_ip_send(dst_ip, 17, pkt, udp_len)
+}
+
+// Send UDP broadcast (for DHCP)
+pub fn udp_send_broadcast(src_port: i64, dst_port: i64, data: i64, length: i64) -> i64 {
+    let broadcast_ip = 0xFFFFFFFF;  // 255.255.255.255
+    udp_send_raw(broadcast_ip, src_port, dst_port, data, length)
+}
+
+// ============================================================
+// UDP Receiving
+// ============================================================
+
+// Find socket for incoming packet
+fn udp_find_socket(local_port: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_UDP_SOCKETS {
+        let sock = udp_get_socket_addr(i);
+        let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+        if state >= UDP_STATE_BOUND {
+            let sock_port = udp_read_u16(sock + UDP_SOCK_LOCAL_PORT) as i64;
+            if sock_port == local_port {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+// Add packet to socket RX queue
+fn udp_queue_packet(socket_id: i64, src_ip: i64, src_port: i64, data: i64, length: i64) -> i64 {
+    let sock = udp_get_socket_addr(socket_id);
+
+    let count = udp_read_u16(sock + UDP_SOCK_RX_COUNT) as i64;
+    if count >= UDP_RX_QUEUE_SIZE {
+        return -1;  // Queue full
+    }
+
+    let tail = udp_read_u16(sock + UDP_SOCK_RX_TAIL) as i64;
+
+    // Find free RX buffer
+    let buf_idx = (socket_id * UDP_RX_QUEUE_SIZE + tail) % UDP_RX_BUF_COUNT;
+    let buf_addr = UDP_RX_BUF + (buf_idx * UDP_RX_BUF_SIZE);
+
+    // Copy data to buffer
+    let copy_len = if length > UDP_RX_BUF_SIZE { UDP_RX_BUF_SIZE } else { length };
+    udp_memcpy(buf_addr, data, copy_len);
+
+    // Add queue entry
+    let entry = sock + UDP_RX_QUEUE_OFFSET + (tail * UDP_RX_ENTRY_SIZE);
+    udp_write_u32(entry + 0, src_ip as u64);      // src_ip
+    udp_write_u16(entry + 4, src_port as u64);    // src_port
+    udp_write_u16(entry + 6, copy_len as u64);    // length
+    udp_write_u32(entry + 8, buf_addr as u64);    // data offset
+
+    // Update queue
+    let new_tail = (tail + 1) % UDP_RX_QUEUE_SIZE;
+    udp_write_u16(sock + UDP_SOCK_RX_TAIL, new_tail as u64);
+    udp_write_u16(sock + UDP_SOCK_RX_COUNT, (count + 1) as u64);
+
+    0
+}
+
+// Handle incoming UDP packet
+pub fn udp_handle_packet(ip_header: i64, payload: i64, length: i64) {
+    if length < UDP_HEADER_SIZE {
+        return;
+    }
+
+    let src_port = udp_read_u16_be(payload + UDP_SRC_PORT);
+    let dst_port = udp_read_u16_be(payload + UDP_DST_PORT);
+    let udp_len = udp_read_u16_be(payload + UDP_LENGTH);
+
+    if udp_len < UDP_HEADER_SIZE || udp_len as i64 > length {
+        return;  // Invalid length
+    }
+
+    let src_ip = udp_ip_get_src(ip_header);
+    let data = payload + UDP_DATA;
+    let data_len = udp_len as i64 - UDP_HEADER_SIZE;
+
+    // Check for special ports (DHCP)
+    if dst_port == UDP_PORT_DHCP_CLIENT {
+        udp_dhcp_handle_packet(data, data_len);
+        return;
+    }
+
+    // Find matching socket
+    let socket_id = udp_find_socket(dst_port as i64);
+    if socket_id < 0 {
+        return;  // No socket listening
+    }
+
+    // Check if connected socket matches source
+    let sock = udp_get_socket_addr(socket_id);
+    let state = udp_read_byte(sock + UDP_SOCK_STATE);
+
+    if state == UDP_STATE_CONNECTED {
+        let remote_ip = udp_read_u32(sock + UDP_SOCK_REMOTE_IP) as i64;
+        let remote_port = udp_read_u16(sock + UDP_SOCK_REMOTE_PORT) as i64;
+
+        if remote_ip != src_ip || remote_port != src_port as i64 {
+            return;  // Not from connected peer
+        }
+    }
+
+    // Queue packet
+    udp_queue_packet(socket_id, src_ip, src_port as i64, data, data_len);
+}
+
+// Receive from socket
+pub fn udp_socket_recv(socket_id: i64, buffer: i64, max_len: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let count = udp_read_u16(sock + UDP_SOCK_RX_COUNT) as i64;
+
+    if count == 0 {
+        return 0;  // No data
+    }
+
+    let head = udp_read_u16(sock + UDP_SOCK_RX_HEAD) as i64;
+    let entry = sock + UDP_RX_QUEUE_OFFSET + (head * UDP_RX_ENTRY_SIZE);
+
+    let length = udp_read_u16(entry + 6) as i64;
+    let data_addr = udp_read_u32(entry + 8) as i64;
+
+    let copy_len = if length < max_len { length } else { max_len };
+    udp_memcpy(buffer, data_addr, copy_len);
+
+    // Update queue
+    let new_head = (head + 1) % UDP_RX_QUEUE_SIZE;
+    udp_write_u16(sock + UDP_SOCK_RX_HEAD, new_head as u64);
+    udp_write_u16(sock + UDP_SOCK_RX_COUNT, (count - 1) as u64);
+
+    copy_len
+}
+
+// Receive with source address (recvfrom)
+pub fn udp_socket_recvfrom(socket_id: i64, buffer: i64, max_len: i64, src_ip_out: i64, src_port_out: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return -1;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    let count = udp_read_u16(sock + UDP_SOCK_RX_COUNT) as i64;
+
+    if count == 0 {
+        return 0;
+    }
+
+    let head = udp_read_u16(sock + UDP_SOCK_RX_HEAD) as i64;
+    let entry = sock + UDP_RX_QUEUE_OFFSET + (head * UDP_RX_ENTRY_SIZE);
+
+    // Get source info
+    let src_ip = udp_read_u32(entry + 0) as i64;
+    let src_port = udp_read_u16(entry + 4) as i64;
+    let length = udp_read_u16(entry + 6) as i64;
+    let data_addr = udp_read_u32(entry + 8) as i64;
+
+    // Write source info
+    if src_ip_out != 0 {
+        udp_write_u32(src_ip_out, src_ip as u64);
+    }
+    if src_port_out != 0 {
+        udp_write_u16(src_port_out, src_port as u64);
+    }
+
+    let copy_len = if length < max_len { length } else { max_len };
+    udp_memcpy(buffer, data_addr, copy_len);
+
+    // Update queue
+    let new_head = (head + 1) % UDP_RX_QUEUE_SIZE;
+    udp_write_u16(sock + UDP_SOCK_RX_HEAD, new_head as u64);
+    udp_write_u16(sock + UDP_SOCK_RX_COUNT, (count - 1) as u64);
+
+    copy_len
+}
+
+// Check if data available
+pub fn udp_socket_available(socket_id: i64) -> i64 {
+    if socket_id < 0 || socket_id >= MAX_UDP_SOCKETS {
+        return 0;
+    }
+
+    let sock = udp_get_socket_addr(socket_id);
+    udp_read_u16(sock + UDP_SOCK_RX_COUNT) as i64
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn udp_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn udp_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn udp_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn udp_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn udp_read_u16_be(addr: i64) -> u64 {
+    let hi = udp_read_byte(addr) as u64;
+    let lo = udp_read_byte(addr + 1) as u64;
+    (hi * 256) + lo
+}
+
+fn udp_write_u16_be(addr: i64, value: i64) {
+    udp_write_byte(addr, value / 256);
+    udp_write_byte(addr + 1, value % 256);
+}
+
+fn udp_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn udp_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn udp_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn udp_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn udp_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        udp_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn udp_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = udp_read_byte(src + i);
+        udp_write_byte(dst + i, byte);
+        i = i + 1;
+    }
+}
+
+// External functions
+fn udp_get_current_pid() -> i64 { 0 }
+fn udp_net_get_ip() -> i64 { 0 }
+fn udp_ip_send(dst: i64, proto: i64, data: i64, len: i64) -> i64 { 0 }
+fn udp_ip_get_src(packet: i64) -> i64 { 0 }
+fn udp_dhcp_handle_packet(data: i64, len: i64) {}

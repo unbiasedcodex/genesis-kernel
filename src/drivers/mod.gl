@@ -1,0 +1,4 @@
+// Genesis Kernel - Drivers Module
+// Exports all hardware drivers
+
+mod e1000;

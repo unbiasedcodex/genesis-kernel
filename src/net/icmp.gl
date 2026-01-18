@@ -1,0 +1,596 @@
+// Genesis Kernel - ICMP Protocol
+// Internet Control Message Protocol (RFC 792)
+
+// ============================================================
+// ICMP Constants
+// ============================================================
+
+// ICMP Types
+const ICMP_ECHO_REPLY: i64 = 0;
+const ICMP_DEST_UNREACHABLE: i64 = 3;
+const ICMP_SOURCE_QUENCH: i64 = 4;
+const ICMP_REDIRECT: i64 = 5;
+const ICMP_ECHO_REQUEST: i64 = 8;
+const ICMP_TIME_EXCEEDED: i64 = 11;
+const ICMP_PARAM_PROBLEM: i64 = 12;
+const ICMP_TIMESTAMP_REQUEST: i64 = 13;
+const ICMP_TIMESTAMP_REPLY: i64 = 14;
+
+// Destination Unreachable Codes
+const ICMP_NET_UNREACHABLE: i64 = 0;
+const ICMP_HOST_UNREACHABLE: i64 = 1;
+const ICMP_PROTO_UNREACHABLE: i64 = 2;
+const ICMP_PORT_UNREACHABLE: i64 = 3;
+const ICMP_FRAG_NEEDED: i64 = 4;
+const ICMP_SOURCE_ROUTE_FAILED: i64 = 5;
+
+// ICMP Header Offsets
+const ICMP_TYPE: i64 = 0;       // Type (1 byte)
+const ICMP_CODE: i64 = 1;       // Code (1 byte)
+const ICMP_CHECKSUM: i64 = 2;   // Checksum (2 bytes)
+const ICMP_ID: i64 = 4;         // Identifier (2 bytes) - for echo
+const ICMP_SEQ: i64 = 6;        // Sequence (2 bytes) - for echo
+const ICMP_DATA: i64 = 8;       // Data starts here
+
+// ICMP Header Size (minimum)
+const ICMP_HEADER_SIZE: i64 = 8;
+
+// ICMP TX Buffer
+const ICMP_TX_BUF: i64 = 0xB33000;   // ICMP TX buffer (512 bytes)
+
+// Ping State
+const PING_STATE_ADDR: i64 = 0xB33200;  // Ping state structure
+const PING_STATE_ID: i64 = 0;            // Current ping ID (2 bytes)
+const PING_STATE_SEQ: i64 = 2;           // Current sequence (2 bytes)
+const PING_STATE_TARGET: i64 = 4;        // Target IP (4 bytes)
+const PING_STATE_SENT_TIME: i64 = 8;     // Send timestamp (8 bytes)
+const PING_STATE_WAITING: i64 = 16;      // Waiting for reply (1 byte)
+const PING_STATE_RTT: i64 = 20;          // Last RTT in ticks (4 bytes)
+const PING_STATE_COUNT: i64 = 24;        // Packets sent (4 bytes)
+const PING_STATE_RECEIVED: i64 = 28;     // Packets received (4 bytes)
+
+// ============================================================
+// ICMP Checksum
+// ============================================================
+
+// Calculate ICMP checksum (same algorithm as IP)
+fn icmp_checksum(data: i64, length: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+
+    // Sum 16-bit words
+    while i < length - 1 {
+        let word = (icmp_read_byte(data + i) * 256) +
+                    icmp_read_byte(data + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    // Handle odd byte
+    if length % 2 == 1 {
+        sum = sum + (icmp_read_byte(data + length - 1) * 256);
+    }
+
+    // Add carry
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    // One's complement
+    (65535 - sum) % 65536
+}
+
+// Verify ICMP checksum
+fn icmp_verify_checksum(data: i64, length: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+
+    while i < length - 1 {
+        let word = (icmp_read_byte(data + i) * 256) +
+                    icmp_read_byte(data + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    if length % 2 == 1 {
+        sum = sum + (icmp_read_byte(data + length - 1) * 256);
+    }
+
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    if sum == 65535 { 1 } else { 0 }
+}
+
+// ============================================================
+// ICMP Packet Building
+// ============================================================
+
+// Build ICMP Echo Request
+fn icmp_build_echo_request(id: i64, seq: i64, data: i64, data_len: i64) -> i64 {
+    let pkt = ICMP_TX_BUF;
+
+    // Type = Echo Request (8)
+    icmp_write_byte(pkt + ICMP_TYPE, ICMP_ECHO_REQUEST);
+
+    // Code = 0
+    icmp_write_byte(pkt + ICMP_CODE, 0);
+
+    // Checksum = 0 (will be calculated)
+    icmp_write_byte(pkt + ICMP_CHECKSUM, 0);
+    icmp_write_byte(pkt + ICMP_CHECKSUM + 1, 0);
+
+    // Identifier (big-endian)
+    icmp_write_byte(pkt + ICMP_ID, id / 256);
+    icmp_write_byte(pkt + ICMP_ID + 1, id % 256);
+
+    // Sequence (big-endian)
+    icmp_write_byte(pkt + ICMP_SEQ, seq / 256);
+    icmp_write_byte(pkt + ICMP_SEQ + 1, seq % 256);
+
+    // Copy data
+    if data_len > 0 && data != 0 {
+        icmp_memcpy(pkt + ICMP_DATA, data, data_len);
+    }
+
+    let total_len = ICMP_HEADER_SIZE + data_len;
+
+    // Calculate checksum
+    let checksum = icmp_checksum(pkt, total_len);
+    icmp_write_byte(pkt + ICMP_CHECKSUM, checksum / 256);
+    icmp_write_byte(pkt + ICMP_CHECKSUM + 1, checksum % 256);
+
+    total_len
+}
+
+// Build ICMP Echo Reply
+fn icmp_build_echo_reply(id: i64, seq: i64, data: i64, data_len: i64) -> i64 {
+    let pkt = ICMP_TX_BUF;
+
+    // Type = Echo Reply (0)
+    icmp_write_byte(pkt + ICMP_TYPE, ICMP_ECHO_REPLY);
+
+    // Code = 0
+    icmp_write_byte(pkt + ICMP_CODE, 0);
+
+    // Checksum = 0
+    icmp_write_byte(pkt + ICMP_CHECKSUM, 0);
+    icmp_write_byte(pkt + ICMP_CHECKSUM + 1, 0);
+
+    // Identifier
+    icmp_write_byte(pkt + ICMP_ID, id / 256);
+    icmp_write_byte(pkt + ICMP_ID + 1, id % 256);
+
+    // Sequence
+    icmp_write_byte(pkt + ICMP_SEQ, seq / 256);
+    icmp_write_byte(pkt + ICMP_SEQ + 1, seq % 256);
+
+    // Copy data
+    if data_len > 0 && data != 0 {
+        icmp_memcpy(pkt + ICMP_DATA, data, data_len);
+    }
+
+    let total_len = ICMP_HEADER_SIZE + data_len;
+
+    // Calculate checksum
+    let checksum = icmp_checksum(pkt, total_len);
+    icmp_write_byte(pkt + ICMP_CHECKSUM, checksum / 256);
+    icmp_write_byte(pkt + ICMP_CHECKSUM + 1, checksum % 256);
+
+    total_len
+}
+
+// ============================================================
+// ICMP Send Functions
+// ============================================================
+
+// Send ICMP Echo Request (ping)
+pub fn icmp_send_echo_request(dst_ip: i64, id: i64, seq: i64, data: i64, data_len: i64) -> i64 {
+    let icmp_len = icmp_build_echo_request(id, seq, data, data_len);
+
+    // Send via IP layer (protocol 1 = ICMP)
+    ip_send(dst_ip, 1, ICMP_TX_BUF, icmp_len)
+}
+
+// Send ICMP Echo Reply
+fn icmp_send_echo_reply(dst_ip: i64, id: i64, seq: i64, data: i64, data_len: i64) -> i64 {
+    let icmp_len = icmp_build_echo_reply(id, seq, data, data_len);
+    ip_send(dst_ip, 1, ICMP_TX_BUF, icmp_len)
+}
+
+// ============================================================
+// ICMP Receive Handler
+// ============================================================
+
+// Handle incoming ICMP packet
+pub fn icmp_handle_packet(ip_header: i64, payload: i64, length: i64) {
+    if length < ICMP_HEADER_SIZE {
+        return;  // Too short
+    }
+
+    // Verify checksum
+    if icmp_verify_checksum(payload, length) == 0 {
+        return;  // Bad checksum
+    }
+
+    let icmp_type = icmp_read_byte(payload + ICMP_TYPE);
+    let icmp_code = icmp_read_byte(payload + ICMP_CODE);
+
+    match icmp_type {
+        8 => {
+            // Echo Request - send reply
+            icmp_handle_echo_request(ip_header, payload, length);
+        }
+        0 => {
+            // Echo Reply - handle ping response
+            icmp_handle_echo_reply(ip_header, payload, length);
+        }
+        3 => {
+            // Destination Unreachable
+            icmp_handle_dest_unreachable(payload, length, icmp_code);
+        }
+        11 => {
+            // Time Exceeded
+            icmp_handle_time_exceeded(payload, length);
+        }
+        _ => {
+            // Unknown type, ignore
+        }
+    }
+}
+
+// Handle Echo Request
+fn icmp_handle_echo_request(ip_header: i64, payload: i64, length: i64) {
+    // Get source IP (will be destination of reply)
+    let src_ip = ip_get_src(ip_header);
+
+    // Get ID and sequence from request
+    let id = (icmp_read_byte(payload + ICMP_ID) * 256) +
+              icmp_read_byte(payload + ICMP_ID + 1);
+    let seq = (icmp_read_byte(payload + ICMP_SEQ) * 256) +
+               icmp_read_byte(payload + ICMP_SEQ + 1);
+
+    // Get data
+    let data_len = length - ICMP_HEADER_SIZE;
+    let data = payload + ICMP_DATA;
+
+    // Send reply
+    icmp_send_echo_reply(src_ip, id, seq, data, data_len);
+
+    // Debug output
+    icmp_debug_str("ICMP: Echo request from ");
+    icmp_debug_ip(src_ip);
+    icmp_debug_str(", seq=");
+    icmp_debug_dec(seq);
+    icmp_debug_char(10);
+}
+
+// Handle Echo Reply
+fn icmp_handle_echo_reply(ip_header: i64, payload: i64, length: i64) {
+    let src_ip = ip_get_src(ip_header);
+
+    // Get ID and sequence
+    let id = (icmp_read_byte(payload + ICMP_ID) * 256) +
+              icmp_read_byte(payload + ICMP_ID + 1);
+    let seq = (icmp_read_byte(payload + ICMP_SEQ) * 256) +
+               icmp_read_byte(payload + ICMP_SEQ + 1);
+
+    // Check if this is for our pending ping
+    let waiting = icmp_read_byte(PING_STATE_ADDR + PING_STATE_WAITING);
+    if waiting == 0 {
+        return;  // Not waiting for reply
+    }
+
+    let expected_id = icmp_read_u16(PING_STATE_ADDR + PING_STATE_ID);
+    let expected_target = icmp_read_u32(PING_STATE_ADDR + PING_STATE_TARGET);
+
+    if id != expected_id as i64 || src_ip != expected_target as i64 {
+        return;  // Not our ping
+    }
+
+    // Calculate RTT
+    let sent_time = icmp_read_u64(PING_STATE_ADDR + PING_STATE_SENT_TIME);
+    let now = icmp_get_ticks() as u64;
+    let rtt = now - sent_time;
+
+    // Update state
+    icmp_write_byte(PING_STATE_ADDR + PING_STATE_WAITING, 0);
+    icmp_write_u32(PING_STATE_ADDR + PING_STATE_RTT, rtt as u64);
+
+    let received = icmp_read_u32(PING_STATE_ADDR + PING_STATE_RECEIVED);
+    icmp_write_u32(PING_STATE_ADDR + PING_STATE_RECEIVED, received + 1);
+
+    // Debug output
+    icmp_debug_str("ICMP: Reply from ");
+    icmp_debug_ip(src_ip);
+    icmp_debug_str(", seq=");
+    icmp_debug_dec(seq);
+    icmp_debug_str(", rtt=");
+    icmp_debug_dec(rtt as i64);
+    icmp_debug_str(" ticks\n");
+}
+
+// Handle Destination Unreachable
+fn icmp_handle_dest_unreachable(payload: i64, length: i64, code: i64) {
+    icmp_debug_str("ICMP: Destination Unreachable, code=");
+    icmp_debug_dec(code);
+    icmp_debug_char(10);
+}
+
+// Handle Time Exceeded
+fn icmp_handle_time_exceeded(payload: i64, length: i64) {
+    icmp_debug_str("ICMP: Time Exceeded\n");
+}
+
+// ============================================================
+// Ping Functions (User-facing)
+// ============================================================
+
+// Initialize ping state
+pub fn ping_init() {
+    icmp_memset(PING_STATE_ADDR, 0, 32);
+    // Set initial ID (use lower bits of tick counter for some randomness)
+    let id = (icmp_get_ticks() % 65536) as u64;
+    icmp_write_u16(PING_STATE_ADDR + PING_STATE_ID, id);
+}
+
+// Send a ping
+// Returns: 1 if sent, 0 on error
+pub fn ping_send(target_ip: i64) -> i64 {
+    // Get current sequence and increment
+    let seq = icmp_read_u16(PING_STATE_ADDR + PING_STATE_SEQ);
+    icmp_write_u16(PING_STATE_ADDR + PING_STATE_SEQ, seq + 1);
+
+    let id = icmp_read_u16(PING_STATE_ADDR + PING_STATE_ID);
+
+    // Save target and timestamp
+    icmp_write_u32(PING_STATE_ADDR + PING_STATE_TARGET, target_ip as u64);
+    icmp_write_u64(PING_STATE_ADDR + PING_STATE_SENT_TIME, icmp_get_ticks() as u64);
+    icmp_write_byte(PING_STATE_ADDR + PING_STATE_WAITING, 1);
+
+    // Increment sent count
+    let count = icmp_read_u32(PING_STATE_ADDR + PING_STATE_COUNT);
+    icmp_write_u32(PING_STATE_ADDR + PING_STATE_COUNT, count + 1);
+
+    // Generate some ping data
+    let data_buf = ICMP_TX_BUF + 256;  // Use end of TX buf for data
+    let mut i: i64 = 0;
+    while i < 56 {
+        icmp_write_byte(data_buf + i, (i % 256));
+        i = i + 1;
+    }
+
+    // Send echo request
+    icmp_send_echo_request(target_ip, id as i64, seq as i64, data_buf, 56)
+}
+
+// Check if ping reply received
+// Returns: RTT in ticks if received, -1 if still waiting, -2 if timeout
+pub fn ping_check(timeout_ticks: i64) -> i64 {
+    let waiting = icmp_read_byte(PING_STATE_ADDR + PING_STATE_WAITING);
+
+    if waiting == 0 {
+        // Reply received
+        let rtt = icmp_read_u32(PING_STATE_ADDR + PING_STATE_RTT) as i64;
+        return rtt;
+    }
+
+    // Check timeout
+    let sent_time = icmp_read_u64(PING_STATE_ADDR + PING_STATE_SENT_TIME) as i64;
+    let now = icmp_get_ticks();
+
+    if now - sent_time > timeout_ticks {
+        icmp_write_byte(PING_STATE_ADDR + PING_STATE_WAITING, 0);
+        return -2;  // Timeout
+    }
+
+    -1  // Still waiting
+}
+
+// Get ping statistics
+pub fn ping_get_sent() -> i64 {
+    icmp_read_u32(PING_STATE_ADDR + PING_STATE_COUNT) as i64
+}
+
+pub fn ping_get_received() -> i64 {
+    icmp_read_u32(PING_STATE_ADDR + PING_STATE_RECEIVED) as i64
+}
+
+// Simple ping function (blocks until reply or timeout)
+// Returns: RTT in ticks, or -1 on timeout
+pub fn ping(target_ip: i64, timeout_ticks: i64) -> i64 {
+    if ping_send(target_ip) == 0 {
+        return -1;  // Failed to send
+    }
+
+    // Poll for reply
+    loop {
+        let result = ping_check(timeout_ticks);
+        if result >= 0 {
+            return result;  // Got reply
+        }
+        if result == -2 {
+            return -1;  // Timeout
+        }
+        // Still waiting, continue polling
+    }
+}
+
+// ============================================================
+// Debug Functions
+// ============================================================
+
+fn icmp_debug_ip(ip: i64) {
+    icmp_debug_dec((ip / 16777216) % 256);
+    icmp_debug_char(46);
+    icmp_debug_dec((ip / 65536) % 256);
+    icmp_debug_char(46);
+    icmp_debug_dec((ip / 256) % 256);
+    icmp_debug_char(46);
+    icmp_debug_dec(ip % 256);
+}
+
+fn icmp_debug_dec(val: i64) {
+    if val == 0 {
+        icmp_debug_char(48);
+        return;
+    }
+
+    let mut num = val;
+    let mut digits: [i64; 10] = [0; 10];
+    let mut count: i64 = 0;
+
+    while num > 0 {
+        digits[count as usize] = num % 10;
+        num = num / 10;
+        count = count + 1;
+    }
+
+    while count > 0 {
+        count = count - 1;
+        icmp_debug_char(48 + digits[count as usize]);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn icmp_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn icmp_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn icmp_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn icmp_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn icmp_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn icmp_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn icmp_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn icmp_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn icmp_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        icmp_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn icmp_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = icmp_read_byte(src + i);
+        icmp_write_byte(dst + i, byte);
+        i = i + 1;
+    }
+}
+
+fn icmp_debug_char(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn icmp_debug_str(s: &str) {
+    for c in s.bytes() {
+        icmp_debug_char(c as i64);
+    }
+}
+
+fn icmp_get_ticks() -> i64 {
+    icmp_read_u64(0x412000) as i64
+}
+
+// External functions
+fn ip_send(dst_ip: i64, protocol: i64, data: i64, length: i64) -> i64 { 0 }
+fn ip_get_src(packet: i64) -> i64 { 0 }

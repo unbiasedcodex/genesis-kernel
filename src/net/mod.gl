@@ -1,0 +1,505 @@
+// Genesis Kernel - Network Module
+// Main network stack initialization and packet processing
+
+// ============================================================
+// Network Stack Architecture
+// ============================================================
+//
+// Layer 5 (Application): DNS, DHCP, Shell commands
+// Layer 4 (Transport):   TCP, UDP via Socket API
+// Layer 3 (Network):     IPv4, ICMP, ARP
+// Layer 2 (Data Link):   Ethernet
+// Layer 1 (Physical):    E1000 NIC Driver
+//
+// ============================================================
+
+// Submodule imports
+mod e1000;
+mod ethernet;
+mod arp;
+mod ipv4;
+mod icmp;
+mod udp;
+mod tcp;
+mod dhcp;
+mod socket;
+
+// ============================================================
+// Network Stack State
+// ============================================================
+
+const NET_STACK_STATE_ADDR: i64 = 0xB3C000;
+
+// State offsets
+const NET_STATE_INITIALIZED: i64 = 0;    // Initialization complete (1 byte)
+const NET_STATE_DRIVER_OK: i64 = 1;      // E1000 driver initialized (1 byte)
+const NET_STATE_LINK_UP: i64 = 2;        // Link status (1 byte)
+const NET_STATE_IP_OK: i64 = 3;          // IP configured (1 byte)
+const NET_STATE_RX_PACKETS: i64 = 8;     // Total RX packets (8 bytes)
+const NET_STATE_TX_PACKETS: i64 = 16;    // Total TX packets (8 bytes)
+const NET_STATE_RX_ERRORS: i64 = 24;     // RX errors (8 bytes)
+const NET_STATE_TX_ERRORS: i64 = 32;     // TX errors (8 bytes)
+
+// Receive buffer for packet processing
+const NET_RX_BUFFER: i64 = 0xB3C100;     // 2KB receive buffer
+const NET_RX_BUFFER_SIZE: i64 = 2048;
+
+// ============================================================
+// Network Stack Initialization
+// ============================================================
+
+// Initialize the complete network stack
+pub fn net_stack_init() -> i64 {
+    // Clear state
+    net_memset(NET_STACK_STATE_ADDR, 0, 64);
+
+    net_debug_str("NET: Initializing network stack\n");
+
+    // Initialize E1000 driver
+    if net_e1000_init() == 0 {
+        net_debug_str("NET: E1000 not found\n");
+        return 0;
+    }
+    net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_DRIVER_OK, 1);
+
+    // Print MAC address
+    net_debug_str("NET: MAC ");
+    let mut i: i64 = 0;
+    while i < 6 {
+        let b = net_e1000_get_mac_byte(i);
+        net_debug_hex_byte(b);
+        if i < 5 {
+            net_debug_char(58);  // ':'
+        }
+        i = i + 1;
+    }
+    net_debug_char(10);
+
+    // Check link status
+    if net_e1000_is_link_up() == 1 {
+        net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_LINK_UP, 1);
+        net_debug_str("NET: Link UP (");
+        let speed = net_e1000_get_speed();
+        net_debug_dec(speed);
+        net_debug_str(" Mbps)\n");
+    } else {
+        net_debug_str("NET: Link DOWN\n");
+    }
+
+    // Initialize protocol layers
+    net_arp_cache_init();
+    net_config_init();
+    net_udp_init();
+    net_tcp_init();
+    net_socket_init();
+    net_ping_init();
+    net_dhcp_init();
+
+    net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_INITIALIZED, 1);
+    net_debug_str("NET: Stack initialized\n");
+
+    1
+}
+
+// Start DHCP auto-configuration
+pub fn net_stack_dhcp() -> i64 {
+    if net_is_initialized() == 0 {
+        return -1;
+    }
+
+    net_debug_str("NET: Starting DHCP\n");
+    net_dhcp_start()
+}
+
+// Configure static IP
+pub fn net_stack_configure(ip: i64, mask: i64, gateway: i64, dns: i64) -> i64 {
+    if net_is_initialized() == 0 {
+        return -1;
+    }
+
+    net_ip_configure(ip, mask, gateway, dns);
+    net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_IP_OK, 1);
+
+    net_debug_str("NET: Static IP configured: ");
+    net_debug_ip(ip);
+    net_debug_char(10);
+
+    1
+}
+
+// ============================================================
+// Packet Processing
+// ============================================================
+
+// Poll for received packets (call from main loop or timer)
+pub fn net_stack_poll() {
+    if net_is_initialized() == 0 {
+        return;
+    }
+
+    // Check for received packets
+    loop {
+        let len = net_e1000_recv(NET_RX_BUFFER, NET_RX_BUFFER_SIZE);
+        if len == 0 {
+            break;
+        }
+
+        // Update stats
+        let rx_count = net_read_u64(NET_STACK_STATE_ADDR + NET_STATE_RX_PACKETS);
+        net_write_u64(NET_STACK_STATE_ADDR + NET_STATE_RX_PACKETS, rx_count + 1);
+
+        // Process the packet
+        net_process_packet(NET_RX_BUFFER, len);
+    }
+
+    // Check DHCP timers
+    net_dhcp_tick();
+
+    // Check TCP timers
+    net_tcp_timer_tick();
+}
+
+// Process a received Ethernet frame
+fn net_process_packet(frame: i64, length: i64) {
+    if length < 14 {
+        return;  // Too short for Ethernet header
+    }
+
+    // Get EtherType
+    let ethertype = net_eth_get_ethertype(frame);
+
+    let payload = frame + 14;
+    let payload_len = length - 14;
+
+    match ethertype {
+        0x0806 => {
+            // ARP
+            net_arp_handle_packet(payload, payload_len);
+        }
+        0x0800 => {
+            // IPv4
+            net_ip_handle_packet(payload, payload_len);
+        }
+        _ => {
+            // Unknown protocol, ignore
+        }
+    }
+}
+
+// ============================================================
+// Status Functions
+// ============================================================
+
+// Check if network stack is initialized
+pub fn net_is_initialized() -> i64 {
+    net_read_byte(NET_STACK_STATE_ADDR + NET_STATE_INITIALIZED)
+}
+
+// Check if link is up
+pub fn net_link_status() -> i64 {
+    if net_is_initialized() == 0 {
+        return 0;
+    }
+    net_e1000_is_link_up()
+}
+
+// Get IP address
+pub fn net_get_ip_addr() -> i64 {
+    net_ip_get_ip()
+}
+
+// Get MAC address (as packed value for first 4 bytes)
+pub fn net_get_mac_lo() -> i64 {
+    let b0 = net_e1000_get_mac_byte(0);
+    let b1 = net_e1000_get_mac_byte(1);
+    let b2 = net_e1000_get_mac_byte(2);
+    let b3 = net_e1000_get_mac_byte(3);
+    b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+}
+
+// Get MAC address (bytes 4-5)
+pub fn net_get_mac_hi() -> i64 {
+    let b4 = net_e1000_get_mac_byte(4);
+    let b5 = net_e1000_get_mac_byte(5);
+    b4 + (b5 * 256)
+}
+
+// Get RX packet count
+pub fn net_get_rx_count() -> i64 {
+    net_read_u64(NET_STACK_STATE_ADDR + NET_STATE_RX_PACKETS) as i64
+}
+
+// Get TX packet count
+pub fn net_get_tx_count() -> i64 {
+    net_read_u64(NET_STACK_STATE_ADDR + NET_STATE_TX_PACKETS) as i64
+}
+
+// Print network status
+pub fn net_print_status() {
+    net_debug_str("=== Network Status ===\n");
+
+    net_debug_str("Initialized: ");
+    if net_is_initialized() == 1 {
+        net_debug_str("Yes\n");
+    } else {
+        net_debug_str("No\n");
+        return;
+    }
+
+    net_debug_str("Link: ");
+    if net_link_status() == 1 {
+        net_debug_str("UP (");
+        net_debug_dec(net_e1000_get_speed());
+        net_debug_str(" Mbps)\n");
+    } else {
+        net_debug_str("DOWN\n");
+    }
+
+    net_debug_str("MAC: ");
+    let mut i: i64 = 0;
+    while i < 6 {
+        net_debug_hex_byte(net_e1000_get_mac_byte(i));
+        if i < 5 {
+            net_debug_char(58);
+        }
+        i = i + 1;
+    }
+    net_debug_char(10);
+
+    let ip = net_get_ip_addr();
+    if ip != 0 {
+        net_debug_str("IP: ");
+        net_debug_ip(ip);
+        net_debug_char(10);
+
+        net_debug_str("Mask: ");
+        net_debug_ip(net_ip_get_netmask());
+        net_debug_char(10);
+
+        net_debug_str("Gateway: ");
+        net_debug_ip(net_ip_get_gateway());
+        net_debug_char(10);
+
+        net_debug_str("DNS: ");
+        net_debug_ip(net_ip_get_dns());
+        net_debug_char(10);
+    } else {
+        net_debug_str("IP: Not configured\n");
+    }
+
+    net_debug_str("RX Packets: ");
+    net_debug_dec(net_get_rx_count());
+    net_debug_char(10);
+
+    net_debug_str("TX Packets: ");
+    net_debug_dec(net_get_tx_count());
+    net_debug_char(10);
+}
+
+// ============================================================
+// Utility Functions
+// ============================================================
+
+// Send ping (ICMP echo request)
+pub fn net_ping(target_ip: i64, timeout_ticks: i64) -> i64 {
+    if net_is_initialized() == 0 || net_get_ip_addr() == 0 {
+        return -1;
+    }
+
+    net_icmp_ping(target_ip, timeout_ticks)
+}
+
+// Resolve ARP (get MAC for IP)
+pub fn net_resolve_mac(ip: i64, mac_out: i64) -> i64 {
+    if net_is_initialized() == 0 {
+        return 0;
+    }
+
+    // Check cache first
+    if net_arp_lookup(ip, mac_out) == 1 {
+        return 1;
+    }
+
+    // Send ARP request
+    net_arp_request(ip);
+
+    0  // Caller should retry later
+}
+
+// ============================================================
+// Debug Functions
+// ============================================================
+
+fn net_debug_ip(ip: i64) {
+    net_debug_dec((ip / 16777216) % 256);
+    net_debug_char(46);
+    net_debug_dec((ip / 65536) % 256);
+    net_debug_char(46);
+    net_debug_dec((ip / 256) % 256);
+    net_debug_char(46);
+    net_debug_dec(ip % 256);
+}
+
+fn net_debug_dec(val: i64) {
+    if val == 0 {
+        net_debug_char(48);
+        return;
+    }
+
+    let mut num = val;
+    let mut digits: [i64; 10] = [0; 10];
+    let mut count: i64 = 0;
+
+    while num > 0 {
+        digits[count as usize] = num % 10;
+        num = num / 10;
+        count = count + 1;
+    }
+
+    while count > 0 {
+        count = count - 1;
+        net_debug_char(48 + digits[count as usize]);
+    }
+}
+
+fn net_debug_hex_byte(b: i64) {
+    let hi = (b / 16) % 16;
+    let lo = b % 16;
+
+    if hi < 10 {
+        net_debug_char(48 + hi);
+    } else {
+        net_debug_char(55 + hi);
+    }
+    if lo < 10 {
+        net_debug_char(48 + lo);
+    } else {
+        net_debug_char(55 + lo);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn net_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn net_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn net_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn net_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn net_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        net_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn net_debug_char(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn net_debug_str(s: &str) {
+    for c in s.bytes() {
+        net_debug_char(c as i64);
+    }
+}
+
+// ============================================================
+// Wrapper Functions - Call into submodules
+// ============================================================
+
+// E1000 driver (now in net module)
+fn net_e1000_init() -> i64 { e1000::e1000_init() }
+fn net_e1000_recv(buf: i64, max_len: i64) -> i64 { e1000::e1000_recv(buf, max_len) }
+fn net_e1000_send(buf: i64, len: i64) -> i64 { e1000::e1000_send(buf, len) }
+fn net_e1000_is_link_up() -> i64 { e1000::e1000_is_link_up() }
+fn net_e1000_get_mac_byte(idx: i64) -> i64 { e1000::e1000_get_mac_byte(idx) }
+fn net_e1000_get_speed() -> i64 { e1000::e1000_get_speed() }
+
+// Ethernet
+fn net_eth_get_ethertype(frame: i64) -> i64 { ethernet::eth_get_ethertype(frame) }
+
+// ARP
+fn net_arp_cache_init() { arp::arp_cache_init(); }
+fn net_arp_handle_packet(payload: i64, len: i64) { arp::arp_handle_packet(payload, len); }
+fn net_arp_lookup(ip: i64, mac_out: i64) -> i64 { arp::arp_lookup(ip, mac_out) }
+fn net_arp_request(ip: i64) -> i64 { arp::arp_request(ip) }
+
+// IPv4
+fn net_config_init() { ipv4::net_config_init(); }
+fn net_ip_configure(ip: i64, mask: i64, gw: i64, dns: i64) { ipv4::net_configure(ip, mask, gw, dns); }
+fn net_ip_handle_packet(payload: i64, len: i64) { ipv4::ip_handle_packet(payload, len); }
+fn net_ip_get_ip() -> i64 { ipv4::net_get_ip() }
+fn net_ip_get_netmask() -> i64 { ipv4::net_get_netmask() }
+fn net_ip_get_gateway() -> i64 { ipv4::net_get_gateway() }
+fn net_ip_get_dns() -> i64 { ipv4::net_get_dns() }
+
+// ICMP
+fn net_ping_init() { icmp::ping_init(); }
+fn net_icmp_ping(ip: i64, timeout: i64) -> i64 { icmp::ping(ip, timeout) }
+
+// UDP
+fn net_udp_init() { udp::udp_init(); }
+
+// TCP
+fn net_tcp_init() { tcp::tcp_init(); }
+fn net_tcp_timer_tick() { tcp::tcp_timer_tick(); }
+
+// DHCP
+fn net_dhcp_init() { dhcp::dhcp_init(); }
+fn net_dhcp_start() -> i64 { dhcp::dhcp_start() }
+fn net_dhcp_tick() { dhcp::dhcp_tick(); }
+
+// Socket
+fn net_socket_init() { socket::socket_init(); }

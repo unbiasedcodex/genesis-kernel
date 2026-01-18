@@ -1,0 +1,1000 @@
+// Genesis Kernel - Intel E1000 Network Driver
+// Supports: 82540EM (QEMU default), 82545EM, 82574L, I217-LM
+// Reference: Intel 8254x Software Developer's Manual
+
+// ============================================================
+// E1000 Constants
+// ============================================================
+
+// PCI Vendor and Device IDs
+const E1000_VENDOR_ID: i64 = 0x8086;  // Intel
+const E1000_DEV_82540EM: i64 = 0x100E;  // QEMU default
+const E1000_DEV_82545EM: i64 = 0x100F;
+const E1000_DEV_82574L: i64 = 0x10D3;
+const E1000_DEV_I217LM: i64 = 0x153A;
+
+// Memory-Mapped Register Offsets
+const E1000_CTRL: i64 = 0x0000;      // Device Control
+const E1000_STATUS: i64 = 0x0008;    // Device Status
+const E1000_EECD: i64 = 0x0010;      // EEPROM Control
+const E1000_EERD: i64 = 0x0014;      // EEPROM Read
+const E1000_CTRL_EXT: i64 = 0x0018;  // Extended Control
+const E1000_ICR: i64 = 0x00C0;       // Interrupt Cause Read
+const E1000_ITR: i64 = 0x00C4;       // Interrupt Throttle
+const E1000_ICS: i64 = 0x00C8;       // Interrupt Cause Set
+const E1000_IMS: i64 = 0x00D0;       // Interrupt Mask Set
+const E1000_IMC: i64 = 0x00D8;       // Interrupt Mask Clear
+
+// Receive registers
+const E1000_RCTL: i64 = 0x0100;      // Receive Control
+const E1000_RDBAL: i64 = 0x2800;     // RX Descriptor Base Low
+const E1000_RDBAH: i64 = 0x2804;     // RX Descriptor Base High
+const E1000_RDLEN: i64 = 0x2808;     // RX Descriptor Length
+const E1000_RDH: i64 = 0x2810;       // RX Descriptor Head
+const E1000_RDT: i64 = 0x2818;       // RX Descriptor Tail
+const E1000_RDTR: i64 = 0x2820;      // RX Delay Timer
+
+// Transmit registers
+const E1000_TCTL: i64 = 0x0400;      // Transmit Control
+const E1000_TIPG: i64 = 0x0410;      // TX Inter-Packet Gap
+const E1000_TDBAL: i64 = 0x3800;     // TX Descriptor Base Low
+const E1000_TDBAH: i64 = 0x3804;     // TX Descriptor Base High
+const E1000_TDLEN: i64 = 0x3808;     // TX Descriptor Length
+const E1000_TDH: i64 = 0x3810;       // TX Descriptor Head
+const E1000_TDT: i64 = 0x3818;       // TX Descriptor Tail
+
+// MAC Address registers
+const E1000_RAL0: i64 = 0x5400;      // Receive Address Low
+const E1000_RAH0: i64 = 0x5404;      // Receive Address High
+const E1000_MTA: i64 = 0x5200;       // Multicast Table Array (128 entries)
+
+// CTRL Register Bits
+const CTRL_FD: i64 = 0x00000001;     // Full Duplex
+const CTRL_LRST: i64 = 0x00000008;   // Link Reset
+const CTRL_ASDE: i64 = 0x00000020;   // Auto-Speed Detection Enable
+const CTRL_SLU: i64 = 0x00000040;    // Set Link Up
+const CTRL_ILOS: i64 = 0x00000080;   // Invert Loss-of-Signal
+const CTRL_RST: i64 = 0x04000000;    // Device Reset
+const CTRL_VME: i64 = 0x40000000;    // VLAN Mode Enable
+const CTRL_PHY_RST: i64 = 0x80000000; // PHY Reset
+
+// STATUS Register Bits
+const STATUS_FD: i64 = 0x01;         // Full Duplex
+const STATUS_LU: i64 = 0x02;         // Link Up
+const STATUS_TXOFF: i64 = 0x10;      // TX Paused
+const STATUS_SPEED_10: i64 = 0x00;   // 10 Mbps
+const STATUS_SPEED_100: i64 = 0x40;  // 100 Mbps
+const STATUS_SPEED_1000: i64 = 0xC0; // 1000 Mbps
+
+// RCTL Register Bits
+const RCTL_EN: i64 = 0x00000002;     // Receiver Enable
+const RCTL_SBP: i64 = 0x00000004;    // Store Bad Packets
+const RCTL_UPE: i64 = 0x00000008;    // Unicast Promiscuous Enable
+const RCTL_MPE: i64 = 0x00000010;    // Multicast Promiscuous Enable
+const RCTL_LPE: i64 = 0x00000020;    // Long Packet Enable
+const RCTL_LBM_NONE: i64 = 0x00000000; // No Loopback
+const RCTL_RDMTS_HALF: i64 = 0x00000000; // RX Desc Min Threshold 1/2
+const RCTL_MO_36: i64 = 0x00000000;  // Multicast Offset bits 47:36
+const RCTL_BAM: i64 = 0x00008000;    // Broadcast Accept Mode
+const RCTL_BSIZE_2048: i64 = 0x00000000; // Buffer Size 2048
+const RCTL_BSIZE_1024: i64 = 0x00010000; // Buffer Size 1024
+const RCTL_BSIZE_512: i64 = 0x00020000;  // Buffer Size 512
+const RCTL_BSIZE_256: i64 = 0x00030000;  // Buffer Size 256
+const RCTL_SECRC: i64 = 0x04000000;  // Strip Ethernet CRC
+
+// TCTL Register Bits
+const TCTL_EN: i64 = 0x00000002;     // Transmitter Enable
+const TCTL_PSP: i64 = 0x00000008;    // Pad Short Packets
+const TCTL_CT_SHIFT: i64 = 4;        // Collision Threshold shift
+const TCTL_COLD_SHIFT: i64 = 12;     // Collision Distance shift
+const TCTL_SWXOFF: i64 = 0x00400000; // SW XOFF Transmission
+const TCTL_RTLC: i64 = 0x01000000;   // Retransmit on Late Collision
+
+// TX Descriptor Command Bits
+const TDESC_CMD_EOP: i64 = 0x01;     // End Of Packet
+const TDESC_CMD_IFCS: i64 = 0x02;    // Insert FCS
+const TDESC_CMD_RS: i64 = 0x08;      // Report Status
+const TDESC_CMD_DEXT: i64 = 0x20;    // Extension
+const TDESC_CMD_IDE: i64 = 0x80;     // Interrupt Delay Enable
+
+// TX Descriptor Status Bits
+const TDESC_STA_DD: i64 = 0x01;      // Descriptor Done
+
+// RX Descriptor Status Bits
+const RDESC_STA_DD: i64 = 0x01;      // Descriptor Done
+const RDESC_STA_EOP: i64 = 0x02;     // End Of Packet
+const RDESC_STA_IXSM: i64 = 0x04;    // Ignore Checksum
+
+// Interrupt Types
+const ICR_TXDW: i64 = 0x00000001;    // TX Descriptor Written Back
+const ICR_TXQE: i64 = 0x00000002;    // TX Queue Empty
+const ICR_LSC: i64 = 0x00000004;     // Link Status Change
+const ICR_RXSEQ: i64 = 0x00000008;   // RX Sequence Error
+const ICR_RXDMT0: i64 = 0x00000010;  // RX Desc Min Threshold
+const ICR_RXO: i64 = 0x00000040;     // RX Overrun
+const ICR_RXT0: i64 = 0x00000080;    // RX Timer Interrupt
+
+// Memory Layout for E1000 (from plan)
+const E1000_TX_DESC_ADDR: i64 = 0xB00000;    // TX Descriptors (512 bytes)
+const E1000_TX_BUF_ADDR: i64 = 0xB00200;     // TX Buffers (64KB)
+const E1000_RX_DESC_ADDR: i64 = 0xB10200;    // RX Descriptors (512 bytes)
+const E1000_RX_BUF_ADDR: i64 = 0xB10400;     // RX Buffers (64KB)
+const E1000_STATE_ADDR: i64 = 0xB20400;      // E1000 State (256 bytes)
+
+// Ring sizes
+const E1000_NUM_TX_DESC: i64 = 32;
+const E1000_NUM_RX_DESC: i64 = 32;
+const E1000_TX_DESC_SIZE: i64 = 16;
+const E1000_RX_DESC_SIZE: i64 = 16;
+const E1000_BUF_SIZE: i64 = 2048;
+
+// State offsets
+const E1000_STATE_PRESENT: i64 = 0;          // Device present (1 byte)
+const E1000_STATE_LINK_UP: i64 = 1;          // Link status (1 byte)
+const E1000_STATE_MMIO_BASE: i64 = 8;        // MMIO base address (8 bytes)
+const E1000_STATE_MAC: i64 = 16;             // MAC address (6 bytes)
+const E1000_STATE_IRQ: i64 = 24;             // IRQ number (1 byte)
+const E1000_STATE_TX_CUR: i64 = 32;          // Current TX descriptor (4 bytes)
+const E1000_STATE_RX_CUR: i64 = 36;          // Current RX descriptor (4 bytes)
+const E1000_STATE_TX_COUNT: i64 = 40;        // TX packet count (8 bytes)
+const E1000_STATE_RX_COUNT: i64 = 48;        // RX packet count (8 bytes)
+const E1000_STATE_BUS: i64 = 56;             // PCI bus (1 byte)
+const E1000_STATE_DEVICE: i64 = 57;          // PCI device (1 byte)
+const E1000_STATE_FUNC: i64 = 58;            // PCI function (1 byte)
+
+// ============================================================
+// E1000 Memory Access Functions
+// ============================================================
+
+// Local bitwise OR implementation (module-local, inline assembly)
+fn e1000_bit_or(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             orq %rsi, %rax",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Local MMIO read implementation (module-local, inline assembly)
+fn e1000_mmio_read32(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Read 32-bit from MMIO with volatile semantics
+fn e1000_read_reg(offset: i64) -> i64 {
+    let base = e1000_get_mmio_base();
+    if base == 0 {
+        e1000_serial(66);  // B
+        e1000_serial(48);  // 0
+        e1000_serial(10);  // newline
+        return 0;
+    }
+    let addr = base + offset;
+
+    // Use local MMIO read
+    e1000_mmio_read32(addr)
+}
+
+// Debug version that prints the address being read
+fn e1000_read_reg_debug(offset: i64) -> i64 {
+    let base = e1000_get_mmio_base();
+    e1000_serial(64);  // @
+    e1000_serial_hex(base + offset);
+
+    let result = e1000_read_reg(offset);
+    e1000_serial(61);  // =
+    e1000_serial_hex(result);
+    e1000_serial(10);  // newline
+    result
+}
+
+// Write 32-bit to MMIO
+fn e1000_write_reg(offset: i64, value: i64) {
+    let base = e1000_get_mmio_base();
+    if base == 0 {
+        return;
+    }
+    write_u32_addr((base + offset) as u64, value as u64);
+}
+
+// Get MMIO base address from state
+fn e1000_get_mmio_base() -> i64 {
+    read_u64_addr(E1000_STATE_ADDR + E1000_STATE_MMIO_BASE) as i64
+}
+
+// ============================================================
+// E1000 EEPROM Functions
+// ============================================================
+
+// Read word from EEPROM
+fn e1000_eeprom_read(addr: i64) -> i64 {
+    // Write address and start bit
+    e1000_write_reg(E1000_EERD, (addr * 256) + 1);  // addr << 8 | 1
+
+    // Wait for done
+    let mut done = 0;
+    let mut timeout = 10000;
+    while done == 0 && timeout > 0 {
+        let eerd = e1000_read_reg(E1000_EERD);
+        done = (eerd / 16) % 2;  // bit 4 = done
+        timeout = timeout - 1;
+    }
+
+    // Read data (bits 31:16)
+    let eerd = e1000_read_reg(E1000_EERD);
+    (eerd / 65536) % 65536
+}
+
+// ============================================================
+// PCI Functions (using kernel's PCI functions)
+// ============================================================
+
+// PCI config ports
+const PCI_CONFIG_ADDR_PORT: i64 = 0xCF8;
+const PCI_CONFIG_DATA_PORT: i64 = 0xCFC;
+
+// Read PCI config (duplicated from main.gl for module isolation)
+fn e1000_pci_read(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    e1000_outl(PCI_CONFIG_ADDR_PORT, addr);
+    e1000_inl(PCI_CONFIG_DATA_PORT)
+}
+
+// Write PCI config
+fn e1000_pci_write(bus: i64, device: i64, func: i64, offset: i64, value: i64) {
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    e1000_outl(PCI_CONFIG_ADDR_PORT, addr);
+    e1000_outl(PCI_CONFIG_DATA_PORT, value);
+}
+
+// Port I/O (duplicated for module isolation)
+fn e1000_outl(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "outl %eax, %dx",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn e1000_inl(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "inl %dx, %eax",
+            in("dx") port,
+            lateout("eax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================
+// E1000 Initialization
+// ============================================================
+
+// Scan PCI bus for E1000 device
+fn e1000_pci_scan() -> i64 {
+    let mut bus: i64 = 0;
+    while bus < 256 {
+        let mut device: i64 = 0;
+        while device < 32 {
+            let vendor_device = e1000_pci_read(bus, device, 0, 0);
+            let vendor = vendor_device % 65536;
+            let dev_id = vendor_device / 65536;
+
+            if vendor == E1000_VENDOR_ID {
+                if dev_id == E1000_DEV_82540EM || dev_id == E1000_DEV_82545EM ||
+                   dev_id == E1000_DEV_82574L || dev_id == E1000_DEV_I217LM {
+                    // Found E1000! Save PCI location
+                    write_byte_addr(E1000_STATE_ADDR + E1000_STATE_BUS, bus);
+                    write_byte_addr(E1000_STATE_ADDR + E1000_STATE_DEVICE, device);
+                    write_byte_addr(E1000_STATE_ADDR + E1000_STATE_FUNC, 0);
+                    return 1;
+                }
+            }
+            device = device + 1;
+        }
+        bus = bus + 1;
+    }
+    0  // Not found
+}
+
+// Get BAR0 (MMIO base address)
+fn e1000_get_bar0() -> i64 {
+    let bus = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_BUS);
+    let device = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_DEVICE);
+    let func = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_FUNC);
+
+    let bar0 = e1000_pci_read(bus, device, func, 0x10);  // BAR0 at offset 0x10
+
+    // Check if memory-mapped (bit 0 = 0)
+    if (bar0 % 2) == 1 {
+        return 0;  // I/O space, not memory
+    }
+
+    // Mask off lower bits (type info)
+    bar0 - (bar0 % 16)
+}
+
+// Enable PCI bus mastering
+fn e1000_enable_bus_master() {
+    let bus = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_BUS);
+    let device = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_DEVICE);
+    let func = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_FUNC);
+
+    // Read command register (offset 0x04)
+    let cmd = e1000_pci_read(bus, device, func, 0x04);
+
+    // Set bit 2 (bus master) and bit 1 (memory space enable) using bitwise OR
+    let new_cmd = e1000_bit_or(cmd, 6);  // OR with 0x06 (bus master 0x04 + memory space 0x02)
+
+    e1000_pci_write(bus, device, func, 0x04, new_cmd);
+}
+
+// Get IRQ line
+fn e1000_get_irq() -> i64 {
+    let bus = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_BUS);
+    let device = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_DEVICE);
+    let func = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_FUNC);
+
+    // IRQ line at offset 0x3C (byte 0)
+    let int_line = e1000_pci_read(bus, device, func, 0x3C);
+    int_line % 256
+}
+
+// Reset the E1000 device
+fn e1000_reset() {
+    // Set reset bit
+    let ctrl = e1000_read_reg(E1000_CTRL);
+    e1000_write_reg(E1000_CTRL, e1000_bit_or(ctrl, CTRL_RST));
+
+    // Wait for reset to complete (~1ms)
+    let mut timeout = 100000;
+    while timeout > 0 {
+        let ctrl_new = e1000_read_reg(E1000_CTRL);
+        if (ctrl_new / CTRL_RST) % 2 == 0 {
+            // Reset bit cleared, reset complete
+            return;
+        }
+        timeout = timeout - 1;
+    }
+}
+
+// Read MAC address from EEPROM or RAL/RAH registers
+fn e1000_read_mac() {
+    // First try reading from RAL0/RAH0 (QEMU usually sets these)
+    let ral = e1000_read_reg(E1000_RAL0);
+    let rah = e1000_read_reg(E1000_RAH0);
+
+    // If RAL/RAH are zero, try EEPROM
+    if ral == 0 && rah == 0 {
+        let word0 = e1000_eeprom_read(0);
+        let word1 = e1000_eeprom_read(1);
+        let word2 = e1000_eeprom_read(2);
+
+        if word0 != 0 || word1 != 0 || word2 != 0 {
+            // Store MAC from EEPROM
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 0, word0 % 256);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 1, (word0 / 256) % 256);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 2, word1 % 256);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 3, (word1 / 256) % 256);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 4, word2 % 256);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 5, (word2 / 256) % 256);
+        } else {
+            // Set a default MAC address (52:54:00:12:34:56)
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 0, 0x52);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 1, 0x54);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 2, 0x00);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 3, 0x12);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 4, 0x34);
+            write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 5, 0x56);
+        }
+    } else {
+        // Use RAL/RAH values
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 0, ral % 256);
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 1, (ral / 256) % 256);
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 2, (ral / 65536) % 256);
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 3, (ral / 16777216) % 256);
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 4, rah % 256);
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 5, (rah / 256) % 256);
+    }
+
+    // Program the receive address register with AV bit set
+    let mac0 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 0);
+    let mac1 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 1);
+    let mac2 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 2);
+    let mac3 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 3);
+    let mac4 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 4);
+    let mac5 = read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + 5);
+
+    let ral_val = mac0 + (mac1 * 256) + (mac2 * 65536) + (mac3 * 16777216);
+    let rah_val = mac4 + (mac5 * 256) + 0x80000000;  // AV bit set (address valid)
+
+    e1000_write_reg(E1000_RAL0, ral_val);
+    e1000_write_reg(E1000_RAH0, rah_val);
+}
+
+// Clear multicast table
+fn e1000_clear_mta() {
+    let mut i: i64 = 0;
+    while i < 128 {
+        e1000_write_reg(E1000_MTA + (i * 4), 0);
+        i = i + 1;
+    }
+}
+
+// Initialize TX ring
+fn e1000_init_tx() {
+    // Clear TX descriptors
+    let mut i: i64 = 0;
+    while i < E1000_NUM_TX_DESC {
+        let desc_addr = E1000_TX_DESC_ADDR + (i * E1000_TX_DESC_SIZE);
+        let buf_addr = E1000_TX_BUF_ADDR + (i * E1000_BUF_SIZE);
+
+        // TX Descriptor Layout (16 bytes):
+        // 0-7:   Buffer Address (64-bit)
+        // 8-9:   Length (16-bit)
+        // 10:    CSO (Checksum Offset)
+        // 11:    CMD (Command)
+        // 12:    STA (Status) + RSV
+        // 13:    CSS (Checksum Start)
+        // 14-15: Special
+
+        write_u64_addr(desc_addr as u64, buf_addr as u64);  // Buffer address
+        write_u16_addr((desc_addr + 8) as u64, 0);          // Length = 0
+        write_byte_addr(desc_addr + 10, 0);                  // CSO
+        write_byte_addr(desc_addr + 11, 0);                  // CMD
+        write_byte_addr(desc_addr + 12, TDESC_STA_DD);       // Status = DD (done)
+        write_byte_addr(desc_addr + 13, 0);                  // CSS
+        write_u16_addr((desc_addr + 14) as u64, 0);          // Special
+
+        i = i + 1;
+    }
+
+    // Set TX descriptor base address
+    e1000_write_reg(E1000_TDBAL, E1000_TX_DESC_ADDR);
+    e1000_write_reg(E1000_TDBAH, 0);
+
+    // Set TX descriptor ring length (32 * 16 = 512 bytes)
+    e1000_write_reg(E1000_TDLEN, E1000_NUM_TX_DESC * E1000_TX_DESC_SIZE);
+
+    // Set head and tail
+    e1000_write_reg(E1000_TDH, 0);
+    e1000_write_reg(E1000_TDT, 0);
+
+    // Initialize TX current index
+    write_u32_addr((E1000_STATE_ADDR + E1000_STATE_TX_CUR) as u64, 0);
+
+    // Configure TCTL
+    // CT=15 (collision threshold), COLD=64 (collision distance for full duplex)
+    let tctl = TCTL_EN + TCTL_PSP + (15 * 16) + (64 * 4096);
+    e1000_write_reg(E1000_TCTL, tctl);
+
+    // Set inter-packet gap (recommended values: 10, 8, 6)
+    let tipg = 10 + (8 * 256) + (6 * 1048576);  // IPGT=10, IPGR1=8, IPGR2=6
+    e1000_write_reg(E1000_TIPG, tipg);
+}
+
+// Initialize RX ring
+fn e1000_init_rx() {
+    // Clear RX descriptors
+    let mut i: i64 = 0;
+    while i < E1000_NUM_RX_DESC {
+        let desc_addr = E1000_RX_DESC_ADDR + (i * E1000_RX_DESC_SIZE);
+        let buf_addr = E1000_RX_BUF_ADDR + (i * E1000_BUF_SIZE);
+
+        // RX Descriptor Layout (16 bytes):
+        // 0-7:   Buffer Address (64-bit)
+        // 8-9:   Length (16-bit)
+        // 10-11: Checksum (16-bit)
+        // 12:    Status (8-bit)
+        // 13:    Errors (8-bit)
+        // 14-15: Special (16-bit)
+
+        write_u64_addr(desc_addr as u64, buf_addr as u64);  // Buffer address
+        write_u16_addr((desc_addr + 8) as u64, 0);          // Length = 0
+        write_u16_addr((desc_addr + 10) as u64, 0);         // Checksum
+        write_byte_addr(desc_addr + 12, 0);                  // Status = 0
+        write_byte_addr(desc_addr + 13, 0);                  // Errors
+        write_u16_addr((desc_addr + 14) as u64, 0);          // Special
+
+        i = i + 1;
+    }
+
+    // Set RX descriptor base address
+    e1000_write_reg(E1000_RDBAL, E1000_RX_DESC_ADDR);
+    e1000_write_reg(E1000_RDBAH, 0);
+
+    // Set RX descriptor ring length (32 * 16 = 512 bytes)
+    e1000_write_reg(E1000_RDLEN, E1000_NUM_RX_DESC * E1000_RX_DESC_SIZE);
+
+    // Set head and tail (tail = N-1 to indicate all buffers available)
+    e1000_write_reg(E1000_RDH, 0);
+    e1000_write_reg(E1000_RDT, E1000_NUM_RX_DESC - 1);
+
+    // Initialize RX current index
+    write_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64, 0);
+
+    // Configure RCTL
+    // EN=enable, BAM=broadcast, BSIZE=2048, SECRC=strip CRC
+    let rctl = RCTL_EN + RCTL_BAM + RCTL_BSIZE_2048 + RCTL_SECRC;
+    e1000_write_reg(E1000_RCTL, rctl);
+}
+
+// Enable interrupts
+fn e1000_enable_interrupts() {
+    // Clear pending interrupts
+    e1000_write_reg(E1000_IMC, 0xFFFFFFFF);
+    e1000_read_reg(E1000_ICR);
+
+    // Enable: RX timer, RX overrun, TX written back, Link status change
+    let ims = ICR_RXT0 + ICR_RXO + ICR_TXDW + ICR_LSC;
+    e1000_write_reg(E1000_IMS, ims);
+}
+
+// Set link up
+fn e1000_link_up() {
+    let ctrl = e1000_read_reg(E1000_CTRL);
+    // SLU=Set Link Up, ASDE=Auto-Speed Detection Enable
+    // SLU=Set Link Up, ASDE=Auto-Speed Detection Enable
+    let slu_asde = e1000_bit_or(CTRL_SLU, CTRL_ASDE);
+    e1000_write_reg(E1000_CTRL, e1000_bit_or(ctrl, slu_asde));
+}
+
+// Check link status
+fn e1000_check_link() -> i64 {
+    let status = e1000_read_reg(E1000_STATUS);
+    if (status / STATUS_LU) % 2 == 1 {
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_LINK_UP, 1);
+        1
+    } else {
+        write_byte_addr(E1000_STATE_ADDR + E1000_STATE_LINK_UP, 0);
+        0
+    }
+}
+
+// Initialize E1000 driver
+// Simple serial debug output for e1000
+fn e1000_serial(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+// Print hex value (8 hex digits)
+fn e1000_serial_hex(val: i64) {
+    e1000_serial(48);  // '0'
+    e1000_serial(120); // 'x'
+
+    // Nibble 7 (bits 28-31): val / 0x10000000
+    let n7 = (val / 0x10000000) % 16;
+    if n7 < 10 { e1000_serial(48 + n7); } else { e1000_serial(55 + n7); }
+
+    // Nibble 6 (bits 24-27): val / 0x1000000
+    let n6 = (val / 0x1000000) % 16;
+    if n6 < 10 { e1000_serial(48 + n6); } else { e1000_serial(55 + n6); }
+
+    // Nibble 5 (bits 20-23): val / 0x100000
+    let n5 = (val / 0x100000) % 16;
+    if n5 < 10 { e1000_serial(48 + n5); } else { e1000_serial(55 + n5); }
+
+    // Nibble 4 (bits 16-19): val / 0x10000
+    let n4 = (val / 0x10000) % 16;
+    if n4 < 10 { e1000_serial(48 + n4); } else { e1000_serial(55 + n4); }
+
+    // Nibble 3 (bits 12-15): val / 0x1000
+    let n3 = (val / 0x1000) % 16;
+    if n3 < 10 { e1000_serial(48 + n3); } else { e1000_serial(55 + n3); }
+
+    // Nibble 2 (bits 8-11): val / 0x100
+    let n2 = (val / 0x100) % 16;
+    if n2 < 10 { e1000_serial(48 + n2); } else { e1000_serial(55 + n2); }
+
+    // Nibble 1 (bits 4-7): val / 0x10
+    let n1 = (val / 0x10) % 16;
+    if n1 < 10 { e1000_serial(48 + n1); } else { e1000_serial(55 + n1); }
+
+    // Nibble 0 (bits 0-3): val
+    let n0 = val % 16;
+    if n0 < 10 { e1000_serial(48 + n0); } else { e1000_serial(55 + n0); }
+}
+
+// Returns: 1 if successful, 0 if no device found
+pub fn e1000_init() -> i64 {
+    // Initialize state
+    e1000_memset(E1000_STATE_ADDR, 0, 256);
+
+    // Scan for E1000 device
+    if e1000_pci_scan() == 0 {
+        return 0;  // Device not found
+    }
+
+    // Get BAR0 (MMIO base)
+    let bar0 = e1000_get_bar0();
+    if bar0 == 0 {
+        return 0;  // Invalid BAR
+    }
+
+    write_u64_addr((E1000_STATE_ADDR + E1000_STATE_MMIO_BASE) as u64, bar0 as u64);
+
+    // Enable bus mastering
+    e1000_enable_bus_master();
+
+    // Get and save IRQ
+    let irq = e1000_get_irq();
+    write_byte_addr(E1000_STATE_ADDR + E1000_STATE_IRQ, irq);
+
+    // Reset device
+    e1000_reset();
+
+    // Set link up
+    e1000_link_up();
+
+    // Read MAC address
+    e1000_read_mac();
+
+    // Clear multicast table
+    e1000_clear_mta();
+
+    // Initialize TX ring
+    e1000_init_tx();
+
+    // Initialize RX ring
+    e1000_init_rx();
+
+    // Enable interrupts
+    e1000_enable_interrupts();
+
+    // Mark as present
+    write_byte_addr(E1000_STATE_ADDR + E1000_STATE_PRESENT, 1);
+
+    // Check link status
+    e1000_check_link();
+
+    // Initialize counters
+    write_u64_addr((E1000_STATE_ADDR + E1000_STATE_TX_COUNT) as u64, 0);
+    write_u64_addr((E1000_STATE_ADDR + E1000_STATE_RX_COUNT) as u64, 0);
+
+    1
+}
+
+// ============================================================
+// E1000 Transmit Functions
+// ============================================================
+
+// Send a packet
+// Returns: 1 on success, 0 on failure
+pub fn e1000_send(data_addr: i64, length: i64) -> i64 {
+    if length < 14 || length > 1518 {
+        return 0;  // Invalid length
+    }
+
+    // Get current TX descriptor index
+    let tx_cur = read_u32_addr((E1000_STATE_ADDR + E1000_STATE_TX_CUR) as u64) as i64;
+    let desc_addr = E1000_TX_DESC_ADDR + (tx_cur * E1000_TX_DESC_SIZE);
+
+    // Wait for descriptor to be available
+    let mut timeout = 100000;
+    while timeout > 0 {
+        let status = read_byte_addr(desc_addr + 12);
+        if (status % 2) == 1 {  // DD bit set
+            break;
+        }
+        timeout = timeout - 1;
+    }
+    if timeout == 0 {
+        return 0;  // Timeout
+    }
+
+    // Copy data to buffer
+    let buf_addr = E1000_TX_BUF_ADDR + (tx_cur * E1000_BUF_SIZE);
+    e1000_memcpy(buf_addr, data_addr, length);
+
+    // Set up descriptor
+    write_u16_addr((desc_addr + 8) as u64, length as u64);  // Length
+    let cmd = TDESC_CMD_EOP + TDESC_CMD_IFCS + TDESC_CMD_RS;
+    write_byte_addr(desc_addr + 11, cmd);  // Command
+    write_byte_addr(desc_addr + 12, 0);    // Clear status
+
+    // Advance tail
+    let next_tx = (tx_cur + 1) % E1000_NUM_TX_DESC;
+    e1000_write_reg(E1000_TDT, next_tx);
+
+    // Update current index
+    write_u32_addr((E1000_STATE_ADDR + E1000_STATE_TX_CUR) as u64, next_tx as u64);
+
+    // Increment TX count
+    let count = read_u64_addr(E1000_STATE_ADDR + E1000_STATE_TX_COUNT);
+    write_u64_addr((E1000_STATE_ADDR + E1000_STATE_TX_COUNT) as u64, count + 1);
+
+    1
+}
+
+// ============================================================
+// E1000 Receive Functions
+// ============================================================
+
+// Check for received packet
+// Returns: packet length if available, 0 if no packet
+pub fn e1000_recv_check() -> i64 {
+    let rx_cur = read_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64) as i64;
+    let desc_addr = E1000_RX_DESC_ADDR + (rx_cur * E1000_RX_DESC_SIZE);
+
+    let status = read_byte_addr(desc_addr + 12);
+    if (status % 2) == 0 {  // DD bit not set
+        return 0;
+    }
+
+    // Get length
+    read_u16_addr((desc_addr + 8) as u64) as i64
+}
+
+// Receive a packet (copy to provided buffer)
+// Returns: packet length, or 0 if no packet
+pub fn e1000_recv(buf_addr: i64, max_len: i64) -> i64 {
+    let rx_cur = read_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64) as i64;
+    let desc_addr = E1000_RX_DESC_ADDR + (rx_cur * E1000_RX_DESC_SIZE);
+
+    let status = read_byte_addr(desc_addr + 12);
+    if (status % 2) == 0 {  // DD bit not set
+        return 0;
+    }
+
+    // Get length
+    let length = read_u16_addr((desc_addr + 8) as u64) as i64;
+
+    // Check for end of packet
+    if (status / 2) % 2 == 0 {  // EOP bit not set
+        // Multi-descriptor packet, skip for now
+        e1000_recv_advance();
+        return 0;
+    }
+
+    // Copy data
+    let copy_len = if length < max_len { length } else { max_len };
+    let src_buf = E1000_RX_BUF_ADDR + (rx_cur * E1000_BUF_SIZE);
+    e1000_memcpy(buf_addr, src_buf, copy_len);
+
+    // Advance to next descriptor
+    e1000_recv_advance();
+
+    // Increment RX count
+    let count = read_u64_addr(E1000_STATE_ADDR + E1000_STATE_RX_COUNT);
+    write_u64_addr((E1000_STATE_ADDR + E1000_STATE_RX_COUNT) as u64, count + 1);
+
+    copy_len
+}
+
+// Advance RX ring to next descriptor
+fn e1000_recv_advance() {
+    let rx_cur = read_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64) as i64;
+    let desc_addr = E1000_RX_DESC_ADDR + (rx_cur * E1000_RX_DESC_SIZE);
+
+    // Clear descriptor status
+    write_byte_addr(desc_addr + 12, 0);
+
+    // Update tail to make this descriptor available again
+    e1000_write_reg(E1000_RDT, rx_cur);
+
+    // Move to next descriptor
+    let next_rx = (rx_cur + 1) % E1000_NUM_RX_DESC;
+    write_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64, next_rx as u64);
+}
+
+// Get RX buffer address for current descriptor (for zero-copy receive)
+pub fn e1000_get_rx_buffer() -> i64 {
+    let rx_cur = read_u32_addr((E1000_STATE_ADDR + E1000_STATE_RX_CUR) as u64) as i64;
+    E1000_RX_BUF_ADDR + (rx_cur * E1000_BUF_SIZE)
+}
+
+// ============================================================
+// E1000 Interrupt Handler
+// ============================================================
+
+// Handle E1000 interrupt
+// Called from main ISR when E1000 IRQ fires
+pub fn e1000_handle_interrupt() {
+    // Read and clear interrupt cause
+    let icr = e1000_read_reg(E1000_ICR);
+
+    if (icr / ICR_LSC) % 2 == 1 {
+        // Link status changed
+        e1000_check_link();
+    }
+
+    // RX and TX handled by polling for now
+}
+
+// ============================================================
+// E1000 Status Functions
+// ============================================================
+
+// Check if device is present
+pub fn e1000_is_present() -> i64 {
+    read_byte_addr(E1000_STATE_ADDR + E1000_STATE_PRESENT)
+}
+
+// Check if link is up
+pub fn e1000_is_link_up() -> i64 {
+    read_byte_addr(E1000_STATE_ADDR + E1000_STATE_LINK_UP)
+}
+
+// Get MAC address byte
+pub fn e1000_get_mac_byte(index: i64) -> i64 {
+    if index < 0 || index >= 6 {
+        return 0;
+    }
+    read_byte_addr(E1000_STATE_ADDR + E1000_STATE_MAC + index)
+}
+
+// Get IRQ number
+pub fn e1000_get_irq_num() -> i64 {
+    read_byte_addr(E1000_STATE_ADDR + E1000_STATE_IRQ)
+}
+
+// Get TX packet count
+pub fn e1000_get_tx_count() -> i64 {
+    read_u64_addr(E1000_STATE_ADDR + E1000_STATE_TX_COUNT) as i64
+}
+
+// Get RX packet count
+pub fn e1000_get_rx_count() -> i64 {
+    read_u64_addr(E1000_STATE_ADDR + E1000_STATE_RX_COUNT) as i64
+}
+
+// Get link speed (10/100/1000 Mbps)
+pub fn e1000_get_speed() -> i64 {
+    let status = e1000_read_reg(E1000_STATUS);
+    let speed_bits = (status / 64) % 4;  // Bits 7:6
+    match speed_bits {
+        0 => 10,
+        1 => 100,
+        2 => 1000,
+        3 => 1000,
+        _ => 0,
+    }
+}
+
+// ============================================================
+// Helper Functions (duplicated for module isolation)
+// ============================================================
+
+fn read_byte_addr(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_byte_addr(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_u16_addr(addr: u64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u16_addr(addr: u64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_u32_addr(addr: u64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u32_addr(addr: u64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn read_u64_addr(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn write_u64_addr(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn e1000_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        write_byte_addr(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn e1000_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = read_byte_addr(src + i);
+        write_byte_addr(dst + i, byte);
+        i = i + 1;
+    }
+}

@@ -1,0 +1,790 @@
+// Genesis Kernel - DHCP Client
+// Dynamic Host Configuration Protocol (RFC 2131)
+
+// ============================================================
+// DHCP Constants
+// ============================================================
+
+// DHCP Ports
+const DHCP_SERVER_PORT: i64 = 67;
+const DHCP_CLIENT_PORT: i64 = 68;
+
+// DHCP Operation Codes
+const DHCP_OP_REQUEST: i64 = 1;
+const DHCP_OP_REPLY: i64 = 2;
+
+// DHCP Hardware Types
+const DHCP_HTYPE_ETHERNET: i64 = 1;
+
+// DHCP Message Types
+const DHCP_DISCOVER: i64 = 1;
+const DHCP_OFFER: i64 = 2;
+const DHCP_REQUEST: i64 = 3;
+const DHCP_DECLINE: i64 = 4;
+const DHCP_ACK: i64 = 5;
+const DHCP_NAK: i64 = 6;
+const DHCP_RELEASE: i64 = 7;
+const DHCP_INFORM: i64 = 8;
+
+// DHCP Options
+const DHCP_OPT_PAD: i64 = 0;
+const DHCP_OPT_SUBNET: i64 = 1;
+const DHCP_OPT_ROUTER: i64 = 3;
+const DHCP_OPT_DNS: i64 = 6;
+const DHCP_OPT_HOSTNAME: i64 = 12;
+const DHCP_OPT_REQUESTED_IP: i64 = 50;
+const DHCP_OPT_LEASE_TIME: i64 = 51;
+const DHCP_OPT_MSG_TYPE: i64 = 53;
+const DHCP_OPT_SERVER_ID: i64 = 54;
+const DHCP_OPT_PARAM_LIST: i64 = 55;
+const DHCP_OPT_END: i64 = 255;
+
+// DHCP Magic Cookie (0x63825363)
+const DHCP_MAGIC_1: i64 = 0x63;
+const DHCP_MAGIC_2: i64 = 0x82;
+const DHCP_MAGIC_3: i64 = 0x53;
+const DHCP_MAGIC_4: i64 = 0x63;
+
+// DHCP Packet Size (minimum)
+const DHCP_MIN_PACKET_SIZE: i64 = 300;
+
+// DHCP Packet Offsets
+const DHCP_OP: i64 = 0;          // Operation (1 byte)
+const DHCP_HTYPE: i64 = 1;       // Hardware type (1 byte)
+const DHCP_HLEN: i64 = 2;        // Hardware address length (1 byte)
+const DHCP_HOPS: i64 = 3;        // Hops (1 byte)
+const DHCP_XID: i64 = 4;         // Transaction ID (4 bytes)
+const DHCP_SECS: i64 = 8;        // Seconds elapsed (2 bytes)
+const DHCP_FLAGS: i64 = 10;      // Flags (2 bytes)
+const DHCP_CIADDR: i64 = 12;     // Client IP (4 bytes)
+const DHCP_YIADDR: i64 = 16;     // Your IP (4 bytes)
+const DHCP_SIADDR: i64 = 20;     // Server IP (4 bytes)
+const DHCP_GIADDR: i64 = 24;     // Gateway IP (4 bytes)
+const DHCP_CHADDR: i64 = 28;     // Client hardware address (16 bytes)
+const DHCP_SNAME: i64 = 44;      // Server name (64 bytes)
+const DHCP_FILE: i64 = 108;      // Boot file (128 bytes)
+const DHCP_OPTIONS: i64 = 236;   // Options start here (after magic cookie)
+
+// DHCP State Machine
+const DHCP_STATE_INIT: i64 = 0;
+const DHCP_STATE_SELECTING: i64 = 1;
+const DHCP_STATE_REQUESTING: i64 = 2;
+const DHCP_STATE_BOUND: i64 = 3;
+const DHCP_STATE_RENEWING: i64 = 4;
+const DHCP_STATE_REBINDING: i64 = 5;
+
+// DHCP State Structure Address
+const DHCP_STATE_ADDR: i64 = 0xB33400;
+
+// State offsets
+const DHCP_S_STATE: i64 = 0;         // Current state (1 byte)
+const DHCP_S_XID: i64 = 4;           // Transaction ID (4 bytes)
+const DHCP_S_OFFERED_IP: i64 = 8;    // Offered IP (4 bytes)
+const DHCP_S_SERVER_IP: i64 = 12;    // Server IP (4 bytes)
+const DHCP_S_LEASE_TIME: i64 = 16;   // Lease time (4 bytes)
+const DHCP_S_T1: i64 = 20;           // Renewal time (4 bytes)
+const DHCP_S_T2: i64 = 24;           // Rebinding time (4 bytes)
+const DHCP_S_START_TIME: i64 = 28;   // Lease start time (8 bytes)
+const DHCP_S_RETRIES: i64 = 36;      // Retry count (1 byte)
+
+// DHCP TX Buffer
+const DHCP_TX_BUF: i64 = 0xB33800;   // DHCP TX buffer (512 bytes)
+
+// ============================================================
+// DHCP Packet Building
+// ============================================================
+
+// Initialize DHCP packet header
+fn dhcp_init_packet(xid: i64) -> i64 {
+    let pkt = DHCP_TX_BUF;
+
+    // Clear packet
+    dhcp_memset(pkt, 0, DHCP_MIN_PACKET_SIZE);
+
+    // Op = BOOTREQUEST (1)
+    dhcp_write_byte(pkt + DHCP_OP, DHCP_OP_REQUEST);
+
+    // Hardware type = Ethernet (1)
+    dhcp_write_byte(pkt + DHCP_HTYPE, DHCP_HTYPE_ETHERNET);
+
+    // Hardware address length = 6
+    dhcp_write_byte(pkt + DHCP_HLEN, 6);
+
+    // Hops = 0
+    dhcp_write_byte(pkt + DHCP_HOPS, 0);
+
+    // Transaction ID (big-endian)
+    dhcp_write_u32_be(pkt + DHCP_XID, xid);
+
+    // Seconds = 0
+    dhcp_write_u16_be(pkt + DHCP_SECS, 0);
+
+    // Flags = 0x8000 (broadcast)
+    dhcp_write_u16_be(pkt + DHCP_FLAGS, 0x8000);
+
+    // Client IP = 0.0.0.0
+    dhcp_write_u32(pkt + DHCP_CIADDR, 0);
+
+    // Your IP = 0.0.0.0
+    dhcp_write_u32(pkt + DHCP_YIADDR, 0);
+
+    // Server IP = 0.0.0.0
+    dhcp_write_u32(pkt + DHCP_SIADDR, 0);
+
+    // Gateway IP = 0.0.0.0
+    dhcp_write_u32(pkt + DHCP_GIADDR, 0);
+
+    // Client hardware address (MAC)
+    let mac_addr = dhcp_get_mac_addr();
+    let mut i: i64 = 0;
+    while i < 6 {
+        dhcp_write_byte(pkt + DHCP_CHADDR + i, dhcp_read_byte(mac_addr + i));
+        i = i + 1;
+    }
+    // Pad remaining 10 bytes
+    while i < 16 {
+        dhcp_write_byte(pkt + DHCP_CHADDR + i, 0);
+        i = i + 1;
+    }
+
+    // Server name = empty
+    dhcp_memset(pkt + DHCP_SNAME, 0, 64);
+
+    // Boot file = empty
+    dhcp_memset(pkt + DHCP_FILE, 0, 128);
+
+    // Magic cookie
+    dhcp_write_byte(pkt + DHCP_OPTIONS - 4, DHCP_MAGIC_1);
+    dhcp_write_byte(pkt + DHCP_OPTIONS - 3, DHCP_MAGIC_2);
+    dhcp_write_byte(pkt + DHCP_OPTIONS - 2, DHCP_MAGIC_3);
+    dhcp_write_byte(pkt + DHCP_OPTIONS - 1, DHCP_MAGIC_4);
+
+    pkt
+}
+
+// Add DHCP option
+// Returns: new offset after option
+fn dhcp_add_option(pkt: i64, offset: i64, opt: i64, len: i64, data: i64) -> i64 {
+    dhcp_write_byte(pkt + offset, opt);
+    dhcp_write_byte(pkt + offset + 1, len);
+
+    let mut i: i64 = 0;
+    while i < len {
+        dhcp_write_byte(pkt + offset + 2 + i, dhcp_read_byte(data + i));
+        i = i + 1;
+    }
+
+    offset + 2 + len
+}
+
+// Add DHCP message type option
+fn dhcp_add_msg_type(pkt: i64, offset: i64, msg_type: i64) -> i64 {
+    dhcp_write_byte(pkt + offset, DHCP_OPT_MSG_TYPE);
+    dhcp_write_byte(pkt + offset + 1, 1);
+    dhcp_write_byte(pkt + offset + 2, msg_type);
+    offset + 3
+}
+
+// Add parameter request list
+fn dhcp_add_param_list(pkt: i64, offset: i64) -> i64 {
+    dhcp_write_byte(pkt + offset, DHCP_OPT_PARAM_LIST);
+    dhcp_write_byte(pkt + offset + 1, 4);  // 4 parameters
+    dhcp_write_byte(pkt + offset + 2, DHCP_OPT_SUBNET);
+    dhcp_write_byte(pkt + offset + 3, DHCP_OPT_ROUTER);
+    dhcp_write_byte(pkt + offset + 4, DHCP_OPT_DNS);
+    dhcp_write_byte(pkt + offset + 5, DHCP_OPT_LEASE_TIME);
+    offset + 6
+}
+
+// Add end option
+fn dhcp_add_end(pkt: i64, offset: i64) -> i64 {
+    dhcp_write_byte(pkt + offset, DHCP_OPT_END);
+    offset + 1
+}
+
+// ============================================================
+// DHCP Message Sending
+// ============================================================
+
+// Generate transaction ID
+fn dhcp_gen_xid() -> i64 {
+    // Use ticks + some fixed value for pseudo-randomness
+    let ticks = dhcp_get_ticks();
+    (ticks * 1103515245 + 12345) % 0x100000000
+}
+
+// Send DHCP DISCOVER
+pub fn dhcp_send_discover() -> i64 {
+    // Generate new XID
+    let xid = dhcp_gen_xid();
+    dhcp_write_u32(DHCP_STATE_ADDR + DHCP_S_XID, xid as u64);
+
+    // Initialize packet
+    let pkt = dhcp_init_packet(xid);
+
+    // Add options
+    let mut offset = DHCP_OPTIONS;
+    offset = dhcp_add_msg_type(pkt, offset, DHCP_DISCOVER);
+    offset = dhcp_add_param_list(pkt, offset);
+    offset = dhcp_add_end(pkt, offset);
+
+    // Pad to minimum size
+    let pkt_len = if offset < DHCP_MIN_PACKET_SIZE { DHCP_MIN_PACKET_SIZE } else { offset };
+
+    // Update state
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_SELECTING);
+
+    // Send via UDP (broadcast)
+    dhcp_send_udp_broadcast(pkt, pkt_len)
+}
+
+// Send DHCP REQUEST
+fn dhcp_send_request(offered_ip: i64, server_ip: i64) -> i64 {
+    let xid = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_XID) as i64;
+
+    let pkt = dhcp_init_packet(xid);
+
+    // Add options
+    let mut offset = DHCP_OPTIONS;
+    offset = dhcp_add_msg_type(pkt, offset, DHCP_REQUEST);
+
+    // Requested IP
+    dhcp_write_byte(pkt + offset, DHCP_OPT_REQUESTED_IP);
+    dhcp_write_byte(pkt + offset + 1, 4);
+    dhcp_write_ip_be(pkt + offset + 2, offered_ip);
+    offset = offset + 6;
+
+    // Server identifier
+    dhcp_write_byte(pkt + offset, DHCP_OPT_SERVER_ID);
+    dhcp_write_byte(pkt + offset + 1, 4);
+    dhcp_write_ip_be(pkt + offset + 2, server_ip);
+    offset = offset + 6;
+
+    offset = dhcp_add_param_list(pkt, offset);
+    offset = dhcp_add_end(pkt, offset);
+
+    let pkt_len = if offset < DHCP_MIN_PACKET_SIZE { DHCP_MIN_PACKET_SIZE } else { offset };
+
+    // Update state
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_REQUESTING);
+
+    dhcp_send_udp_broadcast(pkt, pkt_len)
+}
+
+// Send DHCP RELEASE
+pub fn dhcp_send_release() -> i64 {
+    let xid = dhcp_gen_xid();
+    let our_ip = dhcp_net_get_ip();
+    let server_ip = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_SERVER_IP) as i64;
+
+    if our_ip == 0 || server_ip == 0 {
+        return 0;
+    }
+
+    let pkt = dhcp_init_packet(xid);
+
+    // Set client IP
+    dhcp_write_ip_be(pkt + DHCP_CIADDR, our_ip);
+
+    // Add options
+    let mut offset = DHCP_OPTIONS;
+    offset = dhcp_add_msg_type(pkt, offset, DHCP_RELEASE);
+
+    // Server identifier
+    dhcp_write_byte(pkt + offset, DHCP_OPT_SERVER_ID);
+    dhcp_write_byte(pkt + offset + 1, 4);
+    dhcp_write_ip_be(pkt + offset + 2, server_ip);
+    offset = offset + 6;
+
+    offset = dhcp_add_end(pkt, offset);
+
+    let pkt_len = if offset < DHCP_MIN_PACKET_SIZE { DHCP_MIN_PACKET_SIZE } else { offset };
+
+    // Reset state
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_INIT);
+
+    dhcp_send_udp_unicast(server_ip, pkt, pkt_len)
+}
+
+// ============================================================
+// DHCP Packet Receiving
+// ============================================================
+
+// Parse DHCP options
+fn dhcp_parse_options(pkt: i64, length: i64) {
+    // Verify magic cookie
+    if dhcp_read_byte(pkt + DHCP_OPTIONS - 4) != DHCP_MAGIC_1 ||
+       dhcp_read_byte(pkt + DHCP_OPTIONS - 3) != DHCP_MAGIC_2 ||
+       dhcp_read_byte(pkt + DHCP_OPTIONS - 2) != DHCP_MAGIC_3 ||
+       dhcp_read_byte(pkt + DHCP_OPTIONS - 1) != DHCP_MAGIC_4 {
+        return;
+    }
+
+    let mut offset = DHCP_OPTIONS;
+    let max_offset = if length < 576 { length } else { 576 };
+
+    while offset < max_offset {
+        let opt = dhcp_read_byte(pkt + offset);
+
+        if opt == DHCP_OPT_END {
+            break;
+        }
+
+        if opt == DHCP_OPT_PAD {
+            offset = offset + 1;
+            continue;
+        }
+
+        let len = dhcp_read_byte(pkt + offset + 1);
+
+        // Process known options
+        match opt {
+            1 => {
+                // Subnet mask
+                if len == 4 {
+                    let mask = dhcp_read_ip_be(pkt + offset + 2);
+                    dhcp_net_set_netmask(mask);
+                }
+            }
+            3 => {
+                // Router (gateway)
+                if len >= 4 {
+                    let gw = dhcp_read_ip_be(pkt + offset + 2);
+                    dhcp_net_set_gateway(gw);
+                }
+            }
+            6 => {
+                // DNS server
+                if len >= 4 {
+                    let dns = dhcp_read_ip_be(pkt + offset + 2);
+                    dhcp_net_set_dns(dns);
+                }
+            }
+            51 => {
+                // Lease time
+                if len == 4 {
+                    let lease = dhcp_read_u32_be(pkt + offset + 2);
+                    dhcp_write_u32(DHCP_STATE_ADDR + DHCP_S_LEASE_TIME, lease as u64);
+                }
+            }
+            54 => {
+                // Server identifier
+                if len == 4 {
+                    let server = dhcp_read_ip_be(pkt + offset + 2);
+                    dhcp_write_u32(DHCP_STATE_ADDR + DHCP_S_SERVER_IP, server as u64);
+                }
+            }
+            _ => {
+                // Unknown option, skip
+            }
+        }
+
+        offset = offset + 2 + len;
+    }
+}
+
+// Handle DHCP packet
+pub fn dhcp_handle_packet(payload: i64, length: i64) {
+    if length < DHCP_OPTIONS {
+        return;  // Too short
+    }
+
+    // Check if reply
+    let op = dhcp_read_byte(payload + DHCP_OP);
+    if op != DHCP_OP_REPLY {
+        return;
+    }
+
+    // Check transaction ID
+    let xid = dhcp_read_u32_be(payload + DHCP_XID);
+    let our_xid = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_XID);
+    if xid != our_xid {
+        return;  // Not our transaction
+    }
+
+    // Get message type from options
+    let msg_type = dhcp_get_msg_type(payload, length);
+
+    let state = dhcp_read_byte(DHCP_STATE_ADDR + DHCP_S_STATE);
+
+    match state {
+        1 => {
+            // SELECTING: expecting OFFER
+            if msg_type == DHCP_OFFER {
+                dhcp_handle_offer(payload, length);
+            }
+        }
+        2 => {
+            // REQUESTING: expecting ACK or NAK
+            if msg_type == DHCP_ACK {
+                dhcp_handle_ack(payload, length);
+            } else if msg_type == DHCP_NAK {
+                dhcp_handle_nak(payload, length);
+            }
+        }
+        4 => {
+            // RENEWING: expecting ACK or NAK
+            if msg_type == DHCP_ACK {
+                dhcp_handle_ack(payload, length);
+            } else if msg_type == DHCP_NAK {
+                dhcp_handle_nak(payload, length);
+            }
+        }
+        5 => {
+            // REBINDING: expecting ACK or NAK
+            if msg_type == DHCP_ACK {
+                dhcp_handle_ack(payload, length);
+            } else if msg_type == DHCP_NAK {
+                dhcp_handle_nak(payload, length);
+            }
+        }
+        _ => {
+            // Unexpected packet, ignore
+        }
+    }
+}
+
+// Get message type from options
+fn dhcp_get_msg_type(pkt: i64, length: i64) -> i64 {
+    let mut offset = DHCP_OPTIONS;
+    let max_offset = if length < 576 { length } else { 576 };
+
+    while offset < max_offset {
+        let opt = dhcp_read_byte(pkt + offset);
+
+        if opt == DHCP_OPT_END {
+            break;
+        }
+
+        if opt == DHCP_OPT_PAD {
+            offset = offset + 1;
+            continue;
+        }
+
+        let len = dhcp_read_byte(pkt + offset + 1);
+
+        if opt == DHCP_OPT_MSG_TYPE && len == 1 {
+            return dhcp_read_byte(pkt + offset + 2);
+        }
+
+        offset = offset + 2 + len;
+    }
+
+    0  // Not found
+}
+
+// Handle DHCP OFFER
+fn dhcp_handle_offer(pkt: i64, length: i64) {
+    // Get offered IP
+    let offered_ip = dhcp_read_ip_be(pkt + DHCP_YIADDR);
+
+    // Get server IP from options
+    dhcp_parse_options(pkt, length);
+    let server_ip = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_SERVER_IP) as i64;
+
+    // Save offered IP
+    dhcp_write_u32(DHCP_STATE_ADDR + DHCP_S_OFFERED_IP, offered_ip as u64);
+
+    dhcp_debug_str("DHCP: Received OFFER ");
+    dhcp_debug_ip(offered_ip);
+    dhcp_debug_str(" from ");
+    dhcp_debug_ip(server_ip);
+    dhcp_debug_char(10);
+
+    // Send REQUEST
+    dhcp_send_request(offered_ip, server_ip);
+}
+
+// Handle DHCP ACK
+fn dhcp_handle_ack(pkt: i64, length: i64) {
+    // Get assigned IP
+    let assigned_ip = dhcp_read_ip_be(pkt + DHCP_YIADDR);
+
+    // Parse all options
+    dhcp_parse_options(pkt, length);
+
+    // Configure network
+    dhcp_net_set_ip(assigned_ip);
+    dhcp_net_set_state(2);  // DHCP configured
+
+    // Record lease start time
+    dhcp_write_u64(DHCP_STATE_ADDR + DHCP_S_START_TIME, dhcp_get_ticks() as u64);
+
+    // Update state
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_BOUND);
+
+    dhcp_debug_str("DHCP: Bound to ");
+    dhcp_debug_ip(assigned_ip);
+    dhcp_debug_char(10);
+}
+
+// Handle DHCP NAK
+fn dhcp_handle_nak(pkt: i64, length: i64) {
+    dhcp_debug_str("DHCP: Received NAK, restarting\n");
+
+    // Reset and restart
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_INIT);
+    dhcp_send_discover();
+}
+
+// ============================================================
+// DHCP Client Control
+// ============================================================
+
+// Initialize DHCP client
+pub fn dhcp_init() {
+    dhcp_memset(DHCP_STATE_ADDR, 0, 64);
+    dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_INIT);
+}
+
+// Start DHCP discovery
+pub fn dhcp_start() -> i64 {
+    dhcp_init();
+    dhcp_send_discover()
+}
+
+// Check if DHCP is bound
+pub fn dhcp_is_bound() -> i64 {
+    let state = dhcp_read_byte(DHCP_STATE_ADDR + DHCP_S_STATE);
+    if state == DHCP_STATE_BOUND { 1 } else { 0 }
+}
+
+// Get current DHCP state
+pub fn dhcp_get_state() -> i64 {
+    dhcp_read_byte(DHCP_STATE_ADDR + DHCP_S_STATE)
+}
+
+// Timer tick (called periodically)
+pub fn dhcp_tick() {
+    let state = dhcp_read_byte(DHCP_STATE_ADDR + DHCP_S_STATE);
+
+    if state != DHCP_STATE_BOUND {
+        return;
+    }
+
+    let start_time = dhcp_read_u64(DHCP_STATE_ADDR + DHCP_S_START_TIME) as i64;
+    let lease_time = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_LEASE_TIME) as i64;
+    let now = dhcp_get_ticks();
+    let elapsed = now - start_time;
+
+    // Convert lease_time from seconds to ticks (100 ticks/sec)
+    let lease_ticks = lease_time * 100;
+    let t1_ticks = lease_ticks / 2;        // 50% for renewal
+    let t2_ticks = (lease_ticks * 7) / 8;  // 87.5% for rebinding
+
+    if elapsed >= lease_ticks {
+        // Lease expired
+        dhcp_debug_str("DHCP: Lease expired\n");
+        dhcp_start();
+    } else if elapsed >= t2_ticks {
+        // Enter rebinding state
+        if state != DHCP_STATE_REBINDING {
+            dhcp_debug_str("DHCP: Entering rebinding state\n");
+            dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_REBINDING);
+            // Broadcast request
+            let our_ip = dhcp_net_get_ip();
+            dhcp_send_request(our_ip, 0);
+        }
+    } else if elapsed >= t1_ticks {
+        // Enter renewing state
+        if state != DHCP_STATE_RENEWING {
+            dhcp_debug_str("DHCP: Entering renewing state\n");
+            dhcp_write_byte(DHCP_STATE_ADDR + DHCP_S_STATE, DHCP_STATE_RENEWING);
+            // Unicast request to server
+            let our_ip = dhcp_net_get_ip();
+            let server_ip = dhcp_read_u32(DHCP_STATE_ADDR + DHCP_S_SERVER_IP) as i64;
+            dhcp_send_request(our_ip, server_ip);
+        }
+    }
+}
+
+// ============================================================
+// IP Address Helpers
+// ============================================================
+
+fn dhcp_write_ip_be(addr: i64, ip: i64) {
+    dhcp_write_byte(addr + 0, (ip / 16777216) % 256);
+    dhcp_write_byte(addr + 1, (ip / 65536) % 256);
+    dhcp_write_byte(addr + 2, (ip / 256) % 256);
+    dhcp_write_byte(addr + 3, ip % 256);
+}
+
+fn dhcp_read_ip_be(addr: i64) -> i64 {
+    let b0 = dhcp_read_byte(addr + 0);
+    let b1 = dhcp_read_byte(addr + 1);
+    let b2 = dhcp_read_byte(addr + 2);
+    let b3 = dhcp_read_byte(addr + 3);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+fn dhcp_write_u32_be(addr: i64, val: i64) {
+    dhcp_write_byte(addr + 0, (val / 16777216) % 256);
+    dhcp_write_byte(addr + 1, (val / 65536) % 256);
+    dhcp_write_byte(addr + 2, (val / 256) % 256);
+    dhcp_write_byte(addr + 3, val % 256);
+}
+
+fn dhcp_read_u32_be(addr: i64) -> u64 {
+    let b0 = dhcp_read_byte(addr + 0) as u64;
+    let b1 = dhcp_read_byte(addr + 1) as u64;
+    let b2 = dhcp_read_byte(addr + 2) as u64;
+    let b3 = dhcp_read_byte(addr + 3) as u64;
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+fn dhcp_write_u16_be(addr: i64, val: i64) {
+    dhcp_write_byte(addr + 0, (val / 256) % 256);
+    dhcp_write_byte(addr + 1, val % 256);
+}
+
+// ============================================================
+// Debug Functions
+// ============================================================
+
+fn dhcp_debug_ip(ip: i64) {
+    dhcp_debug_dec((ip / 16777216) % 256);
+    dhcp_debug_char(46);
+    dhcp_debug_dec((ip / 65536) % 256);
+    dhcp_debug_char(46);
+    dhcp_debug_dec((ip / 256) % 256);
+    dhcp_debug_char(46);
+    dhcp_debug_dec(ip % 256);
+}
+
+fn dhcp_debug_dec(val: i64) {
+    if val == 0 {
+        dhcp_debug_char(48);
+        return;
+    }
+
+    let mut num = val;
+    let mut digits: [i64; 10] = [0; 10];
+    let mut count: i64 = 0;
+
+    while num > 0 {
+        digits[count as usize] = num % 10;
+        num = num / 10;
+        count = count + 1;
+    }
+
+    while count > 0 {
+        count = count - 1;
+        dhcp_debug_char(48 + digits[count as usize]);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn dhcp_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dhcp_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dhcp_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dhcp_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dhcp_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dhcp_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dhcp_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        dhcp_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn dhcp_debug_char(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn dhcp_debug_str(s: &str) {
+    for c in s.bytes() {
+        dhcp_debug_char(c as i64);
+    }
+}
+
+fn dhcp_get_ticks() -> i64 {
+    dhcp_read_u64(0x412000) as i64
+}
+
+// External functions
+fn dhcp_get_mac_addr() -> i64 { 0xB20400 + 16 }
+fn dhcp_net_get_ip() -> i64 { 0 }
+fn dhcp_net_set_ip(ip: i64) {}
+fn dhcp_net_set_netmask(mask: i64) {}
+fn dhcp_net_set_gateway(gw: i64) {}
+fn dhcp_net_set_dns(dns: i64) {}
+fn dhcp_net_set_state(state: i64) {}
+fn dhcp_send_udp_broadcast(pkt: i64, len: i64) -> i64 { 0 }
+fn dhcp_send_udp_unicast(dst: i64, pkt: i64, len: i64) -> i64 { 0 }

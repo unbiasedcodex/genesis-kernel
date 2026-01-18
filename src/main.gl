@@ -3,6 +3,12 @@
 // Phase 12: Device Drivers & Disk I/O
 
 // ============================================================
+// Module Imports
+// ============================================================
+
+mod net;
+
+// ============================================================
 // Constants
 // ============================================================
 
@@ -463,6 +469,17 @@ const MMAP_ERR_NOTFOUND: i64 = -43;               // Mapping not found
 const MMAP_PAGE_SIZE: i64 = 4096;                 // 4KB pages
 
 // ============================================================
+// Kernel Page Table Pool (for MMIO and kernel mappings)
+// ============================================================
+// This pool provides pre-allocated pages for page table structures
+// Used when pmm_alloc_page might fail (e.g., mapping high MMIO addresses)
+
+const KPTPOOL_BASE: i64 = 0x4A0000;               // Kernel PT pool base address
+const KPTPOOL_SIZE: i64 = 0x10000;                // 64KB = 16 pages for page tables
+const KPTPOOL_PAGES: i64 = 16;                    // Number of pages in pool
+const KPTPOOL_NEXT_ADDR: i64 = 0x4A0000;          // Next free page index (stored at base)
+
+// ============================================================
 // Extended PCB Fields (Phase 11)
 // ============================================================
 
@@ -563,6 +580,38 @@ const SYS_PROC_COUNT: i64 = 44;                   // Get number of processes
 const SYS_PROC_STATE: i64 = 45;                   // Get process state by PID
 const SYS_RAMFS_READ_NAME: i64 = 46;              // Read filename character
 
+// ============================================================
+// Network Syscall Constants (Phase 13: Network Stack)
+// ============================================================
+
+// Socket syscalls (50-69)
+const SYS_NET_SOCKET: i64 = 50;       // socket(domain, type, protocol) -> fd
+const SYS_NET_BIND: i64 = 51;         // bind(socket, ip, port) -> result
+const SYS_NET_LISTEN: i64 = 52;       // listen(socket, backlog) -> result
+const SYS_NET_ACCEPT: i64 = 53;       // accept(socket) -> new_socket
+const SYS_NET_CONNECT: i64 = 54;      // connect(socket, ip, port) -> result
+const SYS_NET_SEND: i64 = 55;         // send(socket, buffer, len) -> bytes_sent
+const SYS_NET_RECV: i64 = 56;         // recv(socket, buffer, len) -> bytes_recv
+const SYS_NET_CLOSE: i64 = 57;        // close(socket) -> result
+const SYS_NET_CONFIG: i64 = 58;       // configure(ip, mask, gw, dns) -> result
+const SYS_NET_STATUS: i64 = 59;       // get network status -> status
+
+// Extended network syscalls
+const SYS_NET_RESOLVE: i64 = 60;      // resolve(hostname_addr) -> ip
+const SYS_NET_PING: i64 = 61;         // ping(ip, timeout) -> rtt_ticks
+const SYS_NET_ARP: i64 = 62;          // arp_lookup(ip, mac_out) -> result
+const SYS_NET_SENDTO: i64 = 63;       // sendto(socket, buf, len, ip, port) -> bytes
+const SYS_NET_RECVFROM: i64 = 64;     // recvfrom(socket, buf, len, ip_out, port_out) -> bytes
+const SYS_NET_DHCP: i64 = 65;         // start DHCP -> result
+const SYS_NET_POLL: i64 = 66;         // poll network stack -> packets_processed
+
+// Network address families
+const NET_AF_INET: i64 = 2;           // IPv4
+
+// Network socket types
+const NET_SOCK_STREAM: i64 = 1;       // TCP
+const NET_SOCK_DGRAM: i64 = 2;        // UDP
+
 // IRQ forwarding table (16 IRQs, each 8 bytes: handler PID, 0 = no handler)
 const IRQ_HANDLER_TABLE: i64 = 0x1100000;         // 17MB - IRQ handler table
 
@@ -654,26 +703,65 @@ fn shl_u64(value: u64, shift: u64) -> u64 {
 }
 
 fn shr_u64(value: u64, shift: u64) -> u64 {
+    // Use a simpler approach - manual shift loop for small shifts
+    // This avoids compiler issues with inline assembly
+    if shift >= 64 {
+        return 0;
+    }
     let mut result = value;
-    result >>= shift;
+    let mut count = shift;
+    while count > 0 {
+        // Shift right by 1: divide by 2 using bit operations
+        // result = (result >> 1) implemented as: result / 2 for unsigned
+        let hi_bit = bit_and(result, 0x8000000000000000);
+        result = result / 2;
+        // The division by 2 is equivalent to unsigned right shift by 1
+        count = count - 1;
+    }
     result
 }
 
 fn bit_and(a: u64, b: u64) -> u64 {
-    let mut result = a;
-    result &= b;
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             andq %rsi, %rax",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
     result
 }
 
 fn bit_or(a: u64, b: u64) -> u64 {
-    let mut result = a;
-    result |= b;
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             orq %rsi, %rax",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
     result
 }
 
 fn bit_not(a: u64) -> u64 {
-    let mut result = a;
-    result ^= 0xFFFFFFFFFFFFFFFF;
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             notq %rax",
+            in("rdi") a,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
     result
 }
 
@@ -2140,6 +2228,7 @@ fn write_u32_addr(addr: i64, value: i64) {
 // ============================================================
 
 fn pmm_init_bitmap() {
+    // Initialize all bitmap entries to 0xFFFFFFFFFFFFFFFF (all pages used)
     let mut offset: i64 = 0;
     while offset < 32768 {
         write_u64_at(PMM_BITMAP_ADDR, offset, 0xFFFFFFFFFFFFFFFF);
@@ -2171,11 +2260,12 @@ fn pmm_mark_free(base: u64, length: u64) {
         let bitmap_offset = (qword_idx * 8) as i64;
 
         // Read current entry
-        let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset) as u64;
+        let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset);
 
         // Clear the bit (mark as free)
         let mask = shl_u64(1, bit_idx);
-        let new_entry = bit_and(entry, bit_not(mask));
+        let not_mask = bit_not(mask);
+        let new_entry = bit_and(entry, not_mask);
 
         write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, new_entry);
 
@@ -2293,7 +2383,7 @@ fn load_multiboot_modules(mb_info_addr: i64) {
     let mods_count = read_u32_at(mb_info_addr, MB_MODS_COUNT) as i64;
     let mods_addr = read_u32_at(mb_info_addr, MB_MODS_ADDR) as i64;
 
-    // Print module count
+    // Print module count and address for debugging
     serial_out(77);  // M
     serial_out(79);  // O
     serial_out(68);  // D
@@ -2301,6 +2391,9 @@ fn load_multiboot_modules(mb_info_addr: i64) {
     serial_out(58);  // :
     serial_out(32);  // space
     serial_print_dec(mods_count);
+    serial_out(32);  // space
+    serial_out(64);  // @
+    serial_hex32(mods_addr as u64);
     serial_newline();
 
     // Process each module
@@ -2312,15 +2405,17 @@ fn load_multiboot_modules(mb_info_addr: i64) {
         let mod_end = read_u32_at(mod_entry, MOD_END) as i64;
         let mod_size = mod_end - mod_start;
 
-        // Print module info
+        // Print module info using serial_hex (which masks to 32 bits)
         serial_out(32);  // space
         serial_out(91);  // [
         serial_print_dec(i);
         serial_out(93);  // ]
         serial_out(32);  // space
-        serial_print_hex64(mod_start as u64);
+        serial_hex(mod_start as u64);
+        serial_out(32);  // space
         serial_out(45);  // -
-        serial_print_hex64(mod_end as u64);
+        serial_out(32);  // space
+        serial_hex(mod_end as u64);
         serial_out(32);  // space
         serial_out(40);  // (
         serial_print_dec(mod_size);
@@ -3070,6 +3165,22 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         44 => syscall_proc_count(),             // SYS_PROC_COUNT
         45 => syscall_proc_state(arg1),         // SYS_PROC_STATE
         46 => syscall_ramfs_read_name(arg1, arg2), // SYS_RAMFS_READ_NAME
+        // Network syscalls (50-66)
+        50 => syscall_net_socket(arg1, arg2, arg3), // SYS_NET_SOCKET
+        51 => syscall_net_bind(arg1, arg2, arg3),   // SYS_NET_BIND
+        52 => syscall_net_listen(arg1, arg2),       // SYS_NET_LISTEN
+        53 => syscall_net_accept(arg1),             // SYS_NET_ACCEPT
+        54 => syscall_net_connect(arg1, arg2, arg3), // SYS_NET_CONNECT
+        55 => syscall_net_send(arg1, arg2, arg3),   // SYS_NET_SEND
+        56 => syscall_net_recv(arg1, arg2, arg3),   // SYS_NET_RECV
+        57 => syscall_net_close(arg1),              // SYS_NET_CLOSE
+        58 => syscall_net_config(arg1, arg2, arg3), // SYS_NET_CONFIG
+        59 => syscall_net_status(arg1),             // SYS_NET_STATUS
+        60 => syscall_net_resolve(arg1),            // SYS_NET_RESOLVE
+        61 => syscall_net_ping(arg1, arg2),         // SYS_NET_PING
+        62 => syscall_net_arp(arg1, arg2),          // SYS_NET_ARP
+        65 => syscall_net_dhcp(),                   // SYS_NET_DHCP
+        66 => syscall_net_poll(),                   // SYS_NET_POLL
         _ => -1,                                // Unknown syscall
     }
 }
@@ -3637,6 +3748,7 @@ fn mmap_find(vaddr: i64, pid: i64) -> i64 {
     let vaddr_u = vaddr as u64;
     let mut i: i64 = 0;
     let mut result: i64 = -1;
+    let mut found_any: i64 = 0;
     while i < MMAP_MAX_ENTRIES {
         let entry = MMAP_TABLE_ADDR + (i * MMAP_ENTRY_SIZE);
         let flags = read_u64_addr(entry + MMAP_FLAGS);
@@ -3646,6 +3758,16 @@ fn mmap_find(vaddr: i64, pid: i64) -> i64 {
             let vstart = read_u64_addr(entry + MMAP_VADDR_START);
             let vend = read_u64_addr(entry + MMAP_VADDR_END);
 
+            // Debug: print first few valid entries
+            if found_any < 3 {
+                serial_out(91);  // [
+                serial_print_dec(entry_pid);
+                serial_out(58);  // :
+                serial_hex32(vstart);
+                serial_out(93);  // ]
+                found_any = found_any + 1;
+            }
+
             if entry_pid == pid && vaddr_u >= vstart && vaddr_u < vend {
                 if result == -1 {
                     result = i;
@@ -3653,6 +3775,9 @@ fn mmap_find(vaddr: i64, pid: i64) -> i64 {
             }
         }
         i = i + 1;
+    }
+    if found_any > 0 {
+        serial_newline();
     }
     result
 }
@@ -3681,9 +3806,22 @@ fn mmap_remove_process(pid: i64) {
 // pid: process that caused the fault
 // Returns: 0 on success (page loaded), -1 if not a mapped region
 fn mmap_handle_fault(vaddr: i64, pid: i64) -> i64 {
+    // Debug: print PID we're looking for
+    serial_out(80);  // P
+    serial_out(73);  // I
+    serial_out(68);  // D
+    serial_out(58);  // :
+    serial_print_dec(pid);
+    serial_newline();
+
     // Find the mapping for this address
     let idx = mmap_find(vaddr, pid);
     if idx < 0 {
+        serial_out(78);  // N
+        serial_out(70);  // F
+        serial_out(78);  // N (NFN = Not Found)
+        serial_out(68);  // D
+        serial_newline();
         return -1;  // Not a mapped region
     }
 
@@ -3707,11 +3845,33 @@ fn mmap_handle_fault(vaddr: i64, pid: i64) -> i64 {
     serial_hex32(page_vaddr as u64);
     serial_newline();
 
+    // Debug: show PMM state before alloc
+    let free_before = read_u64_at(PMM_STATE_ADDR, 8);
+    serial_out(70);  // F
+    serial_out(82);  // R
+    serial_out(69);  // E
+    serial_out(69);  // E
+    serial_out(58);  // :
+    serial_print_dec(free_before as i64);
+    serial_newline();
+
     // Allocate a physical page for this virtual page
     let phys_page = pmm_alloc_page();
     if phys_page == 0 {
+        serial_out(79);  // O
+        serial_out(79);  // O
+        serial_out(77);  // M (OOM)
+        serial_newline();
         return -1;  // OOM
     }
+    serial_out(65);  // A
+    serial_out(76);  // L
+    serial_out(76);  // L
+    serial_out(79);  // O
+    serial_out(67);  // C (ALLOC)
+    serial_out(58);  // :
+    serial_hex32(phys_page);
+    serial_newline();
 
     // Load data from file into the physical page
     // Read MMAP_PAGE_SIZE bytes from the file
@@ -3762,6 +3922,75 @@ fn mmap_handle_fault(vaddr: i64, pid: i64) -> i64 {
     0  // Success
 }
 
+// ============================================================
+// Kernel Page Table Pool Functions
+// ============================================================
+
+// State addresses for the kernel page table pool
+// Uses first 16 bytes of pool for state tracking
+const KPTPOOL_INIT_FLAG_ADDR: i64 = 0x4A0000;  // 1 = initialized
+const KPTPOOL_NEXT_PAGE_ADDR: i64 = 0x4A0008;  // Next free page address
+
+// Initialize the kernel page table pool
+// Must be called early in boot, before any MMIO mapping
+fn kptpool_init() {
+    // Check if already initialized
+    let init_flag = read_u64_addr(KPTPOOL_INIT_FLAG_ADDR);
+    if init_flag == 1 {
+        return;
+    }
+
+    // Zero out the entire pool
+    let mut offset: i64 = 0;
+    while offset < KPTPOOL_SIZE {
+        write_u64_addr(KPTPOOL_BASE + offset, 0);
+        offset = offset + 8;
+    }
+
+    // Start allocating from the second page (first 4KB used for tracking)
+    write_u64_addr(KPTPOOL_NEXT_PAGE_ADDR, (KPTPOOL_BASE + 0x1000) as u64);
+    write_u64_addr(KPTPOOL_INIT_FLAG_ADDR, 1);
+
+    serial_out(75);  // K
+    serial_out(80);  // P
+    serial_out(84);  // T
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
+// Allocate a page from the kernel page table pool
+// Returns: physical address of the page, or 0 if pool exhausted
+fn kptpool_alloc() -> u64 {
+    // Check if initialized, init if not
+    let init_flag = read_u64_addr(KPTPOOL_INIT_FLAG_ADDR);
+    if init_flag != 1 {
+        kptpool_init();
+    }
+
+    let pool_end = (KPTPOOL_BASE + KPTPOOL_SIZE) as u64;
+    let next_page = read_u64_addr(KPTPOOL_NEXT_PAGE_ADDR);
+
+    if next_page >= pool_end {
+        // Pool exhausted - fall back to PMM
+        return pmm_alloc_page() as u64;
+    }
+
+    // Allocate this page and advance pointer
+    let page = next_page as u64;
+    write_u64_addr(KPTPOOL_NEXT_PAGE_ADDR, next_page + 0x1000);
+
+    // Zero the page
+    let mut offset: i64 = 0;
+    while offset < 0x1000 {
+        write_u64_addr((page as i64) + offset, 0);
+        offset = offset + 8;
+    }
+
+    page
+}
+
 // Map a virtual page to a physical page for demand paging
 // This is a simplified version that works with the existing page tables
 fn mmap_map_page(vaddr: u64, paddr: u64, flags: u64) -> bool {
@@ -3792,7 +4021,7 @@ fn mmap_map_page(vaddr: u64, paddr: u64, flags: u64) -> bool {
     let mut pdpt_addr: u64 = 0;
     if (pml4e % 2) == 0 {  // Check if PRESENT bit (bit 0) is clear
         // Need to allocate PDPT
-        let new_pdpt = pmm_alloc_page() as u64;
+        let new_pdpt = kptpool_alloc();
         if new_pdpt == 0 {
             return false;
         }
@@ -3813,7 +4042,7 @@ fn mmap_map_page(vaddr: u64, paddr: u64, flags: u64) -> bool {
     let pdpte = read_u64_addr((pdpt_addr + pdpt_idx * 8) as i64);
     let mut pd_addr: u64 = 0;
     if (pdpte % 2) == 0 {  // Check if PRESENT bit is clear
-        let new_pd = pmm_alloc_page() as u64;
+        let new_pd = kptpool_alloc();
         if new_pd == 0 {
             return false;
         }
@@ -3832,7 +4061,7 @@ fn mmap_map_page(vaddr: u64, paddr: u64, flags: u64) -> bool {
     let pde = read_u64_addr((pd_addr + pd_idx * 8) as i64);
     let mut pt_addr: u64 = 0;
     if (pde % 2) == 0 {  // Check if PRESENT bit is clear
-        let new_pt = pmm_alloc_page() as u64;
+        let new_pt = kptpool_alloc();
         if new_pt == 0 {
             return false;
         }
@@ -3847,8 +4076,8 @@ fn mmap_map_page(vaddr: u64, paddr: u64, flags: u64) -> bool {
         pt_addr = paddr_and(pde, 0x000FFFFFFFFFF000);
     }
 
-    // Level 1: PT entry
-    let entry = paddr_and(paddr, 0x000FFFFFFFFFF000) + flags + 1;  // Add PRESENT bit
+    // Level 1: PT entry (flags should already include PRESENT bit)
+    let entry = paddr_and(paddr, 0x000FFFFFFFFFF000) + flags;
     write_u64_addr((pt_addr + pt_idx * 8) as i64, entry);
 
     // Invalidate TLB for this address
@@ -3931,7 +4160,7 @@ fn mmap_unmap_page(vaddr: u64) {
     if is_huge {
         // Need to split the 2MB huge page into a 4KB page table
         // Allocate a new page table
-        let new_pt = pmm_alloc_page() as u64;
+        let new_pt = kptpool_alloc();
         if new_pt == 0 {
             return;  // OOM, can't split
         }
@@ -7875,6 +8104,423 @@ fn init_kernel_services() {
 }
 
 // ============================================================
+// Network Syscall Implementations (Phase 13: Network Stack)
+// ============================================================
+
+// Memory map for network stack:
+// 0xB00000 - E1000 TX Descriptors (512B)
+// 0xB00200 - E1000 TX Buffers (64KB)
+// 0xB10200 - E1000 RX Descriptors (512B)
+// 0xB10400 - E1000 RX Buffers (64KB)
+// 0xB20400 - E1000 State (256B)
+// 0xB20500 - ARP Cache (3KB)
+// 0xB21000 - Network Config (4KB)
+// 0xB22000 - UDP Socket Table (8KB)
+// 0xB24000 - TCP Socket Table + Buffers (112KB)
+
+// Network state address
+const NET_INITIALIZED_ADDR: i64 = 0xB3C000;
+
+// Check if network is initialized
+fn net_is_ready() -> i64 {
+    read_byte_addr(NET_INITIALIZED_ADDR)
+}
+
+// SYS_NET_SOCKET - Create a network socket
+// arg1: domain (2 = AF_INET)
+// arg2: type (1 = STREAM/TCP, 2 = DGRAM/UDP)
+// arg3: protocol (0 = default)
+// Returns: socket fd, or negative error
+fn syscall_net_socket(domain: i64, sock_type: i64, protocol: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call socket(domain, sock_type, protocol)
+    // For now, return placeholder
+    return -1;
+}
+
+// SYS_NET_BIND - Bind socket to address
+// arg1: socket fd
+// arg2: IP address (packed)
+// arg3: port number
+fn syscall_net_bind(fd: i64, ip: i64, port: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call bind(fd, ip, port)
+    return -1;
+}
+
+// SYS_NET_LISTEN - Listen for connections
+// arg1: socket fd
+// arg2: backlog
+fn syscall_net_listen(fd: i64, backlog: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call listen(fd, backlog)
+    return -1;
+}
+
+// SYS_NET_ACCEPT - Accept connection
+// arg1: socket fd
+// Returns: new socket fd, or negative error
+fn syscall_net_accept(fd: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call accept(fd)
+    return -1;
+}
+
+// SYS_NET_CONNECT - Connect to remote
+// arg1: socket fd
+// arg2: remote IP
+// arg3: remote port
+fn syscall_net_connect(fd: i64, ip: i64, port: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call connect(fd, ip, port)
+    return -1;
+}
+
+// SYS_NET_SEND - Send data
+// arg1: socket fd
+// arg2: buffer address
+// arg3: length
+fn syscall_net_send(fd: i64, buffer: i64, length: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call send(fd, buffer, length)
+    return -1;
+}
+
+// SYS_NET_RECV - Receive data
+// arg1: socket fd
+// arg2: buffer address
+// arg3: max length
+fn syscall_net_recv(fd: i64, buffer: i64, max_len: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call recv(fd, buffer, max_len)
+    return -1;
+}
+
+// SYS_NET_CLOSE - Close socket
+// arg1: socket fd
+fn syscall_net_close(fd: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call close(fd)
+    return 0;
+}
+
+// SYS_NET_CONFIG - Configure network (static IP)
+// arg1: IP address
+// arg2: subnet mask
+// arg3: gateway (DNS in high 32 bits - TODO: extend)
+fn syscall_net_config(ip: i64, mask: i64, gateway: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call net_configure(ip, mask, gateway, dns)
+    return 0;
+}
+
+// SYS_NET_STATUS - Get network status
+// arg1: what to query (0=initialized, 1=link, 2=ip, 3=mask, 4=gateway, 5=dns)
+fn syscall_net_status(query: i64) -> i64 {
+    match query {
+        0 => net_is_ready(),
+        1 => {
+            // Link status - read from E1000 state
+            let e1000_state = 0xB20400;
+            read_byte_addr(e1000_state + 1)  // E1000_STATE_LINK_UP
+        }
+        2 => {
+            // IP address
+            let net_config = 0xB21000;
+            read_u32_at(net_config, 0) as i64
+        }
+        3 => {
+            // Subnet mask
+            let net_config = 0xB21000;
+            read_u32_at(net_config, 4) as i64
+        }
+        4 => {
+            // Gateway
+            let net_config = 0xB21000;
+            read_u32_at(net_config, 8) as i64
+        }
+        5 => {
+            // DNS
+            let net_config = 0xB21000;
+            read_u32_at(net_config, 12) as i64
+        }
+        _ => -1,
+    }
+}
+
+// SYS_NET_RESOLVE - DNS resolve (placeholder)
+// arg1: hostname buffer address
+fn syscall_net_resolve(hostname: i64) -> i64 {
+    // DNS resolution not implemented yet
+    -1
+}
+
+// SYS_NET_PING - Send ICMP ping
+// arg1: target IP
+// arg2: timeout in ticks
+fn syscall_net_ping(target_ip: i64, timeout: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call ping(target_ip, timeout)
+    // Returns RTT in ticks, or -1 on timeout
+    return -1;
+}
+
+// SYS_NET_ARP - ARP lookup
+// arg1: IP address to lookup
+// arg2: buffer for MAC address (6 bytes)
+fn syscall_net_arp(ip: i64, mac_out: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call arp_lookup(ip, mac_out)
+    return 0;
+}
+
+// SYS_NET_DHCP - Start DHCP discovery
+fn syscall_net_dhcp() -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    // Would call dhcp_start()
+    return 0;
+}
+
+// SYS_NET_POLL - Poll network for packets
+fn syscall_net_poll() -> i64 {
+    if net_is_ready() == 0 {
+        return 0;
+    }
+    // Would call net_stack_poll()
+    // Returns number of packets processed
+    return 0;
+}
+
+// Debug function: check page table entry for an address
+fn debug_check_pte(vaddr: i64) {
+    // Get CR3
+    let mut pml4: i64 = 0;
+    unsafe {
+        asm!(
+            "movq %cr3, %rax",
+            lateout("rax") pml4,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    // Clear lower 12 bits to get physical address
+    let pml4_addr: i64 = (pml4 / 4096) * 4096;
+
+    serial_out(67);  // C
+    serial_out(82);  // R
+    serial_out(51);  // 3
+    serial_out(58);  // :
+    serial_hex(pml4_addr as u64);
+    serial_newline();
+
+    // Calculate indices (0xFEB80000)
+    // PML4: vaddr / 512GB % 512
+    // PDPT: vaddr / 1GB % 512 = 0xFEB80000 / 0x40000000 % 512 = 3
+    // PD: vaddr / 2MB % 512 = 0xFEB80000 / 0x200000 % 512 = 501
+    // PT: vaddr / 4KB % 512 = 0xFEB80000 / 0x1000 % 512 = 384
+    let pml4_idx: i64 = 0;   // vaddr < 512GB so index is 0
+    let pdpt_idx: i64 = 3;   // 0xFEB80000 / 0x40000000 = 3
+    let pd_idx: i64 = 501;   // ((0xFEB80000 / 0x200000) % 512) = 501
+    let pt_idx: i64 = 384;   // ((0xFEB80000 / 0x1000) % 512) = 384
+
+    // Read PML4E
+    let pml4e = read_u64_addr(pml4_addr + pml4_idx * 8) as i64;
+    serial_out(80);  // P
+    serial_out(52);  // 4
+    serial_out(58);  // :
+    serial_hex(pml4e as u64);
+    serial_newline();
+
+    if (pml4e % 2) == 0 {
+        serial_out(78);  // N
+        serial_out(80);  // P
+        serial_newline();
+        return;
+    }
+
+    // Read PDPTE
+    let pdpt_addr: i64 = (pml4e / 4096) * 4096;  // Clear lower 12 bits
+    let pdpte = read_u64_addr(pdpt_addr + pdpt_idx * 8) as i64;
+    serial_out(80);  // P
+    serial_out(51);  // 3
+    serial_out(58);  // :
+    serial_hex(pdpte as u64);
+    serial_newline();
+
+    if (pdpte % 2) == 0 {
+        serial_out(78);  // N
+        serial_out(80);  // P
+        serial_newline();
+        return;
+    }
+
+    // Check for 1GB page (bit 7)
+    if (pdpte / 128) % 2 == 1 {
+        serial_out(49);  // 1
+        serial_out(71);  // G
+        serial_newline();
+        return;
+    }
+
+    // Read PDE
+    let pd_addr: i64 = (pdpte / 4096) * 4096;  // Clear lower 12 bits
+    let pde = read_u64_addr(pd_addr + pd_idx * 8) as i64;
+    serial_out(80);  // P
+    serial_out(50);  // 2
+    serial_out(58);  // :
+    serial_hex(pde as u64);
+    serial_newline();
+
+    if (pde % 2) == 0 {
+        serial_out(78);  // N
+        serial_out(80);  // P
+        serial_newline();
+        return;
+    }
+
+    // Check for 2MB page (bit 7)
+    if (pde / 128) % 2 == 1 {
+        serial_out(50);  // 2
+        serial_out(77);  // M
+        serial_newline();
+        return;
+    }
+
+    // Read PTE
+    let pt_addr: i64 = (pde / 4096) * 4096;  // Clear lower 12 bits
+    let pte = read_u64_addr(pt_addr + pt_idx * 8) as i64;
+    serial_out(80);  // P
+    serial_out(84);  // T
+    serial_out(58);  // :
+    serial_hex(pte as u64);
+    serial_newline();
+}
+
+// Map MMIO region for E1000 network card
+// E1000 typically at 0xFEB80000 in QEMU
+fn map_e1000_mmio() {
+    serial_out(77);  // M
+    serial_out(77);  // M
+    serial_out(73);  // I
+    serial_out(79);  // O
+    serial_newline();
+
+    // Map 256KB of MMIO space (0xFEB80000 - 0xFEBC0000)
+    // Using identity mapping with appropriate flags
+    let base: u64 = 0xFEB80000;
+    let size: u64 = 0x40000;  // 256KB
+
+    // Page flags: Present (1) + Writable (2) + Cache Disable (16)
+    let flags: u64 = 1 + 2 + 16;
+
+    let mut offset: u64 = 0;
+    let mut count: i64 = 0;
+    while offset < size {
+        let addr = base + offset;
+        let ok = mmap_map_page(addr, addr, flags);  // Identity map
+        if ok {
+            count = count + 1;
+        }
+        offset = offset + 0x1000;  // 4KB pages
+    }
+
+    serial_out(77);  // M
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(58);  // :
+    serial_out(48 + ((count / 10) % 10) as i64);
+    serial_out(48 + (count % 10) as i64);
+    serial_newline();
+
+    // Verify the mapping
+    debug_check_pte(0xFEB80000);
+
+    // Test MMIO read directly - use register-based addressing
+    serial_out(84);  // T
+    serial_out(82);  // R
+    serial_out(58);  // :
+    let mmio_addr: i64 = 0xFEB80008;  // STATUS register
+    let mmio_status: i64;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") mmio_addr,
+            lateout("eax") mmio_status,
+            options(nostack, att_syntax)
+        );
+    }
+    serial_hex(mmio_status as u64);
+    serial_newline();
+}
+
+// Public MMIO read helper for network module
+pub fn mmio_read32(addr: i64) -> i64 {
+    // Always print a marker when called
+    serial_out(33);  // !
+
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Initialize network stack
+fn net_init() {
+    // Print banner
+    serial_out(78);  // N
+    serial_out(69);  // E
+    serial_out(84);  // T
+    serial_out(32);  // space
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(73);  // I
+    serial_out(84);  // T
+    serial_newline();
+
+    // Initialize kernel page table pool for MMIO mapping
+    kptpool_init();
+
+    // Map E1000 MMIO region before initializing network stack
+    map_e1000_mmio();
+
+    // Initialize the network stack
+    net::net_stack_init();
+}
+
+// ============================================================
 // Kernel Entry Point
 // ============================================================
 
@@ -7936,6 +8582,9 @@ fn _start() {
 
     // Initialize ATA disk driver
     ata_init();
+
+    // Initialize network stack
+    net_init();
 
     // Test PCI 32-bit port I/O
     test_pci_ports();

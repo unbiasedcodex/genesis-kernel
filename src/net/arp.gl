@@ -1,0 +1,623 @@
+// Genesis Kernel - ARP Protocol
+// Address Resolution Protocol (RFC 826)
+
+// ============================================================
+// ARP Constants
+// ============================================================
+
+// ARP Hardware Types
+const ARP_HTYPE_ETHERNET: i64 = 1;
+
+// ARP Protocol Types
+const ARP_PTYPE_IPV4: i64 = 0x0800;
+
+// ARP Hardware/Protocol Lengths
+const ARP_HLEN_ETHERNET: i64 = 6;   // Ethernet MAC = 6 bytes
+const ARP_PLEN_IPV4: i64 = 4;       // IPv4 = 4 bytes
+
+// ARP Operations
+const ARP_OP_REQUEST: i64 = 1;
+const ARP_OP_REPLY: i64 = 2;
+
+// ARP Packet Size (28 bytes for Ethernet/IPv4)
+const ARP_PACKET_SIZE: i64 = 28;
+
+// ARP Cache
+const ARP_CACHE_ADDR: i64 = 0xB20500;  // ARP cache base address
+const ARP_CACHE_SIZE: i64 = 64;         // Maximum entries
+const ARP_ENTRY_SIZE: i64 = 24;         // Size per entry
+
+// ARP Entry State
+const ARP_STATE_FREE: i64 = 0;
+const ARP_STATE_PENDING: i64 = 1;
+const ARP_STATE_VALID: i64 = 2;
+
+// ARP Entry Offsets (24 bytes per entry)
+const ARP_ENTRY_IP: i64 = 0;        // IP address (4 bytes)
+const ARP_ENTRY_MAC: i64 = 4;       // MAC address (6 bytes)
+const ARP_ENTRY_STATE: i64 = 10;    // State (2 bytes)
+const ARP_ENTRY_TIME: i64 = 12;     // Timestamp (8 bytes)
+const ARP_ENTRY_PAD: i64 = 20;      // Padding (4 bytes)
+
+// ARP Timeout (5 minutes in ticks, assuming 100Hz timer)
+const ARP_TIMEOUT_TICKS: i64 = 30000;
+
+// ARP Packet Buffer
+const ARP_TX_BUF: i64 = 0xB31000;   // TX buffer for ARP packets
+const ARP_RX_BUF: i64 = 0xB31100;   // RX buffer for ARP packets
+
+// ============================================================
+// ARP Packet Structure (offsets within ARP payload)
+// ============================================================
+
+const ARP_HTYPE: i64 = 0;       // Hardware type (2 bytes)
+const ARP_PTYPE: i64 = 2;       // Protocol type (2 bytes)
+const ARP_HLEN: i64 = 4;        // Hardware address length (1 byte)
+const ARP_PLEN: i64 = 5;        // Protocol address length (1 byte)
+const ARP_OPER: i64 = 6;        // Operation (2 bytes)
+const ARP_SHA: i64 = 8;         // Sender hardware address (6 bytes)
+const ARP_SPA: i64 = 14;        // Sender protocol address (4 bytes)
+const ARP_THA: i64 = 18;        // Target hardware address (6 bytes)
+const ARP_TPA: i64 = 24;        // Target protocol address (4 bytes)
+
+// ============================================================
+// ARP Cache Functions
+// ============================================================
+
+// Initialize ARP cache
+pub fn arp_cache_init() {
+    let mut i: i64 = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        arp_write_u16(entry + ARP_ENTRY_STATE, ARP_STATE_FREE as u64);
+        i = i + 1;
+    }
+}
+
+// Find entry in ARP cache by IP
+// Returns: entry address, or 0 if not found
+fn arp_cache_find(ip: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        let state = arp_read_u16(entry + ARP_ENTRY_STATE) as i64;
+
+        if state != ARP_STATE_FREE {
+            let entry_ip = arp_read_u32(entry + ARP_ENTRY_IP) as i64;
+            if entry_ip == ip {
+                return entry;
+            }
+        }
+        i = i + 1;
+    }
+    0  // Not found
+}
+
+// Find free entry in ARP cache
+// Returns: entry address, or 0 if cache full
+fn arp_cache_find_free() -> i64 {
+    let mut i: i64 = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        let state = arp_read_u16(entry + ARP_ENTRY_STATE) as i64;
+
+        if state == ARP_STATE_FREE {
+            return entry;
+        }
+        i = i + 1;
+    }
+
+    // No free entry, try to find oldest expired entry
+    let current_time = arp_get_ticks();
+    let mut oldest_entry: i64 = 0;
+    let mut oldest_time: i64 = current_time;
+
+    i = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        let time = arp_read_u64(entry + ARP_ENTRY_TIME) as i64;
+
+        if time < oldest_time {
+            oldest_time = time;
+            oldest_entry = entry;
+        }
+        i = i + 1;
+    }
+
+    oldest_entry
+}
+
+// Lookup MAC address for IP
+// Returns: 1 if found (MAC written to mac_out), 0 if not found
+pub fn arp_lookup(ip: i64, mac_out: i64) -> i64 {
+    let entry = arp_cache_find(ip);
+    if entry == 0 {
+        return 0;
+    }
+
+    let state = arp_read_u16(entry + ARP_ENTRY_STATE) as i64;
+    if state != ARP_STATE_VALID {
+        return 0;
+    }
+
+    // Check if expired
+    let current_time = arp_get_ticks();
+    let entry_time = arp_read_u64(entry + ARP_ENTRY_TIME) as i64;
+    if current_time - entry_time > ARP_TIMEOUT_TICKS {
+        // Entry expired, mark as free
+        arp_write_u16(entry + ARP_ENTRY_STATE, ARP_STATE_FREE as u64);
+        return 0;
+    }
+
+    // Copy MAC address
+    arp_memcpy(mac_out, entry + ARP_ENTRY_MAC, 6);
+    1
+}
+
+// Insert entry into ARP cache
+pub fn arp_cache_insert(ip: i64, mac_addr: i64) {
+    // Check if already exists
+    let mut entry = arp_cache_find(ip);
+    if entry == 0 {
+        entry = arp_cache_find_free();
+        if entry == 0 {
+            return;  // Cache full
+        }
+    }
+
+    // Write entry
+    arp_write_u32(entry + ARP_ENTRY_IP, ip as u64);
+    arp_memcpy(entry + ARP_ENTRY_MAC, mac_addr, 6);
+    arp_write_u16(entry + ARP_ENTRY_STATE, ARP_STATE_VALID as u64);
+    arp_write_u64(entry + ARP_ENTRY_TIME, arp_get_ticks() as u64);
+}
+
+// Remove expired entries from cache
+pub fn arp_cache_expire() {
+    let current_time = arp_get_ticks();
+    let mut i: i64 = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        let state = arp_read_u16(entry + ARP_ENTRY_STATE) as i64;
+
+        if state == ARP_STATE_VALID {
+            let entry_time = arp_read_u64(entry + ARP_ENTRY_TIME) as i64;
+            if current_time - entry_time > ARP_TIMEOUT_TICKS {
+                arp_write_u16(entry + ARP_ENTRY_STATE, ARP_STATE_FREE as u64);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// ARP Packet Functions
+// ============================================================
+
+// Build ARP request packet
+// Returns: packet length
+fn arp_build_request(target_ip: i64, our_ip: i64, our_mac: i64) -> i64 {
+    let pkt = ARP_TX_BUF;
+
+    // Hardware type (Ethernet = 1, big-endian)
+    arp_write_byte(pkt + ARP_HTYPE, 0);
+    arp_write_byte(pkt + ARP_HTYPE + 1, 1);
+
+    // Protocol type (IPv4 = 0x0800, big-endian)
+    arp_write_byte(pkt + ARP_PTYPE, 0x08);
+    arp_write_byte(pkt + ARP_PTYPE + 1, 0x00);
+
+    // Hardware length (6 for Ethernet)
+    arp_write_byte(pkt + ARP_HLEN, 6);
+
+    // Protocol length (4 for IPv4)
+    arp_write_byte(pkt + ARP_PLEN, 4);
+
+    // Operation (Request = 1, big-endian)
+    arp_write_byte(pkt + ARP_OPER, 0);
+    arp_write_byte(pkt + ARP_OPER + 1, 1);
+
+    // Sender hardware address (our MAC)
+    arp_memcpy(pkt + ARP_SHA, our_mac, 6);
+
+    // Sender protocol address (our IP, big-endian)
+    arp_write_ip(pkt + ARP_SPA, our_ip);
+
+    // Target hardware address (zeros for request)
+    arp_memset(pkt + ARP_THA, 0, 6);
+
+    // Target protocol address (target IP, big-endian)
+    arp_write_ip(pkt + ARP_TPA, target_ip);
+
+    ARP_PACKET_SIZE
+}
+
+// Build ARP reply packet
+fn arp_build_reply(target_ip: i64, target_mac: i64, our_ip: i64, our_mac: i64) -> i64 {
+    let pkt = ARP_TX_BUF;
+
+    // Hardware type (Ethernet = 1)
+    arp_write_byte(pkt + ARP_HTYPE, 0);
+    arp_write_byte(pkt + ARP_HTYPE + 1, 1);
+
+    // Protocol type (IPv4 = 0x0800)
+    arp_write_byte(pkt + ARP_PTYPE, 0x08);
+    arp_write_byte(pkt + ARP_PTYPE + 1, 0x00);
+
+    // Hardware/Protocol lengths
+    arp_write_byte(pkt + ARP_HLEN, 6);
+    arp_write_byte(pkt + ARP_PLEN, 4);
+
+    // Operation (Reply = 2)
+    arp_write_byte(pkt + ARP_OPER, 0);
+    arp_write_byte(pkt + ARP_OPER + 1, 2);
+
+    // Sender = us
+    arp_memcpy(pkt + ARP_SHA, our_mac, 6);
+    arp_write_ip(pkt + ARP_SPA, our_ip);
+
+    // Target = requester
+    arp_memcpy(pkt + ARP_THA, target_mac, 6);
+    arp_write_ip(pkt + ARP_TPA, target_ip);
+
+    ARP_PACKET_SIZE
+}
+
+// Send ARP request for IP
+pub fn arp_request(target_ip: i64) -> i64 {
+    // Get our IP and MAC from network config
+    let our_ip = net_get_ip();
+    let our_mac = net_get_mac_addr();
+
+    if our_ip == 0 {
+        return 0;  // Not configured
+    }
+
+    // Build ARP request
+    let arp_len = arp_build_request(target_ip, our_ip, our_mac);
+
+    // Build Ethernet frame with broadcast destination
+    let eth_frame = arp_eth_build_header(our_mac, 0x0806);  // ARP ethertype
+    let dst_mac = eth_frame;  // First 6 bytes are destination MAC
+
+    // Set broadcast destination
+    arp_memset(dst_mac, 0xFF, 6);
+
+    // Copy ARP packet to Ethernet payload
+    arp_memcpy(eth_frame + 14, ARP_TX_BUF, arp_len);
+
+    // Send frame
+    arp_eth_send(eth_frame, 14 + arp_len)
+}
+
+// Handle incoming ARP packet
+pub fn arp_handle_packet(arp_payload: i64, length: i64) {
+    if length < ARP_PACKET_SIZE {
+        return;  // Too short
+    }
+
+    // Validate hardware/protocol types
+    let htype = (arp_read_byte(arp_payload + ARP_HTYPE) * 256) +
+                 arp_read_byte(arp_payload + ARP_HTYPE + 1);
+    let ptype = (arp_read_byte(arp_payload + ARP_PTYPE) * 256) +
+                 arp_read_byte(arp_payload + ARP_PTYPE + 1);
+
+    if htype != ARP_HTYPE_ETHERNET || ptype != ARP_PTYPE_IPV4 {
+        return;  // Not Ethernet/IPv4
+    }
+
+    // Get operation
+    let oper = (arp_read_byte(arp_payload + ARP_OPER) * 256) +
+                arp_read_byte(arp_payload + ARP_OPER + 1);
+
+    // Get sender info
+    let sender_mac = arp_payload + ARP_SHA;
+    let sender_ip = arp_read_ip(arp_payload + ARP_SPA);
+
+    // Get target info
+    let target_ip = arp_read_ip(arp_payload + ARP_TPA);
+
+    // Always update cache with sender info
+    arp_cache_insert(sender_ip, sender_mac);
+
+    // Get our IP
+    let our_ip = net_get_ip();
+
+    // If this is a request for our IP, send reply
+    if oper == ARP_OP_REQUEST && target_ip == our_ip {
+        let our_mac = net_get_mac_addr();
+
+        // Build reply
+        let reply_len = arp_build_reply(sender_ip, sender_mac, our_ip, our_mac);
+
+        // Build Ethernet frame
+        let eth_frame = arp_eth_build_header(our_mac, 0x0806);
+
+        // Set destination to sender
+        arp_memcpy(eth_frame, sender_mac, 6);
+
+        // Copy ARP packet
+        arp_memcpy(eth_frame + 14, ARP_TX_BUF, reply_len);
+
+        // Send
+        arp_eth_send(eth_frame, 14 + reply_len);
+    }
+}
+
+// ============================================================
+// IP Address Helper Functions
+// ============================================================
+
+// Write IP address in network byte order (big-endian)
+fn arp_write_ip(addr: i64, ip: i64) {
+    arp_write_byte(addr + 0, (ip / 16777216) % 256);  // First octet
+    arp_write_byte(addr + 1, (ip / 65536) % 256);     // Second octet
+    arp_write_byte(addr + 2, (ip / 256) % 256);       // Third octet
+    arp_write_byte(addr + 3, ip % 256);               // Fourth octet
+}
+
+// Read IP address from network byte order
+fn arp_read_ip(addr: i64) -> i64 {
+    let b0 = arp_read_byte(addr + 0);
+    let b1 = arp_read_byte(addr + 1);
+    let b2 = arp_read_byte(addr + 2);
+    let b3 = arp_read_byte(addr + 3);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+// ============================================================
+// Debug Functions
+// ============================================================
+
+// Print ARP cache (for debugging)
+pub fn arp_debug_cache() {
+    arp_debug_str("ARP Cache:\n");
+    let mut i: i64 = 0;
+    let mut count: i64 = 0;
+    while i < ARP_CACHE_SIZE {
+        let entry = ARP_CACHE_ADDR + (i * ARP_ENTRY_SIZE);
+        let state = arp_read_u16(entry + ARP_ENTRY_STATE) as i64;
+
+        if state == ARP_STATE_VALID {
+            let ip = arp_read_u32(entry + ARP_ENTRY_IP) as i64;
+            arp_debug_ip(ip);
+            arp_debug_str(" -> ");
+            arp_debug_mac(entry + ARP_ENTRY_MAC);
+            arp_debug_char(10);  // newline
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    arp_debug_str("Total entries: ");
+    arp_debug_dec(count);
+    arp_debug_char(10);
+}
+
+fn arp_debug_ip(ip: i64) {
+    arp_debug_dec((ip / 16777216) % 256);
+    arp_debug_char(46);  // '.'
+    arp_debug_dec((ip / 65536) % 256);
+    arp_debug_char(46);
+    arp_debug_dec((ip / 256) % 256);
+    arp_debug_char(46);
+    arp_debug_dec(ip % 256);
+}
+
+fn arp_debug_mac(mac_addr: i64) {
+    let mut i: i64 = 0;
+    while i < 6 {
+        let b = arp_read_byte(mac_addr + i);
+        arp_debug_hex_byte(b);
+        if i < 5 {
+            arp_debug_char(58);  // ':'
+        }
+        i = i + 1;
+    }
+}
+
+fn arp_debug_dec(val: i64) {
+    if val == 0 {
+        arp_debug_char(48);  // '0'
+        return;
+    }
+
+    let mut num = val;
+    let mut digits: [i64; 10] = [0; 10];
+    let mut count: i64 = 0;
+
+    while num > 0 {
+        digits[count as usize] = num % 10;
+        num = num / 10;
+        count = count + 1;
+    }
+
+    while count > 0 {
+        count = count - 1;
+        arp_debug_char(48 + digits[count as usize]);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn arp_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn arp_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn arp_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn arp_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn arp_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn arp_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn arp_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn arp_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn arp_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        arp_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn arp_memcpy(dst: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        let byte = arp_read_byte(src + i);
+        arp_write_byte(dst + i, byte);
+        i = i + 1;
+    }
+}
+
+fn arp_debug_char(ch: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn arp_debug_str(s: &str) {
+    for c in s.bytes() {
+        arp_debug_char(c as i64);
+    }
+}
+
+fn arp_debug_hex_byte(b: i64) {
+    let hi = (b / 16) % 16;
+    let lo = b % 16;
+
+    if hi < 10 {
+        arp_debug_char(48 + hi);
+    } else {
+        arp_debug_char(55 + hi);
+    }
+    if lo < 10 {
+        arp_debug_char(48 + lo);
+    } else {
+        arp_debug_char(55 + lo);
+    }
+}
+
+fn arp_get_ticks() -> i64 {
+    // Read from timer tick counter (0x412000)
+    arp_read_u64(0x412000) as i64
+}
+
+// External functions (linked from other modules)
+fn net_get_ip() -> i64 {
+    // From ipv4.gl - will be linked
+    0
+}
+
+fn net_get_mac_addr() -> i64 {
+    // Returns address of MAC, from e1000.gl state
+    0xB20400 + 16  // E1000_STATE_ADDR + E1000_STATE_MAC
+}
+
+fn arp_eth_build_header(src_mac: i64, ethertype: i64) -> i64 {
+    // Build Ethernet header at a fixed location
+    let frame = 0xB31200;  // ARP frame buffer
+
+    // Source MAC (bytes 6-11)
+    arp_memcpy(frame + 6, src_mac, 6);
+
+    // EtherType (bytes 12-13, big-endian)
+    arp_write_byte(frame + 12, ethertype / 256);
+    arp_write_byte(frame + 13, ethertype % 256);
+
+    frame
+}
+
+fn arp_eth_send(frame: i64, length: i64) -> i64 {
+    // Send via E1000 driver
+    0
+}

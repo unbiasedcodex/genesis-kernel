@@ -1,0 +1,360 @@
+// Genesis Kernel - Ethernet Layer
+// IEEE 802.3 Ethernet frame handling
+
+// ============================================================
+// Ethernet Constants
+// ============================================================
+
+// Ethernet header size (14 bytes: 6 dst + 6 src + 2 ethertype)
+const ETH_HEADER_SIZE: i64 = 14;
+
+// Maximum and minimum frame sizes
+const ETH_MIN_FRAME_SIZE: i64 = 60;    // Minimum frame (without FCS)
+const ETH_MAX_FRAME_SIZE: i64 = 1514;  // Maximum frame (without FCS)
+const ETH_MTU: i64 = 1500;             // Maximum payload size
+
+// EtherType values (big-endian in frame, stored here in host order)
+const ETHERTYPE_IPV4: i64 = 0x0800;
+const ETHERTYPE_ARP: i64 = 0x0806;
+const ETHERTYPE_IPV6: i64 = 0x86DD;
+const ETHERTYPE_VLAN: i64 = 0x8100;
+
+// Broadcast MAC address
+const ETH_BROADCAST_MAC_0: i64 = 0xFF;
+const ETH_BROADCAST_MAC_1: i64 = 0xFF;
+const ETH_BROADCAST_MAC_2: i64 = 0xFF;
+const ETH_BROADCAST_MAC_3: i64 = 0xFF;
+const ETH_BROADCAST_MAC_4: i64 = 0xFF;
+const ETH_BROADCAST_MAC_5: i64 = 0xFF;
+
+// Temporary frame buffer for building outgoing frames
+const ETH_TX_FRAME_ADDR: i64 = 0xB30000;  // 2KB buffer for frame assembly
+const ETH_RX_FRAME_ADDR: i64 = 0xB30800;  // 2KB buffer for received frames
+
+// ============================================================
+// Ethernet Frame Structure
+// ============================================================
+
+// Frame header offsets
+const ETH_DST_MAC: i64 = 0;    // Destination MAC (6 bytes)
+const ETH_SRC_MAC: i64 = 6;    // Source MAC (6 bytes)
+const ETH_ETHERTYPE: i64 = 12; // EtherType (2 bytes, big-endian)
+const ETH_PAYLOAD: i64 = 14;   // Payload starts here
+
+// ============================================================
+// MAC Address Functions
+// ============================================================
+
+// Check if MAC address is broadcast (FF:FF:FF:FF:FF:FF)
+pub fn eth_is_broadcast(mac_addr: i64) -> i64 {
+    let b0 = eth_read_byte(mac_addr + 0);
+    let b1 = eth_read_byte(mac_addr + 1);
+    let b2 = eth_read_byte(mac_addr + 2);
+    let b3 = eth_read_byte(mac_addr + 3);
+    let b4 = eth_read_byte(mac_addr + 4);
+    let b5 = eth_read_byte(mac_addr + 5);
+
+    if b0 == 0xFF && b1 == 0xFF && b2 == 0xFF &&
+       b3 == 0xFF && b4 == 0xFF && b5 == 0xFF {
+        1
+    } else {
+        0
+    }
+}
+
+// Check if MAC address is multicast (bit 0 of first byte is 1)
+pub fn eth_is_multicast(mac_addr: i64) -> i64 {
+    let b0 = eth_read_byte(mac_addr);
+    if b0 % 2 == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+// Compare two MAC addresses
+// Returns: 1 if equal, 0 if not
+pub fn eth_mac_equal(mac1: i64, mac2: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 6 {
+        if eth_read_byte(mac1 + i) != eth_read_byte(mac2 + i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    1
+}
+
+// Copy MAC address from src to dst
+pub fn eth_mac_copy(dst: i64, src: i64) {
+    let mut i: i64 = 0;
+    while i < 6 {
+        eth_write_byte(dst + i, eth_read_byte(src + i));
+        i = i + 1;
+    }
+}
+
+// Set MAC address to broadcast (FF:FF:FF:FF:FF:FF)
+pub fn eth_mac_set_broadcast(mac_addr: i64) {
+    let mut i: i64 = 0;
+    while i < 6 {
+        eth_write_byte(mac_addr + i, 0xFF);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Frame Parsing Functions
+// ============================================================
+
+// Get destination MAC from frame
+pub fn eth_get_dst_mac(frame_addr: i64, mac_out: i64) {
+    eth_mac_copy(mac_out, frame_addr + ETH_DST_MAC);
+}
+
+// Get source MAC from frame
+pub fn eth_get_src_mac(frame_addr: i64, mac_out: i64) {
+    eth_mac_copy(mac_out, frame_addr + ETH_SRC_MAC);
+}
+
+// Get EtherType from frame (returns in host byte order)
+pub fn eth_get_ethertype(frame_addr: i64) -> i64 {
+    // EtherType is big-endian in frame
+    let hi = eth_read_byte(frame_addr + ETH_ETHERTYPE);
+    let lo = eth_read_byte(frame_addr + ETH_ETHERTYPE + 1);
+    (hi * 256) + lo
+}
+
+// Get payload address from frame
+pub fn eth_get_payload(frame_addr: i64) -> i64 {
+    frame_addr + ETH_PAYLOAD
+}
+
+// Get payload length from total frame length
+pub fn eth_get_payload_len(frame_len: i64) -> i64 {
+    if frame_len < ETH_HEADER_SIZE {
+        0
+    } else {
+        frame_len - ETH_HEADER_SIZE
+    }
+}
+
+// ============================================================
+// Frame Building Functions
+// ============================================================
+
+// Build Ethernet frame header
+// Returns: address of frame (header + payload space)
+pub fn eth_build_header(dst_mac: i64, src_mac: i64, ethertype: i64) -> i64 {
+    let frame = ETH_TX_FRAME_ADDR;
+
+    // Copy destination MAC
+    eth_mac_copy(frame + ETH_DST_MAC, dst_mac);
+
+    // Copy source MAC
+    eth_mac_copy(frame + ETH_SRC_MAC, src_mac);
+
+    // Set EtherType (big-endian)
+    eth_write_byte(frame + ETH_ETHERTYPE, ethertype / 256);
+    eth_write_byte(frame + ETH_ETHERTYPE + 1, ethertype % 256);
+
+    frame
+}
+
+// Get address to write payload into
+pub fn eth_get_tx_payload() -> i64 {
+    ETH_TX_FRAME_ADDR + ETH_PAYLOAD
+}
+
+// Complete frame building and return total length
+// Pads to minimum frame size if needed
+pub fn eth_finalize_frame(payload_len: i64) -> i64 {
+    let total_len = ETH_HEADER_SIZE + payload_len;
+
+    // Pad to minimum frame size if needed
+    if total_len < ETH_MIN_FRAME_SIZE {
+        // Zero-pad the remaining bytes
+        let mut i = total_len;
+        while i < ETH_MIN_FRAME_SIZE {
+            eth_write_byte(ETH_TX_FRAME_ADDR + i, 0);
+            i = i + 1;
+        }
+        ETH_MIN_FRAME_SIZE
+    } else if total_len > ETH_MAX_FRAME_SIZE {
+        ETH_MAX_FRAME_SIZE
+    } else {
+        total_len
+    }
+}
+
+// Get TX frame address
+pub fn eth_get_tx_frame() -> i64 {
+    ETH_TX_FRAME_ADDR
+}
+
+// ============================================================
+// Frame Validation
+// ============================================================
+
+// Validate received frame
+// Returns: 1 if valid, 0 if invalid
+pub fn eth_validate_frame(frame_addr: i64, frame_len: i64) -> i64 {
+    // Check minimum length
+    if frame_len < ETH_HEADER_SIZE {
+        return 0;
+    }
+
+    // Check maximum length
+    if frame_len > ETH_MAX_FRAME_SIZE {
+        return 0;
+    }
+
+    // Frame is valid
+    1
+}
+
+// Check if frame is addressed to us
+// Returns: 1 if for us, 0 if not
+pub fn eth_is_for_us(frame_addr: i64, our_mac: i64) -> i64 {
+    // Check for exact match
+    if eth_mac_equal(frame_addr + ETH_DST_MAC, our_mac) == 1 {
+        return 1;
+    }
+
+    // Check for broadcast
+    if eth_is_broadcast(frame_addr + ETH_DST_MAC) == 1 {
+        return 1;
+    }
+
+    // Could also check multicast here if needed
+    0
+}
+
+// ============================================================
+// Ethernet Send/Receive (using E1000 driver)
+// ============================================================
+
+// Import E1000 driver functions
+// (These are declared in e1000.gl and linked at compile time)
+
+// Send Ethernet frame
+// Returns: 1 on success, 0 on failure
+pub fn eth_send(frame_addr: i64, frame_len: i64) -> i64 {
+    // Validate length
+    if frame_len < ETH_HEADER_SIZE || frame_len > ETH_MAX_FRAME_SIZE {
+        return 0;
+    }
+
+    // Use E1000 driver to send
+    e1000_send(frame_addr, frame_len)
+}
+
+// Send the prepared TX frame
+pub fn eth_send_prepared(payload_len: i64) -> i64 {
+    let frame_len = eth_finalize_frame(payload_len);
+    eth_send(ETH_TX_FRAME_ADDR, frame_len)
+}
+
+// Receive Ethernet frame into RX buffer
+// Returns: frame length, or 0 if no frame
+pub fn eth_recv() -> i64 {
+    e1000_recv(ETH_RX_FRAME_ADDR, ETH_MAX_FRAME_SIZE)
+}
+
+// Get address of received frame
+pub fn eth_get_rx_frame() -> i64 {
+    ETH_RX_FRAME_ADDR
+}
+
+// ============================================================
+// Debug Helper Functions
+// ============================================================
+
+// Print MAC address (for debugging via serial)
+pub fn eth_debug_mac(mac_addr: i64) {
+    let mut i: i64 = 0;
+    while i < 6 {
+        let byte = eth_read_byte(mac_addr + i);
+        eth_debug_hex_byte(byte);
+        if i < 5 {
+            eth_debug_char(58);  // ':'
+        }
+        i = i + 1;
+    }
+}
+
+// Print EtherType (for debugging)
+pub fn eth_debug_ethertype(ethertype: i64) {
+    eth_debug_char(48);  // '0'
+    eth_debug_char(120); // 'x'
+    eth_debug_hex_byte(ethertype / 256);
+    eth_debug_hex_byte(ethertype % 256);
+}
+
+// ============================================================
+// Helper Functions (duplicated for module isolation)
+// ============================================================
+
+fn eth_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn eth_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn eth_debug_char(ch: i64) {
+    // Write to serial port (COM1 = 0x3F8)
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") 0x3F8,
+            in("al") ch,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn eth_debug_hex_byte(byte: i64) {
+    let hi = (byte / 16) % 16;
+    let lo = byte % 16;
+
+    if hi < 10 {
+        eth_debug_char(48 + hi);  // '0' + hi
+    } else {
+        eth_debug_char(55 + hi);  // 'A' - 10 + hi
+    }
+
+    if lo < 10 {
+        eth_debug_char(48 + lo);
+    } else {
+        eth_debug_char(55 + lo);
+    }
+}
+
+// Import from e1000.gl (external linkage)
+fn e1000_send(data_addr: i64, length: i64) -> i64 {
+    // This will be linked from e1000.gl
+    0  // Placeholder - actual implementation in e1000.gl
+}
+
+fn e1000_recv(buf_addr: i64, max_len: i64) -> i64 {
+    // This will be linked from e1000.gl
+    0  // Placeholder - actual implementation in e1000.gl
+}

@@ -1,0 +1,525 @@
+// Genesis Kernel - Socket API
+// Unified socket abstraction for TCP/UDP
+
+// ============================================================
+// Socket Constants
+// ============================================================
+
+// Socket Types
+const SOCK_STREAM: i64 = 1;    // TCP
+const SOCK_DGRAM: i64 = 2;     // UDP
+const SOCK_RAW: i64 = 3;       // Raw IP
+
+// Address Families
+const AF_INET: i64 = 2;        // IPv4
+
+// Socket Options
+const SO_REUSEADDR: i64 = 1;
+const SO_KEEPALIVE: i64 = 2;
+const SO_BROADCAST: i64 = 3;
+const SO_RCVTIMEO: i64 = 4;
+const SO_SNDTIMEO: i64 = 5;
+
+// Socket States (unified)
+const SOCKET_STATE_CLOSED: i64 = 0;
+const SOCKET_STATE_CREATED: i64 = 1;
+const SOCKET_STATE_BOUND: i64 = 2;
+const SOCKET_STATE_LISTENING: i64 = 3;
+const SOCKET_STATE_CONNECTING: i64 = 4;
+const SOCKET_STATE_CONNECTED: i64 = 5;
+const SOCKET_STATE_CLOSING: i64 = 6;
+
+// Socket descriptor table
+const SOCKET_TABLE_ADDR: i64 = 0xB3A000;
+const MAX_SOCKETS: i64 = 64;
+const SOCKET_DESC_SIZE: i64 = 32;
+
+// Socket descriptor offsets
+const SOCK_DESC_TYPE: i64 = 0;        // Socket type (1 byte)
+const SOCK_DESC_FAMILY: i64 = 1;      // Address family (1 byte)
+const SOCK_DESC_STATE: i64 = 2;       // State (1 byte)
+const SOCK_DESC_FLAGS: i64 = 3;       // Flags (1 byte)
+const SOCK_DESC_PROTO_ID: i64 = 4;    // Protocol-specific socket ID (4 bytes)
+const SOCK_DESC_OWNER: i64 = 8;       // Owner PID (8 bytes)
+const SOCK_DESC_LOCAL_IP: i64 = 16;   // Local IP (4 bytes)
+const SOCK_DESC_LOCAL_PORT: i64 = 20; // Local port (2 bytes)
+const SOCK_DESC_REMOTE_IP: i64 = 22;  // Remote IP (4 bytes)
+const SOCK_DESC_REMOTE_PORT: i64 = 26;// Remote port (2 bytes)
+
+// Error codes
+const SOCK_ERR_INVAL: i64 = -1;       // Invalid argument
+const SOCK_ERR_NOBUFS: i64 = -2;      // No buffer space
+const SOCK_ERR_NOPROTOOPT: i64 = -3;  // Protocol not available
+const SOCK_ERR_ADDRINUSE: i64 = -4;   // Address in use
+const SOCK_ERR_NOTCONN: i64 = -5;     // Not connected
+const SOCK_ERR_ISCONN: i64 = -6;      // Already connected
+const SOCK_ERR_CONNREFUSED: i64 = -7; // Connection refused
+const SOCK_ERR_TIMEOUT: i64 = -8;     // Operation timed out
+const SOCK_ERR_WOULDBLOCK: i64 = -9;  // Would block
+
+// ============================================================
+// Socket Descriptor Management
+// ============================================================
+
+// Initialize socket subsystem
+pub fn socket_init() {
+    sock_memset(SOCKET_TABLE_ADDR, 0, MAX_SOCKETS * SOCKET_DESC_SIZE);
+}
+
+// Get socket descriptor address
+fn sock_get_desc(fd: i64) -> i64 {
+    SOCKET_TABLE_ADDR + (fd * SOCKET_DESC_SIZE)
+}
+
+// Allocate socket descriptor
+fn sock_alloc() -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_SOCKETS {
+        let desc = sock_get_desc(i);
+        let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+
+        if sock_type == 0 {
+            sock_memset(desc, 0, SOCKET_DESC_SIZE);
+            sock_write_u64(desc + SOCK_DESC_OWNER, sock_get_current_pid() as u64);
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+// ============================================================
+// Socket API Functions
+// ============================================================
+
+// Create socket
+// Returns: socket fd, or negative error
+pub fn socket(domain: i64, sock_type: i64, protocol: i64) -> i64 {
+    // Validate domain
+    if domain != AF_INET {
+        return SOCK_ERR_NOPROTOOPT;
+    }
+
+    // Validate type
+    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM {
+        return SOCK_ERR_INVAL;
+    }
+
+    // Allocate descriptor
+    let fd = sock_alloc();
+    if fd < 0 {
+        return SOCK_ERR_NOBUFS;
+    }
+
+    let desc = sock_get_desc(fd);
+
+    // Create underlying protocol socket
+    let proto_id = if sock_type == SOCK_STREAM {
+        sock_tcp_socket_create()
+    } else {
+        sock_udp_socket_create()
+    };
+
+    if proto_id < 0 {
+        sock_write_byte(desc + SOCK_DESC_TYPE, 0);  // Free descriptor
+        return SOCK_ERR_NOBUFS;
+    }
+
+    // Initialize descriptor
+    sock_write_byte(desc + SOCK_DESC_TYPE, sock_type);
+    sock_write_byte(desc + SOCK_DESC_FAMILY, domain);
+    sock_write_byte(desc + SOCK_DESC_STATE, SOCKET_STATE_CREATED);
+    sock_write_u32(desc + SOCK_DESC_PROTO_ID, proto_id as u64);
+
+    fd
+}
+
+// Bind socket to address
+pub fn bind(fd: i64, ip: i64, port: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == 0 {
+        return SOCK_ERR_INVAL;
+    }
+
+    let result = if sock_type == SOCK_STREAM {
+        sock_tcp_socket_bind(proto_id, port)
+    } else {
+        sock_udp_socket_bind(proto_id, port)
+    };
+
+    if result < 0 {
+        return result;
+    }
+
+    sock_write_u32(desc + SOCK_DESC_LOCAL_IP, ip as u64);
+    sock_write_u16(desc + SOCK_DESC_LOCAL_PORT, port as u64);
+    sock_write_byte(desc + SOCK_DESC_STATE, SOCKET_STATE_BOUND);
+
+    0
+}
+
+// Listen for connections (TCP only)
+pub fn listen(fd: i64, backlog: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type != SOCK_STREAM {
+        return SOCK_ERR_INVAL;
+    }
+
+    let result = sock_tcp_socket_listen(proto_id, backlog);
+    if result < 0 {
+        return result;
+    }
+
+    sock_write_byte(desc + SOCK_DESC_STATE, SOCKET_STATE_LISTENING);
+
+    0
+}
+
+// Accept connection (TCP only)
+pub fn accept(fd: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type != SOCK_STREAM {
+        return SOCK_ERR_INVAL;
+    }
+
+    let new_proto_id = sock_tcp_socket_accept(proto_id);
+    if new_proto_id < 0 {
+        return new_proto_id;
+    }
+
+    // Allocate new socket descriptor
+    let new_fd = sock_alloc();
+    if new_fd < 0 {
+        return SOCK_ERR_NOBUFS;
+    }
+
+    let new_desc = sock_get_desc(new_fd);
+
+    // Copy socket info
+    sock_write_byte(new_desc + SOCK_DESC_TYPE, SOCK_STREAM);
+    sock_write_byte(new_desc + SOCK_DESC_FAMILY, AF_INET);
+    sock_write_byte(new_desc + SOCK_DESC_STATE, SOCKET_STATE_CONNECTED);
+    sock_write_u32(new_desc + SOCK_DESC_PROTO_ID, new_proto_id as u64);
+
+    // Copy local address
+    let local_ip = sock_read_u32(desc + SOCK_DESC_LOCAL_IP);
+    let local_port = sock_read_u16(desc + SOCK_DESC_LOCAL_PORT);
+    sock_write_u32(new_desc + SOCK_DESC_LOCAL_IP, local_ip);
+    sock_write_u16(new_desc + SOCK_DESC_LOCAL_PORT, local_port);
+
+    new_fd
+}
+
+// Connect to remote
+pub fn connect(fd: i64, ip: i64, port: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == 0 {
+        return SOCK_ERR_INVAL;
+    }
+
+    let result = if sock_type == SOCK_STREAM {
+        sock_tcp_socket_connect(proto_id, ip, port)
+    } else {
+        sock_udp_socket_connect(proto_id, ip, port)
+    };
+
+    if result < 0 {
+        return result;
+    }
+
+    sock_write_u32(desc + SOCK_DESC_REMOTE_IP, ip as u64);
+    sock_write_u16(desc + SOCK_DESC_REMOTE_PORT, port as u64);
+    sock_write_byte(desc + SOCK_DESC_STATE, SOCKET_STATE_CONNECTED);
+
+    0
+}
+
+// Send data
+pub fn send(fd: i64, data: i64, length: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == 0 {
+        return SOCK_ERR_INVAL;
+    }
+
+    if sock_type == SOCK_STREAM {
+        sock_tcp_socket_send(proto_id, data, length)
+    } else {
+        sock_udp_socket_send(proto_id, data, length)
+    }
+}
+
+// Send to specific address (UDP)
+pub fn sendto(fd: i64, data: i64, length: i64, ip: i64, port: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type != SOCK_DGRAM {
+        return SOCK_ERR_INVAL;
+    }
+
+    sock_udp_socket_sendto(proto_id, ip, port, data, length)
+}
+
+// Receive data
+pub fn recv(fd: i64, buffer: i64, max_len: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == 0 {
+        return SOCK_ERR_INVAL;
+    }
+
+    if sock_type == SOCK_STREAM {
+        sock_tcp_socket_recv(proto_id, buffer, max_len)
+    } else {
+        sock_udp_socket_recv(proto_id, buffer, max_len)
+    }
+}
+
+// Receive with source address (UDP)
+pub fn recvfrom(fd: i64, buffer: i64, max_len: i64, src_ip: i64, src_port: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type != SOCK_DGRAM {
+        return SOCK_ERR_INVAL;
+    }
+
+    sock_udp_socket_recvfrom(proto_id, buffer, max_len, src_ip, src_port)
+}
+
+// Close socket
+pub fn close(fd: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return SOCK_ERR_INVAL;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == 0 {
+        return SOCK_ERR_INVAL;
+    }
+
+    // Close underlying socket
+    if sock_type == SOCK_STREAM {
+        sock_tcp_socket_close(proto_id);
+    } else {
+        sock_udp_socket_close(proto_id);
+    }
+
+    // Free descriptor
+    sock_memset(desc, 0, SOCKET_DESC_SIZE);
+
+    0
+}
+
+// Check if data available
+pub fn sock_available(fd: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return 0;
+    }
+
+    let desc = sock_get_desc(fd);
+    let sock_type = sock_read_byte(desc + SOCK_DESC_TYPE);
+    let proto_id = sock_read_u32(desc + SOCK_DESC_PROTO_ID) as i64;
+
+    if sock_type == SOCK_DGRAM {
+        sock_udp_socket_available(proto_id)
+    } else {
+        0  // TCP doesn't have simple available check
+    }
+}
+
+// Get socket state
+pub fn sock_get_state(fd: i64) -> i64 {
+    if fd < 0 || fd >= MAX_SOCKETS {
+        return -1;
+    }
+
+    let desc = sock_get_desc(fd);
+    sock_read_byte(desc + SOCK_DESC_STATE)
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn sock_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn sock_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn sock_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn sock_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn sock_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn sock_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn sock_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn sock_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn sock_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        sock_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+// External functions
+fn sock_get_current_pid() -> i64 { 0 }
+
+// TCP functions
+fn sock_tcp_socket_create() -> i64 { 0 }
+fn sock_tcp_socket_bind(id: i64, port: i64) -> i64 { 0 }
+fn sock_tcp_socket_listen(id: i64, backlog: i64) -> i64 { 0 }
+fn sock_tcp_socket_accept(id: i64) -> i64 { -1 }
+fn sock_tcp_socket_connect(id: i64, ip: i64, port: i64) -> i64 { 0 }
+fn sock_tcp_socket_send(id: i64, data: i64, len: i64) -> i64 { 0 }
+fn sock_tcp_socket_recv(id: i64, buf: i64, len: i64) -> i64 { 0 }
+fn sock_tcp_socket_close(id: i64) -> i64 { 0 }
+
+// UDP functions
+fn sock_udp_socket_create() -> i64 { 0 }
+fn sock_udp_socket_bind(id: i64, port: i64) -> i64 { 0 }
+fn sock_udp_socket_connect(id: i64, ip: i64, port: i64) -> i64 { 0 }
+fn sock_udp_socket_send(id: i64, data: i64, len: i64) -> i64 { 0 }
+fn sock_udp_socket_sendto(id: i64, ip: i64, port: i64, data: i64, len: i64) -> i64 { 0 }
+fn sock_udp_socket_recv(id: i64, buf: i64, len: i64) -> i64 { 0 }
+fn sock_udp_socket_recvfrom(id: i64, buf: i64, len: i64, src_ip: i64, src_port: i64) -> i64 { 0 }
+fn sock_udp_socket_close(id: i64) -> i64 { 0 }
+fn sock_udp_socket_available(id: i64) -> i64 { 0 }

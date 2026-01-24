@@ -16,7 +16,7 @@ const UDP_CHECKSUM: i64 = 6;     // Checksum (2 bytes)
 const UDP_DATA: i64 = 8;         // Data starts here
 
 // UDP Socket Table
-const UDP_SOCKET_TABLE_ADDR: i64 = 0xB22000;
+const UDP_SOCKET_TABLE_ADDR: i64 = 0xD22000;
 const MAX_UDP_SOCKETS: i64 = 32;
 const UDP_SOCKET_SIZE: i64 = 128;  // Per socket structure
 
@@ -43,8 +43,8 @@ const UDP_RX_QUEUE_SIZE: i64 = 8;    // Max packets in queue
 const UDP_RX_ENTRY_SIZE: i64 = 12;   // src_ip(4) + src_port(2) + length(2) + data_offset(4)
 
 // UDP TX/RX Buffers
-const UDP_TX_BUF: i64 = 0xB34000;    // TX buffer (2KB)
-const UDP_RX_BUF: i64 = 0xB34800;    // RX buffer pool (16KB)
+const UDP_TX_BUF: i64 = 0xD34000;    // TX buffer (2KB)
+const UDP_RX_BUF: i64 = 0xD34800;    // RX buffer pool (16KB)
 const UDP_RX_BUF_SIZE: i64 = 2048;   // Per-packet buffer
 const UDP_RX_BUF_COUNT: i64 = 8;     // Number of buffers
 

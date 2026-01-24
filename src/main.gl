@@ -3179,7 +3179,9 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         60 => syscall_net_resolve(arg1),            // SYS_NET_RESOLVE
         61 => syscall_net_ping(arg1, arg2),         // SYS_NET_PING
         62 => syscall_net_arp(arg1, arg2),          // SYS_NET_ARP
-        65 => syscall_net_dhcp(),                   // SYS_NET_DHCP
+        63 => syscall_net_dhcp(),                   // SYS_NET_DHCP
+        64 => syscall_net_getip(),                  // SYS_NET_GETIP
+        65 => syscall_net_getmac(arg1),             // SYS_NET_GETMAC
         66 => syscall_net_poll(),                   // SYS_NET_POLL
         _ => -1,                                // Unknown syscall
     }
@@ -8108,18 +8110,18 @@ fn init_kernel_services() {
 // ============================================================
 
 // Memory map for network stack:
-// 0xB00000 - E1000 TX Descriptors (512B)
-// 0xB00200 - E1000 TX Buffers (64KB)
-// 0xB10200 - E1000 RX Descriptors (512B)
-// 0xB10400 - E1000 RX Buffers (64KB)
-// 0xB20400 - E1000 State (256B)
-// 0xB20500 - ARP Cache (3KB)
-// 0xB21000 - Network Config (4KB)
-// 0xB22000 - UDP Socket Table (8KB)
-// 0xB24000 - TCP Socket Table + Buffers (112KB)
+// 0xD00000 - E1000 TX Descriptors (512B)
+// 0xD00200 - E1000 TX Buffers (64KB)
+// 0xD10200 - E1000 RX Descriptors (512B)
+// 0xD10400 - E1000 RX Buffers (64KB)
+// 0xD20400 - E1000 State (256B)
+// 0xD20500 - ARP Cache (3KB)
+// 0xD21000 - Network Config (4KB)
+// 0xD22000 - UDP Socket Table (8KB)
+// 0xD24000 - TCP Socket Table + Buffers (112KB)
 
 // Network state address
-const NET_INITIALIZED_ADDR: i64 = 0xB3C000;
+const NET_INITIALIZED_ADDR: i64 = 0xD3C000;
 
 // Check if network is initialized
 fn net_is_ready() -> i64 {
@@ -8135,9 +8137,19 @@ fn syscall_net_socket(domain: i64, sock_type: i64, protocol: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call socket(domain, sock_type, protocol)
-    // For now, return placeholder
-    return -1;
+    // Handle simplified call where arg1 is sock_type (1=TCP, 2=UDP)
+    // In that case, domain comes as the sock_type and sock_type/protocol are 0
+    let actual_domain: i64 = if sock_type == 0 && protocol == 0 {
+        2  // AF_INET
+    } else {
+        domain
+    };
+    let actual_type: i64 = if sock_type == 0 && protocol == 0 {
+        domain  // First arg was actually the socket type
+    } else {
+        sock_type
+    };
+    net::net_socket_create(actual_domain, actual_type, 0)
 }
 
 // SYS_NET_BIND - Bind socket to address
@@ -8148,8 +8160,7 @@ fn syscall_net_bind(fd: i64, ip: i64, port: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call bind(fd, ip, port)
-    return -1;
+    net::net_socket_bind(fd, ip, port)
 }
 
 // SYS_NET_LISTEN - Listen for connections
@@ -8159,8 +8170,7 @@ fn syscall_net_listen(fd: i64, backlog: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call listen(fd, backlog)
-    return -1;
+    net::net_socket_listen(fd, backlog)
 }
 
 // SYS_NET_ACCEPT - Accept connection
@@ -8170,8 +8180,7 @@ fn syscall_net_accept(fd: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call accept(fd)
-    return -1;
+    net::net_socket_accept(fd)
 }
 
 // SYS_NET_CONNECT - Connect to remote
@@ -8182,8 +8191,25 @@ fn syscall_net_connect(fd: i64, ip: i64, port: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call connect(fd, ip, port)
-    return -1;
+    // Direct connect path - call tcp.gl's tcp_socket_connect which sends SYN
+    // Socket table at 0xD3A000, desc size 32, type at offset 0, proto_id at offset 4
+    let desc_addr = 0xD3A000 + (fd * 32);
+    let sock_type = read_byte_addr(desc_addr);
+    let proto_id = read_u32_at(desc_addr, 4) as i64;
+
+    if sock_type == 0 {
+        return -1;  // Invalid socket
+    }
+
+    if sock_type == 1 {
+        // TCP (SOCK_STREAM) - call tcp.gl directly
+        net::net_tcp_connect(proto_id, ip, port)
+    } else if sock_type == 2 {
+        // UDP (SOCK_DGRAM)
+        net::net_udp_connect(proto_id, ip, port)
+    } else {
+        -1
+    }
 }
 
 // SYS_NET_SEND - Send data
@@ -8194,8 +8220,25 @@ fn syscall_net_send(fd: i64, buffer: i64, length: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call send(fd, buffer, length)
-    return -1;
+    // Direct send path - bypass socket.gl's incomplete send()
+    // Socket table at 0xD3A000, desc size 32, type at offset 0, proto_id at offset 4
+    let desc_addr = 0xD3A000 + (fd * 32);
+    let sock_type = read_byte_addr(desc_addr);
+    let proto_id = read_u32_at(desc_addr, 4) as i64;
+
+    if sock_type == 0 {
+        return -1;  // Invalid socket
+    }
+
+    if sock_type == 1 {
+        // TCP (SOCK_STREAM)
+        net::net_tcp_send(proto_id, buffer, length)
+    } else if sock_type == 2 {
+        // UDP (SOCK_DGRAM)
+        net::net_udp_send(proto_id, buffer, length)
+    } else {
+        -1  // Unsupported type
+    }
 }
 
 // SYS_NET_RECV - Receive data
@@ -8206,8 +8249,7 @@ fn syscall_net_recv(fd: i64, buffer: i64, max_len: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call recv(fd, buffer, max_len)
-    return -1;
+    net::net_socket_recv(fd, buffer, max_len)
 }
 
 // SYS_NET_CLOSE - Close socket
@@ -8216,20 +8258,20 @@ fn syscall_net_close(fd: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call close(fd)
-    return 0;
+    net::net_socket_close_fd(fd)
 }
 
 // SYS_NET_CONFIG - Configure network (static IP)
 // arg1: IP address
 // arg2: subnet mask
-// arg3: gateway (DNS in high 32 bits - TODO: extend)
+// arg3: gateway
 fn syscall_net_config(ip: i64, mask: i64, gateway: i64) -> i64 {
     if net_is_ready() == 0 {
         return -1;
     }
-    // Would call net_configure(ip, mask, gateway, dns)
-    return 0;
+    // Configure the network stack with static IP
+    // Use gateway as DNS server by default (common setup)
+    net::net_stack_configure(ip, mask, gateway, gateway)
 }
 
 // SYS_NET_STATUS - Get network status
@@ -8239,30 +8281,52 @@ fn syscall_net_status(query: i64) -> i64 {
         0 => net_is_ready(),
         1 => {
             // Link status - read from E1000 state
-            let e1000_state = 0xB20400;
+            let e1000_state = 0xD20400;
             read_byte_addr(e1000_state + 1)  // E1000_STATE_LINK_UP
         }
         2 => {
             // IP address
-            let net_config = 0xB21000;
+            let net_config = 0xD21000;
             read_u32_at(net_config, 0) as i64
         }
         3 => {
             // Subnet mask
-            let net_config = 0xB21000;
+            let net_config = 0xD21000;
             read_u32_at(net_config, 4) as i64
         }
         4 => {
             // Gateway
-            let net_config = 0xB21000;
+            let net_config = 0xD21000;
             read_u32_at(net_config, 8) as i64
         }
         5 => {
             // DNS
-            let net_config = 0xB21000;
+            let net_config = 0xD21000;
             read_u32_at(net_config, 12) as i64
         }
         _ => -1,
+    }
+}
+
+// SYS_NET_GETIP - Get current IP address
+fn syscall_net_getip() -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    let net_config: i64 = 0xD21000;
+    read_u32_at(net_config, 0) as i64
+}
+
+// SYS_NET_GETMAC - Get MAC address
+// arg1: 0 = low 4 bytes, 1 = high 2 bytes
+fn syscall_net_getmac(idx: i64) -> i64 {
+    if net_is_ready() == 0 {
+        return -1;
+    }
+    if idx == 0 {
+        net::net_get_mac_lo()
+    } else {
+        net::net_get_mac_hi()
     }
 }
 
@@ -8520,6 +8584,84 @@ fn net_init() {
     net::net_stack_init();
 }
 
+// Test TCP connection to debug E1000 TX
+fn test_tcp_connection() {
+    // Print "TCP TEST"
+    serial_out(84);  // T
+    serial_out(67);  // C
+    serial_out(80);  // P
+    serial_out(32);  // space
+    serial_out(84);  // T
+    serial_out(69);  // E
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_newline();
+
+    // Wait for QEMU's network to initialize (SLIRP needs time)
+    // QEMU's SLIRP network stack needs significant time to fully initialize
+    // The E1000 RX path doesn't work until QEMU's network backend is ready
+    serial_out(87);  // W - waiting for network
+    let mut init_delay: i64 = 0;
+    while init_delay < 500000000 {  // ~500ms for QEMU cold start
+        init_delay = init_delay + 1;
+    }
+    serial_out(82);  // R - ready
+
+    // Configure network for QEMU (static IP: 10.0.2.15, gateway: 10.0.2.2)
+    net::net_tcp_configure_qemu();
+
+    // Create TCP socket - domain=2 (AF_INET), type=1 (SOCK_STREAM), protocol=0
+    let sock = net::net_socket_create(2, 1, 0);
+    serial_out(83);  // S
+    serial_out(79);  // O
+    serial_out(67);  // C
+    serial_out(75);  // K
+    serial_out(61);  // =
+    if sock >= 0 {
+        serial_print_dec(sock);
+    } else {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+    }
+    serial_newline();
+
+    if sock >= 0 {
+        // Get proto_id from socket descriptor
+        let desc_addr = 0xD3A000 + (sock * 32);
+        let proto_id = read_u32_at(desc_addr, 4) as i64;
+
+        // Connect to gateway 10.0.2.2:80 (QEMU user mode gateway)
+        // 10.0.2.2 = (10 * 16777216) + (0 * 65536) + (2 * 256) + 2 = 167772674
+        let gateway_ip: i64 = 167772674;
+        let port: i64 = 80;
+
+        serial_out(67);  // C
+        serial_out(79);  // O
+        serial_out(78);  // N
+        serial_out(78);  // N
+        serial_out(69);  // E
+        serial_out(67);  // C
+        serial_out(84);  // T
+        serial_newline();
+
+        // This will trigger ARP resolution and send SYN
+        let result = net::net_tcp_connect(proto_id, gateway_ip, port);
+
+        serial_out(82);  // R
+        serial_out(69);  // E
+        serial_out(83);  // S
+        serial_out(61);  // =
+        if result >= 0 {
+            serial_print_dec(result);
+        } else {
+            serial_out(45);  // -
+            serial_print_dec(0 - result);
+        }
+        serial_newline();
+    }
+}
+
 // ============================================================
 // Kernel Entry Point
 // ============================================================
@@ -8585,6 +8727,10 @@ fn _start() {
 
     // Initialize network stack
     net_init();
+
+    // Early TCP test - this will likely fail but it "wakes up" QEMU's network stack
+    // Without this, later network operations fail because QEMU hasn't initialized its network
+    test_tcp_connection();
 
     // Test PCI 32-bit port I/O
     test_pci_ports();

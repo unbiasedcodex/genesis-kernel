@@ -43,7 +43,7 @@ const TCP_STATE_LAST_ACK: i64 = 9;
 const TCP_STATE_TIME_WAIT: i64 = 10;
 
 // TCP Socket Table
-const TCP_SOCKET_TABLE_ADDR: i64 = 0xB24000;
+const TCP_SOCKET_TABLE_ADDR: i64 = 0xD24000;
 const MAX_TCP_SOCKETS: i64 = 32;
 const TCP_SOCKET_SIZE: i64 = 256;
 
@@ -89,15 +89,43 @@ const TCP_SOCK_ACCEPT_QUEUE: i64 = 112; // Accept queue (8 entries * 4 bytes)
 // Buffer sizes
 const TCP_RX_BUFFER_SIZE: i64 = 8192;
 const TCP_TX_BUFFER_SIZE: i64 = 8192;
-const TCP_BUFFER_POOL_ADDR: i64 = 0xB28000;  // Buffer pool start
+const TCP_BUFFER_POOL_ADDR: i64 = 0xD28000;  // Buffer pool start
 
 // TCP TX buffer
-const TCP_TX_BUF: i64 = 0xB38000;      // TX packet buffer (2KB)
+const TCP_TX_BUF: i64 = 0xD38000;      // TX packet buffer (2KB)
 
 // Default values
 const TCP_DEFAULT_WINDOW: i64 = 8192;
 const TCP_DEFAULT_RTO: i64 = 300;       // 3 seconds at 100Hz
 const TCP_MSL: i64 = 12000;             // 2 minutes at 100Hz
+
+// E1000 RX constants
+const TCP_E1000_RX_DESC_ADDR: i64 = 0xD10200;
+const TCP_E1000_RX_BUF_ADDR: i64 = 0xD10400;
+const TCP_E1000_RX_DESC_SIZE: i64 = 16;
+const TCP_E1000_NUM_RX_DESC: i64 = 32;
+const TCP_E1000_STATE_RX_CUR: i64 = 36;
+const TCP_E1000_RDT: i64 = 0x2818;
+
+// E1000 state (shared with e1000.gl) - MUST be before functions that use them
+const TCP_E1000_STATE_ADDR: i64 = 0xD20400;
+const TCP_E1000_STATE_MMIO_BASE: i64 = 8;
+const TCP_E1000_STATE_MAC: i64 = 16;
+const TCP_E1000_STATE_TX_CUR: i64 = 32;
+const TCP_E1000_STATE_TX_COUNT: i64 = 40;
+const TCP_E1000_STATE_PRESENT: i64 = 0;
+const TCP_E1000_STATE_BUS: i64 = 56;
+const TCP_E1000_STATE_DEVICE: i64 = 57;
+const TCP_E1000_STATE_FUNC: i64 = 58;
+const TCP_E1000_TX_DESC_ADDR: i64 = 0xD00000;
+const TCP_E1000_TX_BUF_ADDR: i64 = 0xD00200;
+const TCP_E1000_TX_DESC_SIZE: i64 = 16;
+const TCP_E1000_NUM_TX_DESC: i64 = 32;
+const TCP_E1000_BUF_SIZE: i64 = 2048;
+const TCP_E1000_TDT: i64 = 0x3818;
+const TCP_TDESC_CMD_EOP: i64 = 0x01;
+const TCP_TDESC_CMD_IFCS: i64 = 0x02;
+const TCP_TDESC_CMD_RS: i64 = 0x08;
 const TCP_MAX_RETRIES: i64 = 5;
 
 // Ephemeral ports
@@ -311,14 +339,752 @@ pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i
     tcp_write_u32(sock + TCP_SOCK_SND_UNA, iss as u64);
     tcp_write_u32(sock + TCP_SOCK_SND_NXT, (iss + 1) as u64);
 
-    // Send SYN
-    tcp_send_segment(socket_id, TCP_SYN, 0, 0);
-
-    // Update state
+    // Update state to SYN_SENT
     tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_SYN_SENT);
     tcp_write_u64(sock + TCP_SOCK_LAST_ACT, tcp_get_ticks() as u64);
 
-    0
+    // DON'T drain packets - they might be useful (ARP replies, etc)
+    // Instead, sync rx_cur to current RDH so we start fresh for new packets
+    // Any packets that arrived before this point are processed by the precheck loop
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    let rdh_addr = base + 0x2810;
+    let mut drain_rdh: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") rdh_addr,
+            lateout("eax") drain_rdh,
+            options(nostack, att_syntax)
+        );
+    }
+    // Show current rx_cur and RDH
+    let drain_rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+    tcp_debug_char(91);  // '['
+    tcp_debug_dec(drain_rx_cur);
+    tcp_debug_char(45);  // '-'
+    tcp_debug_dec(drain_rdh);
+    tcp_debug_char(93);  // ']'
+    // NOTE: Don't sync rx_cur here - let precheck loop handle pending packets
+
+    // Reset RDT to make all descriptors available
+    tcp_e1000_write_reg(TCP_E1000_RDT, 31);
+    // Verify RDT was set
+    let rdt_verify = tcp_e1000_read_reg(TCP_E1000_RDT);
+    tcp_debug_char(33);  // '!' - RX reset
+    tcp_debug_dec(rdt_verify);
+
+    // Long delay before SYN to ensure receiver is fully ready
+    tcp_debug_char(87);  // 'W' - waiting
+    let mut pre_syn_delay: i64 = 0;
+    while pre_syn_delay < 5000000 {
+        pre_syn_delay = pre_syn_delay + 1;
+    }
+    tcp_debug_char(71);  // 'G' - go
+
+    // Send SYN
+    let syn_result = tcp_send_segment(socket_id, TCP_SYN, 0, 0);
+
+    // Debug: Show SYN result
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_char(82);  // 'R'
+    tcp_debug_char(61);  // '='
+    tcp_debug_dec(syn_result);
+    tcp_debug_char(10);
+
+    if syn_result == 0 {
+        // Failed to send SYN (probably ARP issue)
+        tcp_debug_char(70);  // 'F'
+        tcp_debug_char(65);  // 'A'
+        tcp_debug_char(73);  // 'I'
+        tcp_debug_char(76);  // 'L'
+        tcp_debug_char(10);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+        return -4;
+    };
+
+    // Debug: SYN sent successfully, entering poll phase
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(79);  // 'O'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_char(10);
+
+    // Wait for SYN-ACK and transition to ESTABLISHED
+    // Reset poll counter for fresh debug output
+    tcp_write_u32(TCP_DEBUG_POLL_ADDR as u64, 0);
+
+    // LIGHT SYNC: Don't disable receiver (would drop incoming SYN-ACK!)
+    // Just sync rx_cur with RDH and ensure RDT is high
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+
+    // Read current RDH using direct asm (compiler bug workaround)
+    let rdh_addr = base + 0x2810;
+    let mut rdh_now: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") rdh_addr,
+            lateout("eax") rdh_now,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // DON'T sync rx_cur with RDH - that would skip packets that already arrived!
+    // Instead, process all packets from current rx_cur up to RDH
+    let old_rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+    tcp_debug_char(60);  // '<'
+    tcp_debug_dec(old_rx_cur);
+    tcp_debug_char(45);  // '-'
+    tcp_debug_dec(rdh_now);
+    tcp_debug_char(62);  // '>'
+    tcp_debug_char(10);
+
+    // Process any packets that arrived before we started polling
+    // This catches ARP replies, SYN-ACKs that arrived quickly, etc.
+    while old_rx_cur != rdh_now {
+        let precheck_desc = TCP_E1000_RX_DESC_ADDR + (old_rx_cur * TCP_E1000_RX_DESC_SIZE);
+        let precheck_status = tcp_read_byte(precheck_desc + 12);
+        tcp_debug_char(80);  // 'P'
+        tcp_debug_dec(old_rx_cur);
+        tcp_debug_char(58);  // ':'
+        tcp_debug_hex_byte(precheck_status);
+
+        // Check if DD is set
+        if (precheck_status % 2) == 1 {
+            // Get packet length
+            let precheck_len = tcp_read_u16(precheck_desc + 8) as i64;
+            tcp_debug_char(76);  // 'L'
+            tcp_debug_dec(precheck_len);
+
+            // Dump first 16 bytes of packet to see what's actually there
+            // Buffer is at RX_BUF_ADDR + (descriptor_index * 2048)
+            let buf_addr = TCP_E1000_RX_BUF_ADDR + (old_rx_cur * 2048);
+            tcp_debug_char(91);  // '['
+            let mut dump_i: i64 = 0;
+            while dump_i < 16 {
+                tcp_debug_hex_byte(tcp_read_byte(buf_addr + dump_i));
+                dump_i = dump_i + 1;
+            }
+            tcp_debug_char(93);  // ']'
+
+            // Update rx_cur to point to this packet
+            tcp_write_u32((TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as u64, old_rx_cur as u64);
+
+            // Process this packet
+            if precheck_len > 0 {
+                tcp_poll_incoming_with_len(precheck_len);
+            }
+        } else {
+            // No DD bit - clear it and move on
+            tcp_debug_char(45);  // '-'
+        }
+
+        // Advance to next descriptor
+        old_rx_cur = (old_rx_cur + 1) % 32;
+        tcp_write_u32((TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as u64, old_rx_cur as u64);
+    }
+    tcp_debug_char(10);
+
+    // Check if descriptor at rdh_now already has a packet (DD=1)
+    // This can happen if SYN-ACK arrived very quickly via QEMU NAT
+    let desc_addr = TCP_E1000_RX_DESC_ADDR + (rdh_now * TCP_E1000_RX_DESC_SIZE);
+    let existing_status = tcp_read_byte(desc_addr + 12);
+
+    tcp_debug_char(42);  // '*'
+    tcp_debug_hex_byte(rdh_now);  // Show where we're starting from
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex_byte(existing_status);  // Show existing status
+
+    // Don't clear descriptors - they were set up by e1000_init_rx()
+    // Just verify the state
+    tcp_debug_char(42);  // '*'
+    tcp_debug_hex_byte(rdh_now);
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex_byte(existing_status);
+    tcp_debug_char(10);  // newline
+
+    // Ensure RDT is at 31 (all descriptors available)
+    tcp_e1000_write_reg(TCP_E1000_RDT, 31);
+
+    // NOTE: DO NOT write to RCTL here!
+    // RCTL was already configured during e1000_init_rx().
+    // Writing to RCTL triggers a 1-second timer in QEMU E1000 emulation
+    // during which e1000_can_receive() returns FALSE and no packets are received!
+
+    // Debug: Show MMIO base address
+    let mmio_base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    tcp_debug_char(77);  // 'M'
+    tcp_debug_char(77);  // 'M'
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(79);  // 'O'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex(mmio_base);
+    tcp_debug_char(10);
+
+    // Debug: Verify E1000 register state before polling
+    let rdbal_check = tcp_e1000_read_reg(TCP_E1000_RDBAL);
+    let rdbah_check = tcp_e1000_read_reg(0x2804);  // RDBAH (should be 0)
+    let rdlen_check = tcp_e1000_read_reg(0x2808);  // RDLEN
+    let rdt_check = tcp_e1000_read_reg(TCP_E1000_RDT);
+    let rdh_now2 = tcp_e1000_read_reg(TCP_E1000_RDH);
+    let rctl_check = tcp_e1000_read_reg(TCP_E1000_RCTL);
+    // Show RDBAH if non-zero
+    if rdbah_check != 0 {
+        tcp_debug_char(72);  // 'H'
+        tcp_debug_hex(rdbah_check);
+    }
+    let ral_check = tcp_e1000_read_reg(TCP_E1000_RAL0);
+    let rah_check = tcp_e1000_read_reg(TCP_E1000_RAH0);
+    tcp_debug_char(10);  // newline
+    tcp_debug_char(69);  // 'E'
+    tcp_debug_char(49);  // '1'
+    tcp_debug_char(75);  // 'K'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex(rdbal_check);  // RDBAL
+    tcp_debug_char(47);  // '/'
+    tcp_debug_hex(rdlen_check);  // RDLEN
+    tcp_debug_char(47);  // '/'
+    tcp_debug_dec(rdh_now2);  // RDH
+    tcp_debug_char(45);  // '-'
+    tcp_debug_dec(rdt_check);  // RDT
+    tcp_debug_char(47);  // '/'
+    tcp_debug_hex(rctl_check);  // RCTL
+    tcp_debug_char(10);  // newline
+    tcp_debug_char(77);  // 'M'
+    tcp_debug_char(65);  // 'A'
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex(ral_check);  // RAL0
+    tcp_debug_hex(rah_check);  // RAH0
+    // Check error counters
+    let mpc = tcp_e1000_read_reg(0x4010);  // Missed Packets Count
+    let rnbc = tcp_e1000_read_reg(0x40A0); // Receive No Buffers Count
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(77);  // 'M'
+    tcp_debug_hex(mpc);
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(78);  // 'N'
+    tcp_debug_hex(rnbc);
+    tcp_debug_char(10);  // newline
+
+    // More stats: GPRC (good packets), TPR (total packets), CRCERRS
+    let gprc = tcp_e1000_read_reg(0x4074);  // Good Packets Received Count
+    let tpr = tcp_e1000_read_reg(0x40D0);   // Total Packets Received
+    let crcerrs = tcp_e1000_read_reg(0x4000);  // CRC Errors
+    let rlec = tcp_e1000_read_reg(0x4040);  // Receive Length Error Count
+    let mpc = tcp_e1000_read_reg(0x4010);   // Missed Packets Count
+    let rctl = tcp_e1000_read_reg(0x0100);  // Receive Control Register
+    tcp_debug_char(71);  // 'G'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(82);  // 'R'
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_dec(gprc);
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_dec(tpr);
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_dec(crcerrs);
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_dec(rlec);  // Length errors
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(77);  // 'M'
+    tcp_debug_dec(mpc);   // Missed packets
+    tcp_debug_char(47);  // '/'
+    tcp_debug_char(82);  // 'R'
+    tcp_debug_hex(rctl);  // RCTL value
+    tcp_debug_char(10);
+
+    // DIAGNOSTIC: Fill RX buffer at descriptor 6 (next to receive) with pattern 0xDD
+    // If E1000 writes a packet, this pattern will be overwritten
+    let cur_rdh = tcp_e1000_read_reg(TCP_E1000_RDH);
+    let test_buf = TCP_E1000_RX_BUF_ADDR + (cur_rdh * TCP_E1000_BUF_SIZE);
+    tcp_debug_char(70);  // 'F'
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_hex(test_buf);
+    tcp_debug_char(10);
+    let mut fi: i64 = 0;
+    while fi < 64 {
+        tcp_write_byte(test_buf + fi, 0xDD);
+        fi = fi + 1;
+    }
+
+    let mut attempts: i64 = 0;
+    tcp_debug_char(76);  // 'L' - Loop starting
+    tcp_debug_char(79);  // 'O'
+    tcp_debug_char(79);  // 'O'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(10);
+
+    while attempts < 10000 {  // Very long timeout for internet latency through SLIRP
+        // Debug: show iteration number at start
+        if attempts < 10 {
+            tcp_debug_char(46);  // '.'
+        }
+
+        // Busy wait loop - longer for real TCP connections
+        let mut wait: i64 = 0;
+        while wait < 1000000 {
+            wait = wait + 1;
+        }
+
+        // Read ICR to clear any pending interrupts and "wake up" hardware
+        let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+        let icr_addr = base + 0x00C0;  // ICR register
+        let mut icr_val: i64 = 0;
+        unsafe {
+            asm!(
+                "mfence
+                 movl (%rdi), %eax
+                 mfence",
+                in("rdi") icr_addr,
+                lateout("eax") icr_val,
+                options(nostack, att_syntax)
+            );
+        }
+
+        // Debug: On attempt 0, scan ALL descriptors for DD bits
+        if attempts == 0 {
+            tcp_debug_char(10);  // newline
+            tcp_debug_char(83);  // 'S'
+            tcp_debug_char(67);  // 'C'
+            tcp_debug_char(65);  // 'A'
+            tcp_debug_char(78);  // 'N'
+            tcp_debug_char(58);  // ':'
+            let mut di: i64 = 0;
+            while di < 32 {
+                let d_addr = 0xD10200 + (di * 16);
+                let status = tcp_read_byte(d_addr + 12);
+                if status != 0 {
+                    tcp_debug_dec(di);
+                    tcp_debug_char(61);  // '='
+                    tcp_debug_hex_byte(status);
+                    tcp_debug_char(32);  // space
+                }
+                di = di + 1;
+            }
+            tcp_debug_char(10);  // newline
+
+            // Debug: Show ALL 16 bytes of descriptor 0 to see full content
+            let desc0_addr: i64 = 0xD10200;
+            tcp_debug_char(68);  // 'D'
+            tcp_debug_char(48);  // '0'
+            tcp_debug_char(58);  // ':'
+            let mut db: i64 = 0;
+            while db < 16 {
+                tcp_debug_hex_byte(tcp_read_byte(desc0_addr + db));
+                db = db + 1;
+            }
+            tcp_debug_char(10);
+
+            // Debug: Show descriptor 2's buffer address and first 14 bytes of buffer
+            // This helps diagnose if E1000 is writing data but not setting DD
+            let desc2_addr: i64 = 0xD10200 + (2 * 16);
+            let desc2_buf = tcp_read_u64(desc2_addr) as i64;
+            tcp_debug_char(68);  // 'D'
+            tcp_debug_char(50);  // '2'
+            tcp_debug_char(66);  // 'B'
+            tcp_debug_char(58);  // ':'
+            tcp_debug_hex(desc2_buf);
+            tcp_debug_char(10);
+
+            // Show first 14 bytes of buffer 2 (dest MAC + src MAC + ethertype)
+            tcp_debug_char(68);  // 'D'
+            tcp_debug_char(50);  // '2'
+            tcp_debug_char(68);  // 'D'
+            tcp_debug_char(58);  // ':'
+            let buf2_addr = 0xD10400 + (2 * 2048);  // Expected: 0xD11400
+            let mut bi: i64 = 0;
+            while bi < 14 {
+                tcp_debug_hex_byte(tcp_read_byte(buf2_addr + bi));
+                bi = bi + 1;
+            }
+            tcp_debug_char(10);
+
+            // Also show descriptor 2's length and status fields
+            let desc2_len = tcp_read_u16(desc2_addr + 8) as i64;
+            let desc2_stat = tcp_read_byte(desc2_addr + 12);
+            let desc2_err = tcp_read_byte(desc2_addr + 13);
+            tcp_debug_char(68);  // 'D'
+            tcp_debug_char(50);  // '2'
+            tcp_debug_char(83);  // 'S'
+            tcp_debug_char(58);  // ':'
+            tcp_debug_char(76);  // 'L'
+            tcp_debug_dec(desc2_len);
+            tcp_debug_char(47);  // '/'
+            tcp_debug_char(83);  // 'S'
+            tcp_debug_hex_byte(desc2_stat);
+            tcp_debug_char(47);  // '/'
+            tcp_debug_char(69);  // 'E'
+            tcp_debug_hex_byte(desc2_err);
+            tcp_debug_char(10);
+        }
+        // Debug: Show ICR and RDH on first few attempts
+        if attempts < 3 {
+            let rdh_check = tcp_e1000_read_reg(TCP_E1000_RDH);
+            tcp_debug_char(91);  // '['
+            tcp_debug_dec(attempts);
+            tcp_debug_char(72);  // 'H'
+            tcp_debug_dec(rdh_check);
+            tcp_debug_char(73);  // 'I'
+            tcp_debug_hex_byte(icr_val);
+            tcp_debug_char(93);  // ']'
+        }
+
+        // Keep RDT at 31 using direct ASM (compiler bug workaround)
+        let rdt_wr_addr = base + 0x2818;
+        let rdt_val: i64 = 31;
+        unsafe {
+            asm!(
+                "mfence
+                 movl %esi, (%rdi)
+                 mfence",
+                in("rdi") rdt_wr_addr,
+                in("esi") rdt_val,
+                options(nostack, att_syntax)
+            );
+        }
+
+        // Process all packets between rx_cur and RDH incrementally (don't blindly sync)
+        let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+        let rdh_addr = base + 0x2810;  // RDH
+        let rdt_addr = base + 0x2818;  // RDT
+        let mut rdh_now: i64 = 0;
+        unsafe {
+            asm!(
+                "mfence
+                 movl (%rdi), %eax
+                 mfence",
+                in("rdi") rdh_addr,
+                lateout("eax") rdh_now,
+                options(nostack, att_syntax)
+            );
+        }
+        // Don't blindly sync rx_cur with RDH - that skips packets!
+        // Instead, process all available packets via tcp_e1000_recv_check which uses rx_cur
+
+        // Debug: show rx_cur, RDH, and RDT on all attempts
+        let cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+        let mut rdh_val: i64 = 0;
+        let mut rdt_val: i64 = 0;
+        unsafe {
+            asm!(
+                "mfence
+                 movl (%rdi), %eax
+                 mfence",
+                in("rdi") rdh_addr,
+                lateout("eax") rdh_val,
+                options(nostack, att_syntax)
+            );
+        }
+        unsafe {
+            asm!(
+                "mfence
+                 movl (%rdi), %eax
+                 mfence",
+                in("rdi") rdt_addr,
+                lateout("eax") rdt_val,
+                options(nostack, att_syntax)
+            );
+        }
+        // Show progress: H=RDH, T=RDT, C=cur (using fixed tcp_e1000_read_reg)
+        if attempts % 500 == 0 {
+            tcp_debug_char(10);  // newline
+            tcp_debug_char(64);  // '@'
+            tcp_debug_dec(attempts);
+            tcp_debug_char(72);  // 'H'
+            // Test the fixed tcp_e1000_read_reg by reading RDH
+            let rdh_test = tcp_e1000_read_reg(0x2810);
+            tcp_debug_dec(rdh_test);
+            tcp_debug_char(84);  // 'T'
+            tcp_debug_dec(rdt_val);
+            tcp_debug_char(67);  // 'C'
+            tcp_debug_dec(cur);
+            // Also show GPRC (good packets received) to see if E1000 sees packets
+            let gprc_now = tcp_e1000_read_reg(0x4074);
+            tcp_debug_char(71);  // 'G'
+            tcp_debug_dec(gprc_now);
+
+            // Show RXERRC (receive error count) and buffer address at RDH
+            if attempts == 0 {
+                let rxerrc = tcp_e1000_read_reg(0x400C);  // RXERRC
+                let algnerrc = tcp_e1000_read_reg(0x4004); // Alignment Error
+                tcp_debug_char(10);
+                tcp_debug_char(69);  // 'E'
+                tcp_debug_char(82);  // 'R'
+                tcp_debug_char(82);  // 'R'
+                tcp_debug_char(58);  // ':'
+                tcp_debug_dec(rxerrc);
+                tcp_debug_char(47);  // '/'
+                tcp_debug_dec(algnerrc);
+
+                // Show buffer address in descriptor at RDH
+                let rdh_desc = TCP_E1000_RX_DESC_ADDR + (rdh_test * TCP_E1000_RX_DESC_SIZE);
+                let buf_addr_in_desc = tcp_read_u64(rdh_desc) as i64;
+                tcp_debug_char(10);
+                tcp_debug_char(66);  // 'B'
+                tcp_debug_char(85);  // 'U'
+                tcp_debug_char(70);  // 'F'
+                tcp_debug_char(64);  // '@'
+                tcp_debug_dec(rdh_test);
+                tcp_debug_char(61);  // '='
+                tcp_debug_hex(buf_addr_in_desc);
+
+                // Show first 16 bytes of buffer at RDH
+                let rdh_buf = TCP_E1000_RX_BUF_ADDR + (rdh_test * TCP_E1000_BUF_SIZE);
+                tcp_debug_char(91);  // '['
+                let mut bi: i64 = 0;
+                while bi < 16 {
+                    tcp_debug_hex_byte(tcp_read_byte(rdh_buf + bi));
+                    bi = bi + 1;
+                }
+                tcp_debug_char(93);  // ']'
+                tcp_debug_char(10);
+            }
+
+            // CRITICAL: Scan ALL 32 descriptors periodically to find SYN-ACK
+            tcp_debug_char(123);  // '{'
+            let mut scan: i64 = 0;
+            let mut any_found: i64 = 0;
+            while scan < 32 {
+                let scan_desc = TCP_E1000_RX_DESC_ADDR + (scan * TCP_E1000_RX_DESC_SIZE);
+                let scan_status_addr = scan_desc + 12;
+                let mut scan_status: i64 = 0;
+                unsafe {
+                    asm!(
+                        "mfence
+                         lfence
+                         movzbq (%rdi), %rax",
+                        in("rdi") scan_status_addr,
+                        lateout("rax") scan_status,
+                        options(nostack, att_syntax)
+                    );
+                }
+                if (scan_status % 2) == 1 {
+                    // DD bit set - packet available!
+                    tcp_debug_dec(scan);
+                    tcp_debug_char(33);  // '!'
+                    any_found = 1;
+                }
+                scan = scan + 1;
+            }
+            if any_found == 0 {
+                tcp_debug_char(45);  // '-' = none
+            }
+            tcp_debug_char(125);  // '}'
+
+            // Check if test buffer was overwritten (first byte should be 0xDD if not)
+            let test_byte = tcp_read_byte(test_buf);
+            if test_byte != 0xDD {
+                tcp_debug_char(87);  // 'W' = Written!
+                tcp_debug_hex_byte(test_byte);
+            }
+            tcp_debug_char(32);  // space
+        }
+
+        // Debug: show rx_cur and DD status before polling
+        if attempts < 5 {
+            let dbg_rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+            let dbg_desc_addr = TCP_E1000_RX_DESC_ADDR + (dbg_rx_cur * TCP_E1000_RX_DESC_SIZE);
+            let mut dbg_status: i64 = 0;
+            let dbg_status_addr = dbg_desc_addr + 12;
+            unsafe {
+                asm!(
+                    "mfence
+                     lfence
+                     movzbq (%rdi), %rax
+                     mfence",
+                    in("rdi") dbg_status_addr,
+                    lateout("rax") dbg_status,
+                    options(nostack, att_syntax)
+                );
+            }
+            tcp_debug_char(60);  // '<'
+            tcp_debug_dec(dbg_rx_cur);
+            tcp_debug_char(58);  // ':'
+            tcp_debug_hex_byte(dbg_status);
+            tcp_debug_char(62);  // '>'
+        }
+
+        // Process ALL available packets (not just one)
+        let mut processed: i64 = 0;
+        let mut pkt_len: i64 = tcp_e1000_recv_check();
+        while pkt_len > 0 && processed < 32 {
+            // Packet found! Process it - pass length to avoid redundant recv_check
+            tcp_debug_char(33);  // '!' packet found
+            tcp_poll_incoming_with_len(pkt_len);
+            processed = processed + 1;
+            pkt_len = tcp_e1000_recv_check();
+        }
+
+        // Check if no packets were found
+        if processed == 0 {
+            if attempts == 0 {
+                // Check RCTL to see if receiver is still enabled
+                let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+                let rctl_addr = base + 0x0100;
+                let mut rctl_now: i64 = 0;
+                unsafe {
+                    asm!(
+                        "mfence
+                         movl (%rdi), %eax
+                         mfence",
+                        in("rdi") rctl_addr,
+                        lateout("eax") rctl_now,
+                        options(nostack, att_syntax)
+                    );
+                }
+                tcp_debug_char(67);  // 'C'
+                tcp_debug_hex(rctl_now);
+
+                // Check if EN bit (bit 1) is set
+                if (rctl_now % 4) / 2 == 1 {
+                    tcp_debug_char(69);  // 'E' = enabled
+                } else {
+                    tcp_debug_char(68);  // 'D' = disabled!
+                }
+
+                // Scan ALL 32 descriptors to find any with DD bit set
+                tcp_debug_char(91);  // '['
+                let mut found_any: i64 = 0;
+                let mut dd: i64 = 0;
+                while dd < 32 {
+                    let dd_addr = 0xD10200 + (dd * 16);
+                    let dd_status = tcp_read_byte(dd_addr + 12);
+                    if (dd_status % 2) == 1 {  // DD bit set
+                        tcp_debug_dec(dd);
+                        tcp_debug_char(58);  // ':'
+                        tcp_debug_hex_byte(dd_status);
+                        tcp_debug_char(32);  // space
+                        found_any = 1;
+                    }
+                    dd = dd + 1;
+                }
+                if found_any == 0 {
+                    tcp_debug_char(45);  // '-' = none found
+                }
+                tcp_debug_char(93);  // ']'
+
+                // Check descriptor 2 using DIRECT ASM with memory barriers
+                // This ensures we read actual DMA-written values, not cached
+                let desc2 = 0xD10200 + (2 * 16);
+                let mut desc2_buf_addr: i64 = 0;
+                let mut desc2_status: i64 = 0;
+                let mut desc2_len: i64 = 0;
+                unsafe {
+                    asm!(
+                        "mfence
+                         lfence
+                         movq (%rdi), %rax
+                         mfence",
+                        in("rdi") desc2,
+                        lateout("rax") desc2_buf_addr,
+                        options(nostack, att_syntax)
+                    );
+                }
+                let status_addr = desc2 + 12;
+                unsafe {
+                    asm!(
+                        "mfence
+                         lfence
+                         movzbq (%rdi), %rax
+                         mfence",
+                        in("rdi") status_addr,
+                        lateout("rax") desc2_status,
+                        options(nostack, att_syntax)
+                    );
+                }
+                let len_addr = desc2 + 8;
+                unsafe {
+                    asm!(
+                        "mfence
+                         lfence
+                         movzwq (%rdi), %rax
+                         mfence",
+                        in("rdi") len_addr,
+                        lateout("rax") desc2_len,
+                        options(nostack, att_syntax)
+                    );
+                }
+                tcp_debug_char(10);
+                tcp_debug_char(68);  // 'D'
+                tcp_debug_char(50);  // '2'
+                tcp_debug_char(58);  // ':'
+                tcp_debug_hex(desc2_buf_addr);
+                tcp_debug_char(47);  // '/'
+                tcp_debug_hex_byte(desc2_status);
+                tcp_debug_char(47);  // '/'
+                tcp_debug_dec(desc2_len);
+
+                // Verify buffer 2 with direct ASM read
+                let buf2 = desc2_buf_addr;
+                tcp_debug_char(10);
+                tcp_debug_char(66);  // 'B'
+                tcp_debug_char(58);  // ':'
+                let mut bb: i64 = 0;
+                while bb < 6 {
+                    let byte_addr = buf2 + bb;
+                    let mut byte_val: i64 = 0;
+                    unsafe {
+                        asm!(
+                            "mfence
+                             lfence
+                             movzbq (%rdi), %rax
+                             mfence",
+                            in("rdi") byte_addr,
+                            lateout("rax") byte_val,
+                            options(nostack, att_syntax)
+                        );
+                    }
+                    tcp_debug_hex_byte(byte_val);
+                    bb = bb + 1;
+                }
+            }
+            if attempts < 3 {
+                tcp_debug_char(78);  // 'N' - no packet
+            }
+        }
+
+        // Check if state changed to ESTABLISHED
+        let new_state = tcp_read_byte(sock + TCP_SOCK_STATE);
+        if new_state == TCP_STATE_ESTABLISHED {
+            tcp_debug_char(79);  // 'O' - OK established
+            tcp_debug_char(75);  // 'K'
+            tcp_debug_char(10);
+            return 0;  // Success!
+        }
+        if new_state == TCP_STATE_CLOSED {
+            tcp_debug_char(82);  // 'R' - Reset/closed
+            tcp_debug_char(83);  // 'S'
+            tcp_debug_char(84);  // 'T'
+            tcp_debug_char(10);
+            return -5;  // Connection reset
+        }
+
+        attempts = attempts + 1;
+    }
+
+    // Timeout - connection failed
+    tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+
+    // FINAL DEBUG: Show how many attempts ran
+    tcp_debug_char(70);  // 'F'
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(78);  // 'N'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_dec(attempts);
+    tcp_debug_char(10);
+
+    return -6;  // Timeout
 }
 
 // Close socket
@@ -381,36 +1147,45 @@ fn tcp_gen_iss() -> i64 {
     (ticks * 1103515245 + 12345) % 0x100000000
 }
 
-// Calculate TCP checksum
+// Calculate TCP checksum (RFC 793)
+// Uses pseudo-header + TCP header + data
 fn tcp_checksum(src_ip: i64, dst_ip: i64, tcp_data: i64, tcp_len: i64) -> i64 {
     let mut sum: i64 = 0;
 
-    // Pseudo-header
-    sum = sum + ((src_ip / 65536) % 65536);
-    sum = sum + (src_ip % 65536);
-    sum = sum + ((dst_ip / 65536) % 65536);
-    sum = sum + (dst_ip % 65536);
-    sum = sum + 6;  // TCP protocol
-    sum = sum + tcp_len;
+    // Pseudo-header: src_ip (4B) + dst_ip (4B) + 0 + protocol (1B) + tcp_len (2B)
+    // Source IP (2 words)
+    sum = sum + ((src_ip / 65536) % 65536);  // High word
+    sum = sum + (src_ip % 65536);             // Low word
 
-    // TCP segment
+    // Dest IP (2 words)
+    sum = sum + ((dst_ip / 65536) % 65536);  // High word
+    sum = sum + (dst_ip % 65536);             // Low word
+
+    // Protocol (TCP = 6) and TCP length
+    sum = sum + 6;        // Protocol
+    sum = sum + tcp_len;  // TCP length
+
+    // Sum TCP header + data (16-bit words)
     let mut i: i64 = 0;
     while i < tcp_len - 1 {
-        let word = (tcp_read_byte(tcp_data + i) * 256) +
-                    tcp_read_byte(tcp_data + i + 1);
+        let word = (tcp_read_byte(tcp_data + i) * 256) + tcp_read_byte(tcp_data + i + 1);
         sum = sum + word;
         i = i + 2;
     }
 
-    if tcp_len % 2 == 1 {
+    // Handle odd byte at end
+    if (tcp_len % 2) == 1 {
         sum = sum + (tcp_read_byte(tcp_data + tcp_len - 1) * 256);
     }
 
+    // Fold 32-bit sum to 16 bits (add carries)
     while sum > 65535 {
         sum = (sum % 65536) + (sum / 65536);
     }
 
-    (65535 - sum) % 65536
+    // One's complement
+    let checksum = 65535 - sum;
+    checksum
 }
 
 // Send TCP segment
@@ -458,6 +1233,13 @@ fn tcp_send_segment(socket_id: i64, flags: i64, data: i64, data_len: i64) -> i64
     // Calculate checksum
     let src_ip = tcp_net_get_ip();
     let checksum = tcp_checksum(src_ip, remote_ip, pkt, total_len);
+
+    // Debug: show TCP checksum
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_hex(checksum);
+    tcp_debug_char(10);
+
     tcp_write_u16_be(pkt + TCP_CHECKSUM, checksum);
 
     // Update SND.NXT
@@ -537,6 +1319,14 @@ fn tcp_find_socket(local_port: i64, remote_ip: i64, remote_port: i64) -> i64 {
 
 // Handle incoming TCP packet
 pub fn tcp_handle_packet(ip_header: i64, payload: i64, length: i64) {
+    // Debug: TCP packet received
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(33);  // '!'
+    tcp_debug_dec(length);
+    tcp_debug_char(10);
+
     if length < TCP_MIN_HEADER_SIZE {
         return;
     }
@@ -547,6 +1337,18 @@ pub fn tcp_handle_packet(ip_header: i64, payload: i64, length: i64) {
     let ack_num = tcp_read_u32_be(payload + TCP_ACK_NUM);
     let data_off = (tcp_read_byte(payload + TCP_DATA_OFF) / 16) * 4;
     let flags = tcp_read_byte(payload + TCP_FLAGS);
+
+    // Debug: Show TCP flags in detail
+    tcp_debug_char(91);  // '['
+    tcp_debug_char(70);  // 'F'
+    tcp_debug_char(61);  // '='
+    // Show individual flags: SYN=0x02, ACK=0x10, RST=0x04, FIN=0x01
+    if (flags / 2) % 2 == 1 { tcp_debug_char(83); }  // 'S' = SYN
+    if (flags / 16) % 2 == 1 { tcp_debug_char(65); }  // 'A' = ACK
+    if (flags / 4) % 2 == 1 { tcp_debug_char(82); }  // 'R' = RST
+    if flags % 2 == 1 { tcp_debug_char(70); }  // 'F' = FIN
+    tcp_debug_char(93);  // ']'
+    tcp_debug_char(10);
 
     let src_ip = tcp_ip_get_src(ip_header);
 
@@ -654,15 +1456,32 @@ fn tcp_handle_listen(socket_id: i64, src_ip: i64, src_port: i64, seq: u64, flags
 }
 
 fn tcp_handle_syn_sent(socket_id: i64, seq: u64, ack: u64, flags: i64) {
+    // Debug: SYN_SENT state handling
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_char(89);  // 'Y'
+    tcp_debug_char(78);  // 'N'
+    tcp_debug_char(95);  // '_'
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_char(69);  // 'E'
+    tcp_debug_char(78);  // 'N'
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_dec(flags);
+    tcp_debug_char(10);
+
     let sock = tcp_get_socket_addr(socket_id);
 
     // Expect SYN+ACK
     if (flags % 4) / 2 != 1 {  // SYN not set
+        tcp_debug_char(78);  // 'N' - no SYN
+        tcp_debug_char(83);  // 'S'
         return;
     }
 
     if (flags % 32) / 16 != 1 {  // ACK not set
         // Simultaneous open
+        tcp_debug_char(83);  // 'S' - SYN only
+        tcp_debug_char(79);  // 'O'
         tcp_write_u32(sock + TCP_SOCK_IRS, seq as u64);
         tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (seq + 1) as u64);
         tcp_send_segment(socket_id, TCP_SYN + TCP_ACK, 0, 0);
@@ -670,7 +1489,11 @@ fn tcp_handle_syn_sent(socket_id: i64, seq: u64, ack: u64, flags: i64) {
         return;
     }
 
-    // Normal SYN+ACK
+    // Normal SYN+ACK - debug
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_char(65);  // 'A' - SYN+ACK received!
+    tcp_debug_char(33);  // '!'
+
     tcp_write_u32(sock + TCP_SOCK_IRS, seq as u64);
     tcp_write_u32(sock + TCP_SOCK_RCV_NXT, (seq + 1) as u64);
     tcp_write_u32(sock + TCP_SOCK_SND_UNA, ack as u64);
@@ -679,6 +1502,11 @@ fn tcp_handle_syn_sent(socket_id: i64, seq: u64, ack: u64, flags: i64) {
     tcp_send_segment(socket_id, TCP_ACK, 0, 0);
 
     // Established!
+    tcp_debug_char(69);  // 'E'
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_char(33);  // '!'
+    tcp_debug_char(10);
     tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_ESTABLISHED);
 }
 
@@ -862,7 +1690,9 @@ fn tcp_read_byte(addr: i64) -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
-            "movzbq (%rdi), %rax",
+            "mfence
+             lfence
+             movzbq (%rdi), %rax",
             in("rdi") addr,
             lateout("rax") result,
             options(nostack, att_syntax)
@@ -918,22 +1748,35 @@ fn tcp_write_u16_be(addr: i64, value: i64) {
 }
 
 fn tcp_read_u32(addr: i64) -> u64 {
-    let mut result: u64 = 0;
+    // Debug: print addr if it's MMIO region (0xFEB8xxxx)
+    let high_word = (addr / 65536) % 65536;
+    if high_word == 0xFEB8 {
+        tcp_debug_char(126);  // '~'
+        tcp_debug_hex_byte((addr / 16777216) % 256);
+        tcp_debug_hex_byte((addr / 65536) % 256);
+        tcp_debug_hex_byte((addr / 256) % 256);
+        tcp_debug_hex_byte(addr % 256);
+    }
+    let mut result: i64 = 0;
     unsafe {
         asm!(
-            "movl (%rdi), %eax",
+            "mfence
+             movl (%rdi), %eax
+             mfence",
             in("rdi") addr,
             lateout("eax") result,
-            options(nostack, att_syntax)
+            options(att_syntax)
         );
     }
-    result
+    result as u64
 }
 
 fn tcp_write_u32(addr: i64, value: u64) {
     unsafe {
         asm!(
-            "movl %esi, (%rdi)",
+            "mfence
+             movl %esi, (%rdi)
+             mfence",
             in("rdi") addr,
             in("esi") value,
             options(nostack, att_syntax)
@@ -996,12 +1839,1401 @@ fn tcp_memcpy(dst: i64, src: i64, len: i64) {
     }
 }
 
+// Serial port output for debug
+const TCP_COM1: i64 = 0x3F8;
+
+fn tcp_outb(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "outb %al, %dx",
+            in("dx") port,
+            in("al") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_debug_char(ch: i64) {
+    tcp_outb(TCP_COM1, ch);
+}
+
+fn tcp_debug_arp() {
+    tcp_debug_char(65);  // 'A'
+    tcp_debug_char(82);  // 'R'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(58);  // ':'
+}
+
+fn tcp_debug_ok() {
+    tcp_debug_char(79);  // 'O'
+    tcp_debug_char(75);  // 'K'
+    tcp_debug_char(10);  // '\n'
+}
+
+fn tcp_debug_fail() {
+    tcp_debug_char(70);  // 'F'
+    tcp_debug_char(65);  // 'A'
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_char(10);  // '\n'
+}
+
+fn tcp_debug_hex(value: i64) {
+    tcp_debug_char(48);  // '0'
+    tcp_debug_char(120); // 'x'
+    let mut i: i64 = 28;
+    while i >= 0 {
+        let nibble = (value / tcp_pow2(i)) % 16;
+        let ch: i64 = if nibble < 10 { 48 + nibble } else { 55 + nibble };
+        tcp_debug_char(ch);
+        i = i - 4;
+    }
+}
+
+fn tcp_debug_dec(n: i64) {
+    if n >= 100 {
+        tcp_debug_char(48 + n / 100);
+    }
+    if n >= 10 {
+        tcp_debug_char(48 + (n / 10) % 10);
+    }
+    tcp_debug_char(48 + n % 10);
+}
+
+fn tcp_debug_ip(ip: i64) {
+    // IP in host order: 10.0.2.15 = 167772687
+    let b0 = (ip / 16777216) % 256;
+    let b1 = (ip / 65536) % 256;
+    let b2 = (ip / 256) % 256;
+    let b3 = ip % 256;
+    tcp_debug_dec(b0);
+    tcp_debug_char(46);  // '.'
+    tcp_debug_dec(b1);
+    tcp_debug_char(46);  // '.'
+    tcp_debug_dec(b2);
+    tcp_debug_char(46);  // '.'
+    tcp_debug_dec(b3);
+}
+
+fn tcp_debug_gw() {
+    tcp_debug_char(71);  // 'G'
+    tcp_debug_char(87);  // 'W'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_ip(tcp_net_get_gateway());
+    tcp_debug_char(10);  // '\n'
+}
+
 fn tcp_get_ticks() -> i64 {
     tcp_read_u64(0x412000) as i64
 }
 
 // External functions
 fn tcp_get_current_pid() -> i64 { 0 }
-fn tcp_net_get_ip() -> i64 { 0 }
-fn tcp_ip_send(dst: i64, proto: i64, data: i64, len: i64) -> i64 { 0 }
-fn tcp_ip_get_src(packet: i64) -> i64 { 0 }
+
+// ============================================================
+// Network Stack Integration - IP/Ethernet/E1000 Send Path
+// ============================================================
+
+// Network configuration (shared with ipv4.gl)
+const TCP_NET_CONFIG_ADDR: i64 = 0xD21000;
+const TCP_NET_CFG_IP: i64 = 0;
+const TCP_NET_CFG_NETMASK: i64 = 4;
+const TCP_NET_CFG_GATEWAY: i64 = 8;
+const TCP_NET_CFG_CONFIGURED: i64 = 16;
+const TCP_NET_CFG_ID_COUNTER: i64 = 28;
+
+// ARP cache (shared with arp.gl)
+const TCP_ARP_CACHE_ADDR: i64 = 0xD20500;
+const TCP_ARP_MAX_ENTRIES: i64 = 32;
+const TCP_ARP_ENTRY_SIZE: i64 = 24;
+const TCP_ARP_ENTRY_IP: i64 = 0;
+const TCP_ARP_ENTRY_MAC: i64 = 4;
+const TCP_ARP_ENTRY_STATE: i64 = 10;
+const TCP_ARP_STATE_VALID: i64 = 2;
+
+// IP constants
+const TCP_IP_TX_BUF: i64 = 0xD32000;
+const TCP_IP_MIN_HEADER_LEN: i64 = 20;
+const TCP_IP_DEFAULT_TTL: i64 = 64;
+
+// Ethernet constants
+const TCP_ETH_TX_FRAME_ADDR: i64 = 0xD30000;
+const TCP_ETH_HEADER_SIZE: i64 = 14;
+
+// Get our IP address from network config
+fn tcp_net_get_ip() -> i64 {
+    tcp_read_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_IP) as i64
+}
+
+// Get source IP from IP packet header
+fn tcp_ip_get_src(packet: i64) -> i64 {
+    // IP source address is at offset 12, 4 bytes big-endian
+    let b0 = tcp_read_byte(packet + 12);
+    let b1 = tcp_read_byte(packet + 13);
+    let b2 = tcp_read_byte(packet + 14);
+    let b3 = tcp_read_byte(packet + 15);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+// Get netmask from config
+fn tcp_net_get_netmask() -> i64 {
+    tcp_read_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_NETMASK) as i64
+}
+
+// Get gateway from config
+fn tcp_net_get_gateway() -> i64 {
+    tcp_read_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_GATEWAY) as i64
+}
+
+// Check if network is configured
+fn tcp_net_is_configured() -> i64 {
+    tcp_read_byte(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_CONFIGURED)
+}
+
+// Configure network with static IP (for QEMU user mode networking)
+// QEMU user mode: IP=10.0.2.15, Gateway=10.0.2.2, Netmask=255.255.255.0
+pub fn tcp_net_configure_qemu() {
+    // IP: 10.0.2.15 = (10*16777216) + (0*65536) + (2*256) + 15 = 167772687
+    let ip: i64 = 167772687;
+    // Netmask: 255.255.255.0 = 4294967040
+    let netmask: i64 = 4294967040;
+    // Gateway: 10.0.2.2 = 167772674
+    let gateway: i64 = 167772674;
+
+    tcp_write_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_IP, ip as u64);
+    tcp_write_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_NETMASK, netmask as u64);
+    tcp_write_u32(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_GATEWAY, gateway as u64);
+    tcp_write_byte(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_CONFIGURED, 1);
+
+    // Don't pre-populate ARP cache - let ARP resolution happen naturally
+    // This allows us to test E1000 RX for ARP replies
+
+    tcp_debug_char(78);  // 'N'
+    tcp_debug_char(69);  // 'E'
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_char(58);  // ':'
+    tcp_debug_ip(ip);
+    tcp_debug_char(10);
+}
+
+// Power of 2 helper for bitwise operations
+fn tcp_pow2(n: i64) -> i64 {
+    let mut result: i64 = 1;
+    let mut i: i64 = 0;
+    while i < n {
+        result = result * 2;
+        i = i + 1;
+    }
+    result
+}
+
+// Bitwise AND for IP addresses (32-bit)
+fn tcp_ip_and(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 32 {
+        let bit_a = (a / tcp_pow2(i)) % 2;
+        let bit_b = (b / tcp_pow2(i)) % 2;
+        if bit_a == 1 && bit_b == 1 {
+            result = result + tcp_pow2(i);
+        }
+        i = i + 1;
+    }
+    result
+}
+
+// Check if IP is on same subnet
+fn tcp_ip_same_subnet(ip1: i64, ip2: i64, mask: i64) -> i64 {
+    let net1 = tcp_ip_and(ip1, mask);
+    let net2 = tcp_ip_and(ip2, mask);
+    if net1 == net2 { 1 } else { 0 }
+}
+
+// Route: determine next hop
+fn tcp_ip_route(dst_ip: i64) -> i64 {
+    let our_ip = tcp_net_get_ip();
+    let mask = tcp_net_get_netmask();
+    let gateway = tcp_net_get_gateway();
+
+    if tcp_ip_same_subnet(our_ip, dst_ip, mask) == 1 {
+        dst_ip  // Direct delivery
+    } else {
+        gateway  // Use gateway
+    }
+}
+
+// Get next IP packet ID
+fn tcp_ip_next_id() -> i64 {
+    let id = tcp_read_u16(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_ID_COUNTER) as i64;
+    tcp_write_u16(TCP_NET_CONFIG_ADDR + TCP_NET_CFG_ID_COUNTER, ((id + 1) % 65536) as u64);
+    id
+}
+
+// Calculate IP header checksum (RFC 791)
+// One's complement sum of all 16-bit words in header
+fn tcp_ip_header_checksum(header: i64, len: i64) -> i64 {
+    let mut sum: i64 = 0;
+
+    // Sum all 16-bit words (checksum field should be 0)
+    let mut i: i64 = 0;
+    while i < len {
+        let word = (tcp_read_byte(header + i) * 256) + tcp_read_byte(header + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while sum > 65535 {
+        sum = (sum % 65536) + (sum / 65536);
+    }
+
+    // One's complement
+    65535 - sum
+}
+
+// Build IP header at TCP_IP_TX_BUF
+fn tcp_ip_build_header(dst_ip: i64, protocol: i64, payload_len: i64) -> i64 {
+    // Debug: entering function
+    tcp_debug_char(60);  // '<'
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(62);  // '>'
+    tcp_debug_char(10);
+
+    let header = TCP_IP_TX_BUF;
+    let total_len = TCP_IP_MIN_HEADER_LEN + payload_len;
+
+    // Version (4) + IHL (5 = 20 bytes)
+    tcp_write_byte(header + 0, 0x45);
+
+    // TOS
+    tcp_write_byte(header + 1, 0);
+
+    // Total length (big-endian)
+    tcp_write_byte(header + 2, total_len / 256);
+    tcp_write_byte(header + 3, total_len % 256);
+
+    // ID (big-endian)
+    let id = tcp_ip_next_id();
+    tcp_write_byte(header + 4, id / 256);
+    tcp_write_byte(header + 5, id % 256);
+
+    // Flags + Fragment (DF bit)
+    tcp_write_byte(header + 6, 0x40);
+    tcp_write_byte(header + 7, 0);
+
+    // TTL
+    tcp_write_byte(header + 8, TCP_IP_DEFAULT_TTL);
+
+    // Protocol
+    tcp_write_byte(header + 9, protocol);
+
+    // Checksum (set to 0 initially)
+    tcp_write_byte(header + 10, 0);
+    tcp_write_byte(header + 11, 0);
+
+    // Source IP
+    let src_ip = tcp_net_get_ip();
+    tcp_write_byte(header + 12, (src_ip / 16777216) % 256);
+    tcp_write_byte(header + 13, (src_ip / 65536) % 256);
+    tcp_write_byte(header + 14, (src_ip / 256) % 256);
+    tcp_write_byte(header + 15, src_ip % 256);
+
+    // Dest IP
+    tcp_write_byte(header + 16, (dst_ip / 16777216) % 256);
+    tcp_write_byte(header + 17, (dst_ip / 65536) % 256);
+    tcp_write_byte(header + 18, (dst_ip / 256) % 256);
+    tcp_write_byte(header + 19, dst_ip % 256);
+
+    // Debug: show header before checksum calc
+    tcp_debug_char(66);  // 'B' for before
+    tcp_debug_hex(header);
+    tcp_debug_char(58);  // ':'
+    let mut bb: i64 = 0;
+    while bb < 20 {
+        tcp_debug_hex_byte(tcp_read_byte(header + bb));
+        bb = bb + 1;
+    }
+    tcp_debug_char(10);
+
+    // Calculate and set checksum
+    tcp_debug_char(35);  // '#' marker before IP checksum
+    let checksum = tcp_ip_header_checksum(header, TCP_IP_MIN_HEADER_LEN);
+    tcp_debug_char(36);  // '$' marker after IP checksum
+
+    // Debug: show calculated checksum
+    tcp_debug_char(73);  // 'I' for IP
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(61);  // '='
+    tcp_debug_hex(checksum);
+    tcp_debug_char(10);
+
+    tcp_write_byte(header + 10, checksum / 256);
+    tcp_write_byte(header + 11, checksum % 256);
+
+    // Debug: verify what was written
+    let verify = (tcp_read_byte(header + 10) * 256) + tcp_read_byte(header + 11);
+    tcp_debug_char(86);  // 'V' for verify
+    tcp_debug_hex(verify);
+    tcp_debug_char(10);
+
+    TCP_IP_MIN_HEADER_LEN
+}
+
+// ARP lookup - find MAC for IP
+// Returns 1 if found (MAC copied to mac_out), 0 if not found
+fn tcp_arp_lookup(ip: i64, mac_out: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < TCP_ARP_MAX_ENTRIES {
+        let entry = TCP_ARP_CACHE_ADDR + (i * TCP_ARP_ENTRY_SIZE);
+        let state = tcp_read_u16(entry + TCP_ARP_ENTRY_STATE) as i64;
+
+        if state == TCP_ARP_STATE_VALID {
+            let entry_ip = tcp_read_u32(entry + TCP_ARP_ENTRY_IP) as i64;
+            if entry_ip == ip {
+                // Copy MAC address
+                let mut j: i64 = 0;
+                while j < 6 {
+                    tcp_write_byte(mac_out + j, tcp_read_byte(entry + TCP_ARP_ENTRY_MAC + j));
+                    j = j + 1;
+                }
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    0
+}
+
+// Get our MAC address
+fn tcp_get_our_mac(mac_out: i64) {
+    let mut i: i64 = 0;
+    while i < 6 {
+        tcp_write_byte(mac_out + i, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + i));
+        i = i + 1;
+    }
+}
+
+// Build ethernet frame header at TCP_ETH_TX_FRAME_ADDR
+fn tcp_eth_build_header(dst_mac: i64, src_mac: i64, ethertype: i64) -> i64 {
+    let frame = TCP_ETH_TX_FRAME_ADDR;
+
+    // Dest MAC
+    let mut i: i64 = 0;
+    while i < 6 {
+        tcp_write_byte(frame + i, tcp_read_byte(dst_mac + i));
+        i = i + 1;
+    }
+
+    // Src MAC
+    i = 0;
+    while i < 6 {
+        tcp_write_byte(frame + 6 + i, tcp_read_byte(src_mac + i));
+        i = i + 1;
+    }
+
+    // Ethertype (big-endian)
+    tcp_write_byte(frame + 12, ethertype / 256);
+    tcp_write_byte(frame + 13, ethertype % 256);
+
+    frame
+}
+
+// Write to E1000 MMIO register
+// WORKAROUND: Genesis compiler has issues with passing computed addresses
+// So we pass base and offset separately and compute in asm
+fn tcp_e1000_write_reg(offset: i64, value: i64) {
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    if base == 0 { return; }
+    unsafe {
+        asm!(
+            "mfence
+             addq %rsi, %rdi
+             movl %edx, (%rdi)
+             mfence",
+            in("rdi") base,
+            in("rsi") offset,
+            in("edx") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+// Read E1000 MMIO register
+// WORKAROUND: Genesis compiler has issues with passing computed addresses
+// So we pass base and offset separately and compute in asm
+fn tcp_e1000_read_reg(offset: i64) -> i64 {
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    if base == 0 { return 0; }
+    // Compute full address first (like e1000_mmio_read32)
+    let addr = base + offset;
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// E1000 register offsets for debug
+const TCP_E1000_CTRL: i64 = 0x0000;  // Device Control
+const TCP_E1000_STATUS: i64 = 0x0008;  // Device Status
+const TCP_E1000_ICR: i64 = 0x00C0;   // Interrupt Cause Read
+const TCP_E1000_TCTL: i64 = 0x0400;  // Transmit Control
+const TCP_E1000_RCTL: i64 = 0x0100;
+const TCP_E1000_RDBAL: i64 = 0x2800;
+const TCP_E1000_RDH: i64 = 0x2810;
+const TCP_E1000_RDT_REG: i64 = 0x2818;
+const TCP_E1000_RAL0: i64 = 0x5400;  // Receive Address Low
+const TCP_E1000_RAH0: i64 = 0x5404;  // Receive Address High
+const TCP_E1000_TDBAL: i64 = 0x3800;  // TX Descriptor Base Low
+const TCP_E1000_TDBAH: i64 = 0x3804;  // TX Descriptor Base High
+const TCP_E1000_TDLEN: i64 = 0x3808;  // TX Descriptor Length
+const TCP_E1000_TDH: i64 = 0x3810;   // TX Descriptor Head
+const TCP_E1000_TDT_DEBUG: i64 = 0x3818;  // TX Descriptor Tail (for debug read)
+
+// E1000 state offsets (must match e1000.gl)
+// PCI config space ports
+const TCP_PCI_CONFIG_ADDR: i64 = 0xCF8;
+const TCP_PCI_CONFIG_DATA: i64 = 0xCFC;
+
+// PCI read
+fn tcp_pci_read(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    tcp_outl(TCP_PCI_CONFIG_ADDR, addr);
+    tcp_inl(TCP_PCI_CONFIG_DATA)
+}
+
+// PCI write
+fn tcp_pci_write(bus: i64, device: i64, func: i64, offset: i64, value: i64) {
+    let addr = 0x80000000 + (bus * 65536) + (device * 2048) + (func * 256) + offset;
+    tcp_outl(TCP_PCI_CONFIG_ADDR, addr);
+    tcp_outl(TCP_PCI_CONFIG_DATA, value);
+}
+
+// Port I/O for PCI
+fn tcp_outl(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "outl %eax, %dx",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn tcp_inl(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "inl %dx, %eax",
+            in("dx") port,
+            lateout("eax") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Bitwise OR
+fn tcp_bit_or(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 32 {
+        let mask = tcp_pow2(i);
+        let bit_a = (a / mask) % 2;
+        let bit_b = (b / mask) % 2;
+        if bit_a == 1 || bit_b == 1 {
+            result = result + mask;
+        }
+        i = i + 1;
+    }
+    result
+}
+
+// Send ethernet frame via E1000
+fn tcp_e1000_send(frame: i64, length: i64) -> i64 {
+    // Check E1000 present and MMIO base
+    let present = tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_PRESENT);
+    if present == 0 {
+        tcp_debug_char(33);  // '!' - not present
+        return 0;
+    }
+
+    // Debug MMIO base
+    let mmio = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    if mmio == 0 {
+        tcp_debug_char(33);  // '!' - no mmio
+        return 0;
+    }
+
+    // Check E1000 STATUS - bit 1 is Link Up (LU)
+    let status = tcp_e1000_read_reg(TCP_E1000_STATUS);
+    tcp_debug_char(115);  // 's' - status
+    tcp_debug_hex(status);
+
+    // Check TCTL - bit 1 is EN (transmit enable)
+    let tctl = tcp_e1000_read_reg(TCP_E1000_TCTL);
+    tcp_debug_char(116);  // 't' - tctl
+    tcp_debug_hex(tctl);
+
+    // Check TDLEN - should be non-zero
+    let tdlen = tcp_e1000_read_reg(TCP_E1000_TDLEN);
+    tcp_debug_char(108);  // 'l' - tdlen
+    tcp_debug_hex(tdlen);
+    tcp_debug_char(10);
+
+    if length < 14 || length > 1518 {
+        tcp_debug_char(76);  // 'L' - length error
+        return 0;
+    }
+
+    // Get current TX descriptor index
+    let tx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_TX_CUR) as i64;
+    let desc_addr = TCP_E1000_TX_DESC_ADDR + (tx_cur * TCP_E1000_TX_DESC_SIZE);
+
+    // Debug: show tx_cur and initial status
+    tcp_debug_char(91);  // '['
+    tcp_debug_dec(tx_cur);
+    tcp_debug_char(58);  // ':'
+    let initial_status = tcp_read_byte(desc_addr + 12);
+    tcp_debug_hex(initial_status);
+    tcp_debug_char(93);  // ']'
+
+    // If status is 0, manually set DD bit (work around init issue)
+    if initial_status == 0 {
+        tcp_write_byte(desc_addr + 12, 1);  // Set DD bit
+        tcp_debug_char(70);  // 'F' - fixed
+    }
+
+    // Wait for descriptor to be available
+    let mut timeout: i64 = 100000;
+    while timeout > 0 {
+        let status = tcp_read_byte(desc_addr + 12);
+        if (status % 2) == 1 {  // DD bit set
+            break;
+        }
+        timeout = timeout - 1;
+    }
+    if timeout == 0 {
+        tcp_debug_char(87);  // 'W' - wait timeout
+        return 0;  // Timeout
+    }
+
+    // Copy frame to TX buffer
+    let buf_addr = TCP_E1000_TX_BUF_ADDR + (tx_cur * TCP_E1000_BUF_SIZE);
+    tcp_memcpy(buf_addr, frame, length);
+
+    // Always set the descriptor buffer address (it gets corrupted)
+    tcp_write_u64(desc_addr, buf_addr as u64);
+
+    // Debug: show the buffer address we're using
+    tcp_debug_char(65);  // 'A'
+    tcp_debug_hex(buf_addr);
+    tcp_debug_char(10);
+
+    // Set up descriptor
+    tcp_write_u16((desc_addr + 8) as u64, length as u64);  // Length
+    let cmd = TCP_TDESC_CMD_EOP + TCP_TDESC_CMD_IFCS + TCP_TDESC_CMD_RS;
+    tcp_write_byte(desc_addr + 11, cmd);  // Command
+    tcp_write_byte(desc_addr + 12, 0);    // Clear status
+
+    // Debug: show TDH and TDT before
+    let old_tdh = tcp_e1000_read_reg(TCP_E1000_TDH);
+    let old_tdt = tcp_e1000_read_reg(TCP_E1000_TDT_DEBUG);
+    tcp_debug_char(72);  // 'H'
+    tcp_debug_dec(old_tdh);
+    tcp_debug_char(84);  // 'T'
+    tcp_debug_dec(old_tdt);
+
+    // Debug: show command byte we're writing
+    tcp_debug_char(67);  // 'C'
+    tcp_debug_dec(cmd);
+
+    // Advance tail using DIRECT ASM (compiler bug workaround)
+    // Write to TDT register at MMIO + 0x3818
+    let next_tx = (tx_cur + 1) % TCP_E1000_NUM_TX_DESC;
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    let tdt_addr = base + 0x3818;  // TDT register (NOT 0x2818 which is RDT!)
+    unsafe {
+        asm!(
+            "mfence
+             movl %esi, (%rdi)
+             mfence",
+            in("rdi") tdt_addr,
+            in("esi") next_tx,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // Debug: read back TDT using direct ASM
+    let mut new_tdt: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") tdt_addr,
+            lateout("eax") new_tdt,
+            options(nostack, att_syntax)
+        );
+    }
+    tcp_debug_char(62);  // '>'
+    tcp_debug_dec(new_tdt);
+
+    // Small delay to let hardware process
+    let mut delay = 0;
+    while delay < 100000 {
+        delay = delay + 1;
+    }
+
+    // Check TDH after delay - did hardware process?
+    let new_tdh = tcp_e1000_read_reg(TCP_E1000_TDH);
+    tcp_debug_char(104);  // 'h'
+    tcp_debug_dec(new_tdh);
+
+    // Check descriptor status after send attempt
+    let final_status = tcp_read_byte(desc_addr + 12);
+    tcp_debug_char(83);  // 'S'
+    tcp_debug_dec(final_status);
+    tcp_debug_char(10);
+
+    // Update current index
+    tcp_write_u32((TCP_E1000_STATE_ADDR + TCP_E1000_STATE_TX_CUR) as u64, next_tx as u64);
+
+    // Increment TX count
+    let count = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_TX_COUNT) as i64;
+    tcp_write_u64((TCP_E1000_STATE_ADDR + TCP_E1000_STATE_TX_COUNT) as u64, (count + 1) as u64);
+
+    1
+}
+
+// ARP packet constants
+const TCP_ARP_TX_BUF: i64 = 0xD31000;
+const TCP_ARP_PACKET_SIZE: i64 = 28;
+const TCP_ARP_HTYPE: i64 = 0;
+const TCP_ARP_PTYPE: i64 = 2;
+const TCP_ARP_HLEN: i64 = 4;
+const TCP_ARP_PLEN: i64 = 5;
+const TCP_ARP_OPER: i64 = 6;
+const TCP_ARP_SHA: i64 = 8;
+const TCP_ARP_SPA: i64 = 14;
+const TCP_ARP_THA: i64 = 18;
+const TCP_ARP_TPA: i64 = 24;
+
+// Write IP address in big-endian
+fn tcp_arp_write_ip(addr: i64, ip: i64) {
+    tcp_write_byte(addr + 0, (ip / 16777216) % 256);
+    tcp_write_byte(addr + 1, (ip / 65536) % 256);
+    tcp_write_byte(addr + 2, (ip / 256) % 256);
+    tcp_write_byte(addr + 3, ip % 256);
+}
+
+// Build ARP request packet
+fn tcp_arp_build_request(target_ip: i64) -> i64 {
+    let pkt = TCP_ARP_TX_BUF;
+    let our_ip = tcp_net_get_ip();
+
+    // Hardware type (Ethernet = 1, big-endian)
+    tcp_write_byte(pkt + TCP_ARP_HTYPE, 0);
+    tcp_write_byte(pkt + TCP_ARP_HTYPE + 1, 1);
+
+    // Protocol type (IPv4 = 0x0800, big-endian)
+    tcp_write_byte(pkt + TCP_ARP_PTYPE, 0x08);
+    tcp_write_byte(pkt + TCP_ARP_PTYPE + 1, 0x00);
+
+    // Hardware length (6 for Ethernet)
+    tcp_write_byte(pkt + TCP_ARP_HLEN, 6);
+
+    // Protocol length (4 for IPv4)
+    tcp_write_byte(pkt + TCP_ARP_PLEN, 4);
+
+    // Operation (Request = 1, big-endian)
+    tcp_write_byte(pkt + TCP_ARP_OPER, 0);
+    tcp_write_byte(pkt + TCP_ARP_OPER + 1, 1);
+
+    // Sender hardware address (our MAC)
+    let mut i: i64 = 0;
+    while i < 6 {
+        tcp_write_byte(pkt + TCP_ARP_SHA + i, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + i));
+        i = i + 1;
+    }
+
+    // Sender protocol address (our IP)
+    tcp_arp_write_ip(pkt + TCP_ARP_SPA, our_ip);
+
+    // Target hardware address (zeros for request)
+    tcp_memset(pkt + TCP_ARP_THA, 0, 6);
+
+    // Target protocol address
+    tcp_arp_write_ip(pkt + TCP_ARP_TPA, target_ip);
+
+    TCP_ARP_PACKET_SIZE
+}
+
+// Send ARP request
+fn tcp_arp_send_request(target_ip: i64) -> i64 {
+    let arp_len = tcp_arp_build_request(target_ip);
+
+    // Build ethernet frame with broadcast destination
+    let frame = TCP_ETH_TX_FRAME_ADDR;
+
+    // Broadcast destination MAC (FF:FF:FF:FF:FF:FF)
+    tcp_memset(frame, 0xFF, 6);
+
+    // Our source MAC
+    let mut i: i64 = 0;
+    while i < 6 {
+        tcp_write_byte(frame + 6 + i, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + i));
+        i = i + 1;
+    }
+
+    // Ethertype 0x0806 = ARP (big-endian)
+    tcp_write_byte(frame + 12, 0x08);
+    tcp_write_byte(frame + 13, 0x06);
+
+    // Copy ARP packet to ethernet payload
+    tcp_memcpy(frame + TCP_ETH_HEADER_SIZE, TCP_ARP_TX_BUF, arp_len);
+
+    // Total frame length (14 header + 28 ARP = 42 bytes)
+    let frame_len = TCP_ETH_HEADER_SIZE + arp_len;
+
+    // Pad to minimum Ethernet frame size (60 bytes, excluding FCS)
+    // E1000 adds FCS automatically with IFCS command bit
+    let min_frame_len = 60;
+    if frame_len < min_frame_len {
+        tcp_memset(frame + frame_len, 0, min_frame_len - frame_len);
+    }
+    let actual_len = if frame_len < min_frame_len { min_frame_len } else { frame_len };
+
+    // Debug: dump first 42 bytes of frame (full ARP)
+    tcp_debug_char(70);  // 'F'
+    tcp_debug_char(58);  // ':'
+    let mut j: i64 = 0;
+    while j < 42 {
+        let b = tcp_read_byte(frame + j);
+        tcp_debug_hex_byte(b);
+        j = j + 1;
+    }
+    tcp_debug_char(10);
+
+    // Debug: show frame length
+    tcp_debug_char(76);  // 'L'
+    tcp_debug_dec(actual_len);
+    tcp_debug_char(10);
+
+    // Send frame
+    tcp_e1000_send(frame, actual_len)
+}
+
+// Send ARP reply in response to an ARP request
+// Reads requester info from the received packet at rx_frame_base
+fn tcp_arp_send_reply_from_request(rx_frame_base: i64) -> i64 {
+    let frame = TCP_ETH_TX_FRAME_ADDR;
+    let our_ip = tcp_net_get_ip();
+
+    // The incoming ARP is at rx_frame_base + 14 (after ethernet header)
+    let rx_arp = rx_frame_base + 14;
+
+    // Destination MAC = sender's MAC from request (at SHA offset)
+    tcp_write_byte(frame + 0, tcp_read_byte(rx_arp + TCP_ARP_SHA + 0));
+    tcp_write_byte(frame + 1, tcp_read_byte(rx_arp + TCP_ARP_SHA + 1));
+    tcp_write_byte(frame + 2, tcp_read_byte(rx_arp + TCP_ARP_SHA + 2));
+    tcp_write_byte(frame + 3, tcp_read_byte(rx_arp + TCP_ARP_SHA + 3));
+    tcp_write_byte(frame + 4, tcp_read_byte(rx_arp + TCP_ARP_SHA + 4));
+    tcp_write_byte(frame + 5, tcp_read_byte(rx_arp + TCP_ARP_SHA + 5));
+
+    // Source MAC = our MAC
+    tcp_write_byte(frame + 6, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 0));
+    tcp_write_byte(frame + 7, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 1));
+    tcp_write_byte(frame + 8, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 2));
+    tcp_write_byte(frame + 9, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 3));
+    tcp_write_byte(frame + 10, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 4));
+    tcp_write_byte(frame + 11, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 5));
+
+    // Ethertype 0x0806 = ARP
+    tcp_write_byte(frame + 12, 0x08);
+    tcp_write_byte(frame + 13, 0x06);
+
+    // ARP payload starts at frame + 14
+    let arp = frame + 14;
+
+    // Hardware type (Ethernet = 1)
+    tcp_write_byte(arp + TCP_ARP_HTYPE, 0);
+    tcp_write_byte(arp + TCP_ARP_HTYPE + 1, 1);
+
+    // Protocol type (IPv4 = 0x0800)
+    tcp_write_byte(arp + TCP_ARP_PTYPE, 0x08);
+    tcp_write_byte(arp + TCP_ARP_PTYPE + 1, 0x00);
+
+    // Hardware length (6), Protocol length (4)
+    tcp_write_byte(arp + TCP_ARP_HLEN, 6);
+    tcp_write_byte(arp + TCP_ARP_PLEN, 4);
+
+    // Operation = Reply (2)
+    tcp_write_byte(arp + TCP_ARP_OPER, 0);
+    tcp_write_byte(arp + TCP_ARP_OPER + 1, 2);
+
+    // Sender hardware address = our MAC
+    tcp_write_byte(arp + TCP_ARP_SHA + 0, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 0));
+    tcp_write_byte(arp + TCP_ARP_SHA + 1, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 1));
+    tcp_write_byte(arp + TCP_ARP_SHA + 2, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 2));
+    tcp_write_byte(arp + TCP_ARP_SHA + 3, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 3));
+    tcp_write_byte(arp + TCP_ARP_SHA + 4, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 4));
+    tcp_write_byte(arp + TCP_ARP_SHA + 5, tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MAC + 5));
+
+    // Sender protocol address = our IP
+    tcp_arp_write_ip(arp + TCP_ARP_SPA, our_ip);
+
+    // Target hardware address = requester's MAC (from request SHA)
+    tcp_write_byte(arp + TCP_ARP_THA + 0, tcp_read_byte(rx_arp + TCP_ARP_SHA + 0));
+    tcp_write_byte(arp + TCP_ARP_THA + 1, tcp_read_byte(rx_arp + TCP_ARP_SHA + 1));
+    tcp_write_byte(arp + TCP_ARP_THA + 2, tcp_read_byte(rx_arp + TCP_ARP_SHA + 2));
+    tcp_write_byte(arp + TCP_ARP_THA + 3, tcp_read_byte(rx_arp + TCP_ARP_SHA + 3));
+    tcp_write_byte(arp + TCP_ARP_THA + 4, tcp_read_byte(rx_arp + TCP_ARP_SHA + 4));
+    tcp_write_byte(arp + TCP_ARP_THA + 5, tcp_read_byte(rx_arp + TCP_ARP_SHA + 5));
+
+    // Target protocol address = requester's IP (from request SPA)
+    let requester_ip = tcp_arp_read_ip(rx_arp + TCP_ARP_SPA);
+    tcp_arp_write_ip(arp + TCP_ARP_TPA, requester_ip);
+
+    // Frame length: 14 (eth) + 28 (arp) = 42, pad to 60
+    let frame_len: i64 = 60;
+    tcp_memset(frame + 42, 0, 18);  // Pad with zeros
+
+    // Debug: show ARP reply being sent
+    tcp_debug_char(65);  // 'A'
+    tcp_debug_char(82);  // 'R'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(62);  // '>'
+    tcp_debug_dec(requester_ip % 256);  // Last octet of requester IP
+    tcp_debug_char(10);
+
+    // Send frame
+    tcp_e1000_send(frame, frame_len)
+}
+
+// Debug: print single byte in hex
+fn tcp_debug_hex_byte(val: i64) {
+    let hi = (val / 16) % 16;
+    let lo = val % 16;
+    if hi < 10 { tcp_debug_char(48 + hi); } else { tcp_debug_char(55 + hi); }
+    if lo < 10 { tcp_debug_char(48 + lo); } else { tcp_debug_char(55 + lo); }
+}
+
+// memset for ARP
+fn tcp_memset(addr: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        tcp_write_byte(addr + i, value);
+        i = i + 1;
+    }
+}
+
+// Debug poll counter stored at this address
+const TCP_DEBUG_POLL_ADDR: i64 = 0xD3F000;
+
+// Check for received packet
+fn tcp_e1000_recv_check() -> i64 {
+    let rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+    let desc_addr = TCP_E1000_RX_DESC_ADDR + (rx_cur * TCP_E1000_RX_DESC_SIZE);
+
+    // CRITICAL: Memory barrier before reading descriptor status
+    // The E1000 writes to RAM via DMA, but CPU cache may have stale data.
+    // Without mfence, CPU reads cached value (DD=0) instead of DMA-updated value (DD=1).
+    // This is why ARP works (1s delay allows cache flush) but SYN-ACK fails (2ms is too fast).
+    let mut status: i64 = 0;
+    let status_addr = desc_addr + 12;
+    unsafe {
+        asm!(
+            "mfence
+             lfence
+             movzbq (%rdi), %rax
+             mfence",
+            in("rdi") status_addr,
+            lateout("rax") status,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // Debug: first poll, show E1000 RX state
+    let poll_count = tcp_read_u32(TCP_DEBUG_POLL_ADDR) as i64;
+    if poll_count == 0 {
+        // Show RDH (head) - where hardware has written up to
+        let rdh = tcp_e1000_read_reg(TCP_E1000_RDH);
+        tcp_debug_char(72);  // 'H' - rdh
+        tcp_debug_dec(rdh);
+
+        // Show RDT
+        let rdt = tcp_e1000_read_reg(TCP_E1000_RDT_REG);
+        tcp_debug_char(84);  // 'T' - rdt
+        tcp_debug_dec(rdt);
+
+        // Show rx_cur
+        tcp_debug_char(67);  // 'C' - cur
+        tcp_debug_dec(rx_cur);
+        tcp_debug_char(10);  // newline
+
+        // Show first RX descriptor buffer address
+        let rx0_buf = tcp_read_u64(TCP_E1000_RX_DESC_ADDR) as i64;
+        tcp_debug_char(48);  // '0' for desc 0
+        tcp_debug_char(58);  // ':'
+        tcp_debug_hex(rx0_buf);
+        tcp_debug_char(10);
+
+        // Show RCTL (should have EN bit set)
+        let rctl = tcp_e1000_read_reg(TCP_E1000_RCTL);
+        tcp_debug_char(67);  // 'C'
+        tcp_debug_hex(rctl);
+        tcp_debug_char(10);  // newline
+
+        // Show RDBAL and RDLEN
+        let rdbal = tcp_e1000_read_reg(TCP_E1000_RDBAL);
+        tcp_debug_char(66);  // 'B'
+        tcp_debug_hex(rdbal);
+        let rdlen = tcp_e1000_read_reg(0x2808);  // RDLEN = 0x2808
+        tcp_debug_char(76);  // 'L'
+        tcp_debug_hex(rdlen);
+        tcp_debug_char(10);  // newline
+
+        // Show RAL/RAH (receive address)
+        let ral = tcp_e1000_read_reg(TCP_E1000_RAL0);
+        tcp_debug_char(82);  // 'R'
+        tcp_debug_hex(ral);
+        let rah = tcp_e1000_read_reg(TCP_E1000_RAH0);
+        tcp_debug_char(72);  // 'H'
+        tcp_debug_hex(rah);
+        tcp_debug_char(10);  // newline
+    }
+
+    if poll_count < 5 {
+        // Show rx_cur and RDH to verify they are in sync
+        tcp_debug_char(91);  // '['
+        tcp_debug_dec(rx_cur);  // rx_cur (where we're checking)
+        tcp_debug_char(124);  // '|'
+        let rdh_now = tcp_e1000_read_reg(TCP_E1000_RDH);
+        tcp_debug_dec(rdh_now);  // RDH (where hardware is)
+        tcp_debug_char(47);  // '/'
+        tcp_debug_hex(status);
+        tcp_debug_char(93);  // ']'
+
+        // On first poll, also check first bytes of RX buffer
+        if poll_count == 0 {
+            let rx_buf = TCP_E1000_RX_BUF_ADDR;
+            tcp_debug_char(123);  // '{'
+            let mut k: i64 = 0;
+            while k < 6 {
+                tcp_debug_hex_byte(tcp_read_byte(rx_buf + k));
+                k = k + 1;
+            }
+            tcp_debug_char(125);  // '}'
+        }
+        tcp_write_u32(TCP_DEBUG_POLL_ADDR as u64, (poll_count + 1) as u64);
+    }
+
+    // Debug: print 'X' if DD set
+    if (status % 2) == 1 {
+        tcp_debug_char(88);  // 'X' - packet found
+        // Packet available - get length with memory barrier
+        let len_addr = desc_addr + 8;
+        let mut pkt_len: i64 = 0;
+        unsafe {
+            asm!(
+                "mfence
+                 movzwq (%rdi), %rax",
+                in("rdi") len_addr,
+                lateout("rax") pkt_len,
+                options(nostack, att_syntax)
+            );
+        }
+        pkt_len
+    } else {
+        0
+    }
+}
+
+// Get received packet buffer address
+fn tcp_e1000_get_rx_buf() -> i64 {
+    // Memory barrier to ensure DMA-written buffer data is visible
+    unsafe {
+        asm!("mfence; lfence", options(nostack));
+    }
+    let rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+    TCP_E1000_RX_BUF_ADDR + (rx_cur * TCP_E1000_BUF_SIZE)
+}
+
+// Advance RX descriptor to next
+fn tcp_e1000_rx_advance() {
+    let rx_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+    let desc_addr = TCP_E1000_RX_DESC_ADDR + (rx_cur * TCP_E1000_RX_DESC_SIZE);
+
+    // Clear status
+    tcp_write_byte(desc_addr + 12, 0);
+
+    // Advance to next descriptor
+    let next_rx = (rx_cur + 1) % TCP_E1000_NUM_RX_DESC;
+    tcp_write_u32((TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as u64, next_rx as u64);
+
+    // Update RDT dynamically using DIRECT ASM (compiler bug workaround)
+    // RDT = descriptor before rx_cur - tells hardware it can use up to RDT
+    let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+    let rdt_addr = base + 0x2818;  // RDT register
+    // RDT should be the descriptor we just processed (rx_cur before advance)
+    // This tells hardware: "you can use up to this descriptor"
+    let rdt_value: i64 = rx_cur;
+    unsafe {
+        asm!(
+            "mfence
+             movl %esi, (%rdi)
+             mfence",
+            in("rdi") rdt_addr,
+            in("esi") rdt_value,
+            options(nostack, att_syntax)
+        );
+    }
+
+    // Debug: read back RDT using direct ASM to verify
+    let mut rdt_actual: i64 = 0;
+    unsafe {
+        asm!(
+            "mfence
+             movl (%rdi), %eax
+             mfence",
+            in("rdi") rdt_addr,
+            lateout("eax") rdt_actual,
+            options(nostack, att_syntax)
+        );
+    }
+    tcp_debug_char(126);  // '~'
+    tcp_debug_dec(rdt_actual);  // Show ACTUAL value read back
+}
+
+// Read IP from ARP packet (big-endian)
+fn tcp_arp_read_ip(addr: i64) -> i64 {
+    let b0 = tcp_read_byte(addr);
+    let b1 = tcp_read_byte(addr + 1);
+    let b2 = tcp_read_byte(addr + 2);
+    let b3 = tcp_read_byte(addr + 3);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+// Update ARP cache with new entry
+fn tcp_arp_cache_add(ip: i64, mac: i64) {
+    // Find a free slot or existing entry for this IP
+    let mut i: i64 = 0;
+    while i < TCP_ARP_MAX_ENTRIES {
+        let entry = TCP_ARP_CACHE_ADDR + (i * TCP_ARP_ENTRY_SIZE);
+        let state = tcp_read_u16(entry + TCP_ARP_ENTRY_STATE) as i64;
+        let entry_ip = tcp_read_u32(entry + TCP_ARP_ENTRY_IP) as i64;
+
+        if state == 0 || entry_ip == ip {
+            // Found a slot - update it
+            tcp_write_u32(entry + TCP_ARP_ENTRY_IP, ip as u64);
+            let mut j: i64 = 0;
+            while j < 6 {
+                tcp_write_byte(entry + TCP_ARP_ENTRY_MAC + j, tcp_read_byte(mac + j));
+                j = j + 1;
+            }
+            tcp_write_u16(entry + TCP_ARP_ENTRY_STATE, TCP_ARP_STATE_VALID as u64);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Static counter for TCP poll debug
+const TCP_POLL_CNT_ADDR: i64 = 0xD3F100;
+
+// Poll for incoming IP/TCP packets and process them
+// pkt_len: packet length from tcp_e1000_recv_check() - pass 0 to check internally
+fn tcp_poll_incoming_with_len(pkt_len: i64) {
+    // Debug: show RX descriptor index
+    let rx_idx = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+
+    // If pkt_len is 0, caller didn't check - do it ourselves
+    let actual_len = if pkt_len > 0 { pkt_len } else { tcp_e1000_recv_check() };
+    if actual_len == 0 {
+        return;
+    }
+
+    tcp_debug_char(80);  // 'P' - packet found in tcp_poll_incoming
+    tcp_debug_dec(rx_idx);  // Show which descriptor
+    let frame = tcp_e1000_get_rx_buf();
+
+    // Check ethertype
+    let ethertype = (tcp_read_byte(frame + 12) * 256) + tcp_read_byte(frame + 13);
+
+    // Debug: show ethertype to diagnose what packets we're receiving
+    tcp_debug_char(69);  // 'E'
+    tcp_debug_hex_byte(ethertype / 256);
+    tcp_debug_hex_byte(ethertype % 256);
+
+    if ethertype == 0x0806 {
+        // ARP packet - process it
+        let arp = frame + 14;
+        let oper = (tcp_read_byte(arp + TCP_ARP_OPER) * 256) + tcp_read_byte(arp + TCP_ARP_OPER + 1);
+        if oper == 1 {
+            // ARP request - check if it's asking for our IP
+            let target_ip = tcp_arp_read_ip(arp + TCP_ARP_TPA);
+            let our_ip = tcp_net_get_ip();
+            if target_ip == our_ip {
+                // They're asking for our MAC - send a reply!
+                tcp_debug_char(63);  // '?' = ARP request for us
+                tcp_arp_send_reply_from_request(frame);
+            }
+        } else if oper == 2 {
+            // ARP reply - cache the sender's MAC
+            let sender_mac = arp + TCP_ARP_SHA;
+            let sender_ip = tcp_arp_read_ip(arp + TCP_ARP_SPA);
+            tcp_arp_cache_add(sender_ip, sender_mac);
+        }
+    } else if ethertype == 0x0800 {
+        // IPv4 packet - check if it's TCP (protocol 6)
+        tcp_debug_char(73);  // 'I' - IPv4
+        let ip_header = frame + 14;
+        let protocol = tcp_read_byte(ip_header + 9);
+
+        if protocol == 6 {
+            // TCP packet
+            tcp_debug_char(84);  // 'T' - TCP packet
+            let ip_header_len = (tcp_read_byte(ip_header) % 16) * 4;
+            let ip_total_len = (tcp_read_byte(ip_header + 2) * 256) + tcp_read_byte(ip_header + 3);
+            let tcp_len = ip_total_len - ip_header_len;
+            let tcp_payload = ip_header + ip_header_len;
+
+            // Process through TCP state machine
+            tcp_handle_packet(ip_header, tcp_payload, tcp_len);
+        }
+    }
+
+    // Advance to next descriptor
+    tcp_e1000_rx_advance();
+}
+
+// Poll for ARP reply packets and process them
+fn tcp_poll_arp_reply() {
+    // Check if packet available
+    let pkt_len = tcp_e1000_recv_check();
+    if pkt_len == 0 {
+        return;
+    }
+
+    tcp_debug_char(82);  // 'R' - packet received
+    let frame = tcp_e1000_get_rx_buf();
+
+    // Check ethertype (offset 12-13, big-endian)
+    let ethertype = (tcp_read_byte(frame + 12) * 256) + tcp_read_byte(frame + 13);
+
+    if ethertype == 0x0806 {
+        // ARP packet - check if it's a reply
+        let arp = frame + 14;  // ARP payload starts after ethernet header
+
+        // Check operation (offset 6-7, big-endian) - 2 = reply
+        let oper = (tcp_read_byte(arp + TCP_ARP_OPER) * 256) + tcp_read_byte(arp + TCP_ARP_OPER + 1);
+
+        if oper == 2 {
+            // ARP reply - extract sender MAC and IP
+            let sender_mac = arp + TCP_ARP_SHA;
+            let sender_ip = tcp_arp_read_ip(arp + TCP_ARP_SPA);
+
+            // Add to cache
+            tcp_arp_cache_add(sender_ip, sender_mac);
+        }
+
+        // Advance descriptor after processing ARP
+        tcp_e1000_rx_advance();
+    } else if ethertype == 0x0800 {
+        // IPv4 packet - could be TCP! Process it
+        tcp_debug_char(73);  // 'I' - IPv4 packet
+        tcp_poll_incoming_with_len(pkt_len);
+        // tcp_poll_incoming_with_len calls rx_advance internally
+    } else {
+        // Unknown ethertype - discard and advance to prevent blocking
+        tcp_debug_char(63);  // '?' - unknown packet type
+        tcp_e1000_rx_advance();
+    }
+}
+
+// Complete IP send path - builds IP packet and sends via ethernet/e1000
+fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i64 {
+    if tcp_net_is_configured() == 0 {
+        return 0;  // Network not configured
+    }
+
+    // Build IP header
+    let header_len = tcp_ip_build_header(dst_ip, protocol, payload_len);
+
+    // Copy payload after IP header
+    let payload_dst = TCP_IP_TX_BUF + header_len;
+    tcp_memcpy(payload_dst, payload, payload_len);
+
+    let total_ip_len = header_len + payload_len;
+
+    // Determine next hop
+    let next_hop = tcp_ip_route(dst_ip);
+
+    // ARP lookup for next hop MAC
+    let mac_buf: i64 = TCP_IP_TX_BUF - 12;  // Temp buffer for MACs
+    let dst_mac = mac_buf;
+    let src_mac = mac_buf + 6;
+
+    if tcp_arp_lookup(next_hop, dst_mac) == 0 {
+        // MAC not in cache - send ARP request and poll for reply
+        tcp_debug_gw();
+        tcp_debug_arp();
+        tcp_debug_ip(next_hop);
+        tcp_debug_char(10);  // newline
+        let arp_sent = tcp_arp_send_request(next_hop);
+        if arp_sent == 1 {
+            tcp_debug_char(83);  // 'S' - sent
+            tcp_debug_char(10);
+        } else {
+            tcp_debug_char(69);  // 'E' - error
+            tcp_debug_char(10);
+        }
+
+        // Re-enable RX and bus master right before polling
+        // First re-enable PCI bus master
+        let bus = tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_BUS);
+        let device = tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_DEVICE);
+        let func = tcp_read_byte(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_FUNC);
+
+        // Debug: verify we have the right device
+        let vendor_dev = tcp_pci_read(bus, device, func, 0x00);
+        tcp_debug_char(86);  // 'V'
+        tcp_debug_hex(vendor_dev);
+        tcp_debug_char(10);
+
+        let old_cmd = tcp_pci_read(bus, device, func, 0x04);
+        tcp_debug_char(79);  // 'O' - old cmd
+        tcp_debug_hex(old_cmd);
+
+        tcp_pci_write(bus, device, func, 0x04, tcp_bit_or(old_cmd, 0x07));
+
+        let new_cmd = tcp_pci_read(bus, device, func, 0x04);
+        tcp_debug_char(78);  // 'N' - new cmd
+        tcp_debug_hex(new_cmd);
+        tcp_debug_char(10);
+
+        // NOTE: DO NOT write to RCTL here!
+        // Writing to RCTL triggers a 1-second timer in QEMU E1000 emulation
+        // during which e1000_can_receive() returns FALSE and no packets are received!
+        tcp_debug_char(42);  // '*' - RX ready
+
+        // Debug: Verify RDBAL and MMIO base before ARP polling
+        let arp_mmio = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
+        let arp_rdbal = tcp_e1000_read_reg(TCP_E1000_RDBAL);
+        tcp_debug_char(77);  // 'M'
+        tcp_debug_hex(arp_mmio);
+        tcp_debug_char(66);  // 'B'
+        tcp_debug_hex(arp_rdbal);
+        tcp_debug_char(10);
+
+        // Poll for ARP reply with timeout
+        // CRITICAL: Add initial delay before polling - QEMU SLIRP needs time to process
+        // The ARP request goes: E1000 -> QEMU NAT -> host ARP -> QEMU NAT -> E1000
+        // This round-trip can take significant time in emulation
+        tcp_debug_char(87);  // 'W' - waiting
+        let mut init_wait: i64 = 0;
+        while init_wait < 50000000 {  // ~50ms initial wait
+            init_wait = init_wait + 1;
+        }
+        tcp_debug_char(80);  // 'P' - polling
+
+        // Debug: show E1000 RX state before polling
+        let arp_rctl = tcp_e1000_read_reg(TCP_E1000_RCTL);
+        let arp_rdh = tcp_e1000_read_reg(TCP_E1000_RDH);
+        let arp_rdt = tcp_e1000_read_reg(TCP_E1000_RDT);
+        let arp_gprc = tcp_e1000_read_reg(0x4074);  // Good Packets Received Count
+        tcp_debug_char(65);  // 'A'
+        tcp_debug_char(82);  // 'R'
+        tcp_debug_char(80);  // 'P'
+        tcp_debug_char(58);  // ':'
+        tcp_debug_char(82);  // 'R'
+        tcp_debug_hex(arp_rctl);
+        tcp_debug_char(72);  // 'H'
+        tcp_debug_dec(arp_rdh);
+        tcp_debug_char(84);  // 'T'
+        tcp_debug_dec(arp_rdt);
+        tcp_debug_char(71);  // 'G'
+        tcp_debug_dec(arp_gprc);
+        tcp_debug_char(10);
+
+        let mut attempts: i64 = 0;
+        while attempts < 100 {  // Increased from 20 - QEMU SLIRP has latency
+            // Resend ARP request periodically to "wake up" QEMU's network stack
+            if attempts % 20 == 0 && attempts > 0 {
+                tcp_debug_char(65);  // 'A' - resend ARP
+                tcp_arp_send_request(next_hop);
+            }
+
+            // Wait a bit - longer delay for QEMU network stack
+            let mut wait: i64 = 0;
+            while wait < 2000000 {  // Increased further
+                wait = wait + 1;
+            }
+
+            // Check for received packet and process ARP replies
+            tcp_poll_arp_reply();
+
+            // Debug: show RX state every 5 attempts
+            if attempts % 5 == 0 {
+                let poll_rdh = tcp_e1000_read_reg(TCP_E1000_RDH);
+                let poll_gprc = tcp_e1000_read_reg(0x4074);
+                tcp_debug_char(91);  // '['
+                tcp_debug_dec(attempts);
+                tcp_debug_char(72);  // 'H'
+                tcp_debug_dec(poll_rdh);
+                tcp_debug_char(71);  // 'G'
+                tcp_debug_dec(poll_gprc);
+                tcp_debug_char(93);  // ']'
+            }
+
+            // Retry ARP lookup
+            if tcp_arp_lookup(next_hop, dst_mac) == 1 {
+                tcp_debug_ok();
+                break;
+            }
+
+            attempts = attempts + 1;
+        }
+
+        // Final check
+        if tcp_arp_lookup(next_hop, dst_mac) == 0 {
+            tcp_debug_fail();
+            return 0;  // Still no MAC
+        }
+    }
+
+    // Get our MAC
+    tcp_get_our_mac(src_mac);
+
+    // Build ethernet frame header (ethertype 0x0800 = IPv4)
+    let frame = tcp_eth_build_header(dst_mac, src_mac, 0x0800);
+
+    // Copy IP packet to ethernet payload
+    tcp_memcpy(frame + TCP_ETH_HEADER_SIZE, TCP_IP_TX_BUF, total_ip_len);
+
+    // Debug: show full IP+TCP packet being sent
+    tcp_debug_char(73);  // 'I'
+    tcp_debug_char(80);  // 'P'
+    tcp_debug_char(58);  // ':'
+    let dump_len = TCP_ETH_HEADER_SIZE + total_ip_len;
+    let max_dump: i64 = if dump_len > 60 { 60 } else { dump_len };
+    let mut j: i64 = 0;
+    while j < max_dump {
+        tcp_debug_hex_byte(tcp_read_byte(frame + j));
+        j = j + 1;
+    }
+    tcp_debug_char(10);
+
+    // Send via E1000
+    tcp_e1000_send(frame, TCP_ETH_HEADER_SIZE + total_ip_len)
+}

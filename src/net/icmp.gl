@@ -36,10 +36,10 @@ const ICMP_DATA: i64 = 8;       // Data starts here
 const ICMP_HEADER_SIZE: i64 = 8;
 
 // ICMP TX Buffer
-const ICMP_TX_BUF: i64 = 0xB33000;   // ICMP TX buffer (512 bytes)
+const ICMP_TX_BUF: i64 = 0xD33000;   // ICMP TX buffer (512 bytes)
 
 // Ping State
-const PING_STATE_ADDR: i64 = 0xB33200;  // Ping state structure
+const PING_STATE_ADDR: i64 = 0xD33200;  // Ping state structure
 const PING_STATE_ID: i64 = 0;            // Current ping ID (2 bytes)
 const PING_STATE_SEQ: i64 = 2;           // Current sequence (2 bytes)
 const PING_STATE_TARGET: i64 = 4;        // Target IP (4 bytes)

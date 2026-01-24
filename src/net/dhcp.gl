@@ -74,7 +74,7 @@ const DHCP_STATE_RENEWING: i64 = 4;
 const DHCP_STATE_REBINDING: i64 = 5;
 
 // DHCP State Structure Address
-const DHCP_STATE_ADDR: i64 = 0xB33400;
+const DHCP_STATE_ADDR: i64 = 0xD33400;
 
 // State offsets
 const DHCP_S_STATE: i64 = 0;         // Current state (1 byte)
@@ -88,7 +88,7 @@ const DHCP_S_START_TIME: i64 = 28;   // Lease start time (8 bytes)
 const DHCP_S_RETRIES: i64 = 36;      // Retry count (1 byte)
 
 // DHCP TX Buffer
-const DHCP_TX_BUF: i64 = 0xB33800;   // DHCP TX buffer (512 bytes)
+const DHCP_TX_BUF: i64 = 0xD33800;   // DHCP TX buffer (512 bytes)
 
 // ============================================================
 // DHCP Packet Building
@@ -779,7 +779,7 @@ fn dhcp_get_ticks() -> i64 {
 }
 
 // External functions
-fn dhcp_get_mac_addr() -> i64 { 0xB20400 + 16 }
+fn dhcp_get_mac_addr() -> i64 { 0xD20400 + 16 }
 fn dhcp_net_get_ip() -> i64 { 0 }
 fn dhcp_net_set_ip(ip: i64) {}
 fn dhcp_net_set_netmask(mask: i64) {}

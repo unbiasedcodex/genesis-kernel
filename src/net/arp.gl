@@ -23,7 +23,7 @@ const ARP_OP_REPLY: i64 = 2;
 const ARP_PACKET_SIZE: i64 = 28;
 
 // ARP Cache
-const ARP_CACHE_ADDR: i64 = 0xB20500;  // ARP cache base address
+const ARP_CACHE_ADDR: i64 = 0xD20500;  // ARP cache base address
 const ARP_CACHE_SIZE: i64 = 64;         // Maximum entries
 const ARP_ENTRY_SIZE: i64 = 24;         // Size per entry
 
@@ -43,8 +43,8 @@ const ARP_ENTRY_PAD: i64 = 20;      // Padding (4 bytes)
 const ARP_TIMEOUT_TICKS: i64 = 30000;
 
 // ARP Packet Buffer
-const ARP_TX_BUF: i64 = 0xB31000;   // TX buffer for ARP packets
-const ARP_RX_BUF: i64 = 0xB31100;   // RX buffer for ARP packets
+const ARP_TX_BUF: i64 = 0xD31000;   // TX buffer for ARP packets
+const ARP_RX_BUF: i64 = 0xD31100;   // RX buffer for ARP packets
 
 // ============================================================
 // ARP Packet Structure (offsets within ARP payload)
@@ -600,12 +600,12 @@ fn net_get_ip() -> i64 {
 
 fn net_get_mac_addr() -> i64 {
     // Returns address of MAC, from e1000.gl state
-    0xB20400 + 16  // E1000_STATE_ADDR + E1000_STATE_MAC
+    0xD20400 + 16  // E1000_STATE_ADDR + E1000_STATE_MAC
 }
 
 fn arp_eth_build_header(src_mac: i64, ethertype: i64) -> i64 {
     // Build Ethernet header at a fixed location
-    let frame = 0xB31200;  // ARP frame buffer
+    let frame = 0xD31200;  // ARP frame buffer
 
     // Source MAC (bytes 6-11)
     arp_memcpy(frame + 6, src_mac, 6);

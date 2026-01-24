@@ -28,7 +28,7 @@ mod socket;
 // Network Stack State
 // ============================================================
 
-const NET_STACK_STATE_ADDR: i64 = 0xB3C000;
+const NET_STACK_STATE_ADDR: i64 = 0xD3C000;
 
 // State offsets
 const NET_STATE_INITIALIZED: i64 = 0;    // Initialization complete (1 byte)
@@ -41,7 +41,7 @@ const NET_STATE_RX_ERRORS: i64 = 24;     // RX errors (8 bytes)
 const NET_STATE_TX_ERRORS: i64 = 32;     // TX errors (8 bytes)
 
 // Receive buffer for packet processing
-const NET_RX_BUFFER: i64 = 0xB3C100;     // 2KB receive buffer
+const NET_RX_BUFFER: i64 = 0xD3C100;     // 2KB receive buffer
 const NET_RX_BUFFER_SIZE: i64 = 2048;
 
 // ============================================================
@@ -61,6 +61,12 @@ pub fn net_stack_init() -> i64 {
         return 0;
     }
     net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_DRIVER_OK, 1);
+
+    // Allow E1000 and QEMU's network to stabilize after init
+    let mut e1k_delay: i64 = 0;
+    while e1k_delay < 50000000 {  // ~50ms delay
+        e1k_delay = e1k_delay + 1;
+    }
 
     // Print MAC address
     net_debug_str("NET: MAC ");
@@ -119,10 +125,6 @@ pub fn net_stack_configure(ip: i64, mask: i64, gateway: i64, dns: i64) -> i64 {
 
     net_ip_configure(ip, mask, gateway, dns);
     net_write_byte(NET_STACK_STATE_ADDR + NET_STATE_IP_OK, 1);
-
-    net_debug_str("NET: Static IP configured: ");
-    net_debug_ip(ip);
-    net_debug_char(10);
 
     1
 }
@@ -503,3 +505,57 @@ fn net_dhcp_tick() { dhcp::dhcp_tick(); }
 
 // Socket
 fn net_socket_init() { socket::socket_init(); }
+
+// Socket API wrappers for syscalls
+pub fn net_socket_create(domain: i64, sock_type: i64, protocol: i64) -> i64 {
+    socket::socket(domain, sock_type, protocol)
+}
+
+pub fn net_socket_bind(fd: i64, ip: i64, port: i64) -> i64 {
+    socket::bind(fd, ip, port)
+}
+
+pub fn net_socket_listen(fd: i64, backlog: i64) -> i64 {
+    socket::listen(fd, backlog)
+}
+
+pub fn net_socket_accept(fd: i64) -> i64 {
+    socket::accept(fd)
+}
+
+pub fn net_socket_connect(fd: i64, ip: i64, port: i64) -> i64 {
+    socket::connect(fd, ip, port)
+}
+
+pub fn net_socket_send(fd: i64, data: i64, len: i64) -> i64 {
+    socket::send(fd, data, len)
+}
+
+pub fn net_socket_recv(fd: i64, buf: i64, max_len: i64) -> i64 {
+    socket::recv(fd, buf, max_len)
+}
+
+pub fn net_socket_close_fd(fd: i64) -> i64 {
+    socket::close(fd)
+}
+
+// TCP/UDP wrappers for socket.gl to call
+pub fn net_tcp_create() -> i64 { tcp::tcp_socket_create() }
+pub fn net_tcp_bind(id: i64, port: i64) -> i64 { tcp::tcp_socket_bind(id, port) }
+pub fn net_tcp_listen(id: i64, backlog: i64) -> i64 { tcp::tcp_socket_listen(id, backlog) }
+pub fn net_tcp_accept(id: i64) -> i64 { tcp::tcp_socket_accept(id) }
+pub fn net_tcp_connect(id: i64, ip: i64, port: i64) -> i64 { tcp::tcp_socket_connect(id, ip, port) }
+pub fn net_tcp_send(id: i64, data: i64, len: i64) -> i64 { tcp::tcp_socket_send(id, data, len) }
+pub fn net_tcp_recv(id: i64, buf: i64, len: i64) -> i64 { tcp::tcp_socket_recv(id, buf, len) }
+pub fn net_tcp_close(id: i64) -> i64 { tcp::tcp_socket_close(id) }
+pub fn net_tcp_configure_qemu() { tcp::tcp_net_configure_qemu() }
+
+pub fn net_udp_create() -> i64 { udp::udp_socket_create() }
+pub fn net_udp_bind(id: i64, port: i64) -> i64 { udp::udp_socket_bind(id, port) }
+pub fn net_udp_connect(id: i64, ip: i64, port: i64) -> i64 { udp::udp_socket_connect(id, ip, port) }
+pub fn net_udp_send(id: i64, data: i64, len: i64) -> i64 { udp::udp_socket_send(id, data, len) }
+pub fn net_udp_sendto(id: i64, ip: i64, port: i64, data: i64, len: i64) -> i64 { udp::udp_socket_sendto(id, ip, port, data, len) }
+pub fn net_udp_recv(id: i64, buf: i64, len: i64) -> i64 { udp::udp_socket_recv(id, buf, len) }
+pub fn net_udp_recvfrom(id: i64, buf: i64, len: i64, src_ip: i64, src_port: i64) -> i64 { udp::udp_socket_recvfrom(id, buf, len, src_ip, src_port) }
+pub fn net_udp_close(id: i64) -> i64 { udp::udp_socket_close(id) }
+pub fn net_udp_available(id: i64) -> i64 { udp::udp_socket_available(id) }

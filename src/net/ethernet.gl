@@ -28,8 +28,8 @@ const ETH_BROADCAST_MAC_4: i64 = 0xFF;
 const ETH_BROADCAST_MAC_5: i64 = 0xFF;
 
 // Temporary frame buffer for building outgoing frames
-const ETH_TX_FRAME_ADDR: i64 = 0xB30000;  // 2KB buffer for frame assembly
-const ETH_RX_FRAME_ADDR: i64 = 0xB30800;  // 2KB buffer for received frames
+const ETH_TX_FRAME_ADDR: i64 = 0xD30000;  // 2KB buffer for frame assembly
+const ETH_RX_FRAME_ADDR: i64 = 0xD30800;  // 2KB buffer for received frames
 
 // ============================================================
 // Ethernet Frame Structure

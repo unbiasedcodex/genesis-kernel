@@ -23,7 +23,7 @@ const IP_FLAG_MF: i64 = 0x2000;   // More Fragments
 const IP_FRAG_MASK: i64 = 0x1FFF; // Fragment offset mask
 
 // Network Configuration Address
-const NET_CONFIG_ADDR: i64 = 0xB21000;
+const NET_CONFIG_ADDR: i64 = 0xD21000;
 
 // Network Configuration Offsets (structure)
 const NET_CFG_IP: i64 = 0;           // Our IP address (4 bytes)
@@ -54,8 +54,8 @@ const IP_DST_ADDR: i64 = 16;    // Destination Address (4 bytes)
 const IP_OPTIONS: i64 = 20;     // Options start here
 
 // TX/RX Buffers
-const IP_TX_BUF: i64 = 0xB32000;   // IP TX buffer (2KB)
-const IP_RX_BUF: i64 = 0xB32800;   // IP RX buffer (2KB)
+const IP_TX_BUF: i64 = 0xD32000;   // IP TX buffer (2KB)
+const IP_RX_BUF: i64 = 0xD32800;   // IP RX buffer (2KB)
 
 // Ethernet header size
 const ETH_HEADER_SIZE: i64 = 14;
@@ -667,7 +667,7 @@ fn ip_debug_str(s: &str) {
 // External functions (linked from other modules)
 fn arp_lookup(ip: i64, mac_out: i64) -> i64 { 0 }
 fn arp_request(ip: i64) -> i64 { 0 }
-fn net_get_mac_addr() -> i64 { 0xB20400 + 16 }
+fn net_get_mac_addr() -> i64 { 0xD20400 + 16 }
 fn ip_eth_build_frame(dst_mac: i64, src_mac: i64, ethertype: i64) -> i64 { 0 }
 fn ip_eth_send(frame: i64, length: i64) -> i64 { 0 }
 fn icmp_handle_packet(ip_header: i64, payload: i64, length: i64) {}

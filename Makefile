@@ -94,6 +94,20 @@ run-disk: iso disk
 run-disk-vga: iso disk
 	qemu-system-x86_64 -cdrom $(ISO) -drive file=test.img,format=raw,if=ide
 
+# Run with network (E1000 NIC) - serial mode
+run-net: iso
+	qemu-system-x86_64 -cdrom $(ISO) \
+		-netdev user,id=net0,hostfwd=tcp::8080-:80 \
+		-device e1000,netdev=net0 \
+		-serial stdio -display none -m 128M
+
+# Run with network (E1000 NIC) - VGA mode
+run-net-vga: iso
+	qemu-system-x86_64 -cdrom $(ISO) \
+		-netdev user,id=net0,hostfwd=tcp::8080-:80 \
+		-device e1000,netdev=net0 \
+		-m 128M
+
 # Clean build artifacts
 clean:
 	rm -f $(KERNEL) kernel64.elf $(OBJS) $(ISO) test.img
@@ -106,4 +120,4 @@ check:
 	@which grub-mkrescue > /dev/null || (echo "Error: grub-mkrescue not found" && exit 1)
 	@echo "All tools found"
 
-.PHONY: all iso run run-vga debug disk run-disk run-disk-vga clean check
+.PHONY: all iso run run-vga debug disk run-disk run-disk-vga run-net run-net-vga clean check

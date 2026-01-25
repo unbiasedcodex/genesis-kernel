@@ -20,6 +20,10 @@ const COM1: i64 = 0x3F8;
 // Timer tick counter (stored at fixed address)
 const TICK_COUNT_ADDR: i64 = 0x412000;
 
+// Mouse state (stored at fixed address)
+const MOUSE_STATE_ADDR: i64 = 0x4B0000;
+// Offsets: 0=packet_index, 8=x, 16=y, 24=buttons, 32=packet[3]
+
 // PIT (Programmable Interval Timer) ports
 const PIT_CHANNEL0: i64 = 0x40;
 const PIT_CMD: i64 = 0x43;
@@ -304,8 +308,10 @@ fn handle_irq(irq: i64) {
     } else if irq == 1 {
         // Keyboard interrupt
         handle_keyboard();
+    } else if irq == 12 {
+        // Mouse interrupt
+        handle_mouse();
     }
-    // Other IRQs are ignored for now
 
     // Send End of Interrupt
     pic_send_eoi(irq);
@@ -372,4 +378,124 @@ fn inb(port: i64) -> i64 {
         );
     }
     result
+}
+
+// ============================================================
+// Mouse Handler (PS/2)
+// ============================================================
+
+fn handle_mouse() {
+    // Read byte from PS/2 data port
+    let byte = inb(0x60);
+
+    // Get packet index
+    let idx_ptr = MOUSE_STATE_ADDR as *i64;
+    let idx: i64;
+    unsafe { idx = volatile_read_i64(idx_ptr); }
+
+    // Store byte in packet buffer
+    let pkt_ptr = MOUSE_STATE_ADDR + 32 + idx;
+    unsafe { volatile_write_u8(pkt_ptr as *mut u8, byte as u8); }
+
+    // Increment packet index
+    let next_idx = idx + 1;
+
+    if next_idx >= 3 {
+        // Full packet received, process it
+        process_mouse_packet();
+        // Reset index
+        unsafe { volatile_write_i64(idx_ptr as *mut i64, 0); }
+    } else {
+        unsafe { volatile_write_i64(idx_ptr as *mut i64, next_idx); }
+    }
+}
+
+fn process_mouse_packet() {
+    // Read packet bytes
+    let b0_ptr = (MOUSE_STATE_ADDR + 32) as *u8;
+    let b1_ptr = (MOUSE_STATE_ADDR + 33) as *u8;
+    let b2_ptr = (MOUSE_STATE_ADDR + 34) as *u8;
+
+    let status: u8;
+    let dx_raw: u8;
+    let dy_raw: u8;
+    unsafe {
+        status = volatile_read_u8(b0_ptr);
+        dx_raw = volatile_read_u8(b1_ptr);
+        dy_raw = volatile_read_u8(b2_ptr);
+    }
+
+    // Validate packet - bit 3 must be set
+    let bit3 = status & 0x08;
+    if bit3 == 0 {
+        return;
+    }
+
+    // Extract buttons (bits 0-2 of status)
+    let buttons = status & 0x07;
+    let btn_ptr = (MOUSE_STATE_ADDR + 24) as *mut u8;
+    unsafe { volatile_write_u8(btn_ptr, buttons); }
+
+    // Get current position
+    let x_ptr = (MOUSE_STATE_ADDR + 8) as *i64;
+    let y_ptr = (MOUSE_STATE_ADDR + 16) as *i64;
+    let mut mx: i64;
+    let mut my: i64;
+    unsafe {
+        mx = volatile_read_i64(x_ptr);
+        my = volatile_read_i64(y_ptr);
+    }
+
+    // Apply delta with sign extension
+    let dx: i64 = if (status & 0x10) != 0 {
+        (dx_raw as i64) - 256
+    } else {
+        dx_raw as i64
+    };
+
+    let dy: i64 = if (status & 0x20) != 0 {
+        (dy_raw as i64) - 256
+    } else {
+        dy_raw as i64
+    };
+
+    // Update position (Y is inverted in PS/2)
+    mx = mx + dx;
+    my = my - dy;
+
+    // Clamp to screen bounds (assume 1920x1080)
+    if mx < 0 { mx = 0; }
+    if mx > 1919 { mx = 1919; }
+    if my < 0 { my = 0; }
+    if my > 1079 { my = 1079; }
+
+    // Store new position
+    unsafe {
+        volatile_write_i64(x_ptr as *mut i64, mx);
+        volatile_write_i64(y_ptr as *mut i64, my);
+    }
+}
+
+fn volatile_read_i64(ptr: *i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rcx), %rax",
+            in("rcx") ptr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn volatile_write_i64(ptr: *mut i64, value: i64) {
+    unsafe {
+        asm!(
+            "movq %rax, (%rcx)",
+            in("rcx") ptr,
+            in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
 }

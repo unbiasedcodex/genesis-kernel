@@ -3189,6 +3189,9 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         72 => syscall_fb_rect(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_RECT (5 args)
         73 => syscall_fb_swap(),                     // SYS_FB_SWAP
         74 => syscall_fb_clear(arg1),                // SYS_FB_CLEAR
+        90 => syscall_mouse_pos(),                   // SYS_MOUSE_POS
+        91 => syscall_mouse_btn(),                   // SYS_MOUSE_BTN
+        92 => syscall_mouse_set(arg1, arg2),         // SYS_MOUSE_SET
         _ => -1,                                // Unknown syscall
     }
 }
@@ -8821,6 +8824,174 @@ fn draw_rect_direct(fb_addr: i64, pitch: i64, x: i64, y: i64, w: i64, h: i64, co
     }
 }
 
+// ============================================================
+// Mouse PS/2 Initialization
+// ============================================================
+
+const MOUSE_STATE_ADDR: i64 = 0x4B0000;
+
+fn mouse_init() {
+    // Initialize mouse state to center of screen
+    let x_ptr = (MOUSE_STATE_ADDR + 8) as *mut i64;
+    let y_ptr = (MOUSE_STATE_ADDR + 16) as *mut i64;
+    let btn_ptr = (MOUSE_STATE_ADDR + 24) as *mut u8;
+    let idx_ptr = MOUSE_STATE_ADDR as *mut i64;
+    unsafe {
+        volatile_write_i64(x_ptr, 960);  // Center X
+        volatile_write_i64(y_ptr, 540);  // Center Y
+        volatile_write_u8(btn_ptr, 0);
+        volatile_write_i64(idx_ptr, 0);
+    }
+
+    // Wait for controller ready
+    mouse_wait_write();
+    outb_main(0x64, 0xA8);  // Enable auxiliary device
+
+    // Enable IRQ12
+    mouse_wait_write();
+    outb_main(0x64, 0x20);  // Read command byte
+    mouse_wait_read();
+    let config = inb_main(0x60);
+    // Enable IRQ12 - bit 1 should be 0 initially, so + works like |
+    let bit1_clear = config & 0xFD;  // Clear bit 1 first
+    let new_config = bit1_clear + 0x02;  // Set bit 1
+
+    mouse_wait_write();
+    outb_main(0x64, 0x60);  // Write command byte
+    mouse_wait_write();
+    outb_main(0x60, new_config as i64);
+
+    // Enable mouse data reporting
+    mouse_write_cmd(0xF4);
+
+    serial_out(77);  // M
+    serial_out(79);  // O
+    serial_out(85);  // U
+    serial_out(83);  // S
+    serial_out(69);  // E
+    serial_out(58);  // :
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
+fn mouse_wait_write() {
+    let mut timeout: i64 = 100000;
+    while timeout > 0 {
+        let status = inb_main(0x64);
+        let busy = status & 0x02;
+        if busy == 0 {
+            return;
+        }
+        timeout = timeout - 1;
+    }
+}
+
+fn mouse_wait_read() {
+    let mut timeout: i64 = 100000;
+    while timeout > 0 {
+        let status = inb_main(0x64);
+        let ready = status & 0x01;
+        if ready != 0 {
+            return;
+        }
+        timeout = timeout - 1;
+    }
+}
+
+fn mouse_write_cmd(cmd: i64) {
+    mouse_wait_write();
+    outb_main(0x64, 0xD4);  // Write to mouse
+    mouse_wait_write();
+    outb_main(0x60, cmd);
+    // Read ACK
+    mouse_wait_read();
+    let _ = inb_main(0x60);
+}
+
+fn inb_main(port: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "in %dx, %al",
+            in("dx") port,
+            lateout("al") result,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn outb_main(port: i64, value: i64) {
+    unsafe {
+        asm!(
+            "out %al, %dx",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+}
+
+fn volatile_write_i64(ptr: *mut i64, value: i64) {
+    unsafe {
+        asm!(
+            "movq %rax, (%rcx)",
+            in("rcx") ptr,
+            in("rax") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+// ============================================================
+// Mouse Syscalls
+// ============================================================
+
+fn syscall_mouse_pos() -> i64 {
+    let x_ptr = (MOUSE_STATE_ADDR + 8) as *i64;
+    let y_ptr = (MOUSE_STATE_ADDR + 16) as *i64;
+    let x: i64;
+    let y: i64;
+    unsafe {
+        x = volatile_read_i64(x_ptr);
+        y = volatile_read_i64(y_ptr);
+    }
+    // Return x in low 32 bits, y in high 32 bits
+    let y_shifted = y * 0x100000000;
+    x + y_shifted
+}
+
+fn syscall_mouse_btn() -> i64 {
+    let btn_ptr = (MOUSE_STATE_ADDR + 24) as *u8;
+    let btn: u8;
+    unsafe { btn = volatile_read_u8(btn_ptr); }
+    btn as i64
+}
+
+fn syscall_mouse_set(x: i64, y: i64) -> i64 {
+    let x_ptr = (MOUSE_STATE_ADDR + 8) as *mut i64;
+    let y_ptr = (MOUSE_STATE_ADDR + 16) as *mut i64;
+    unsafe {
+        volatile_write_i64(x_ptr, x);
+        volatile_write_i64(y_ptr, y);
+    }
+    0
+}
+
+fn volatile_read_i64(ptr: *i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rcx), %rax",
+            in("rcx") ptr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // Hello Graphics Demo - draw colored rectangles
 fn hello_graphics_demo() {
     let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
@@ -9241,6 +9412,9 @@ fn _start() {
 
     // Initialize VBE framebuffer
     let vbe_ok = vbe_init(mb_info_addr);
+
+    // Initialize PS/2 mouse
+    mouse_init();
 
     // Run graphics demo if VBE is available
     if vbe_ok {

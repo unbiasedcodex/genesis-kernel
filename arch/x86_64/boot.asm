@@ -10,7 +10,8 @@ bits 32
 MBOOT_MAGIC         equ 0x1BADB002
 MBOOT_ALIGN         equ 1 << 0
 MBOOT_MEMINFO       equ 1 << 1
-MBOOT_FLAGS         equ MBOOT_ALIGN | MBOOT_MEMINFO
+MBOOT_VIDEO         equ 1 << 2      ; Request VBE video mode
+MBOOT_FLAGS         equ MBOOT_ALIGN | MBOOT_MEMINFO | MBOOT_VIDEO
 MBOOT_CHECKSUM      equ -(MBOOT_MAGIC + MBOOT_FLAGS)
 
 ; Paging
@@ -28,6 +29,11 @@ align 4
     dd MBOOT_MAGIC
     dd MBOOT_FLAGS
     dd MBOOT_CHECKSUM
+    ; Video mode fields (required when MBOOT_VIDEO is set)
+    dd 0            ; mode_type: 0 = linear graphics mode
+    dd 1920         ; width: preferred 1920 pixels
+    dd 1080         ; height: preferred 1080 pixels
+    dd 32           ; bpp: 32 bits per pixel (ARGB8888)
 
 ; ============================================================
 ; Data

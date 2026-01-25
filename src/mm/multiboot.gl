@@ -18,6 +18,10 @@ pub const MMAP_TYPE_ACPI_RECLAIMABLE: u32 = 3;
 pub const MMAP_TYPE_ACPI_NVS: u32 = 4;
 pub const MMAP_TYPE_BAD: u32 = 5;
 
+// VBE flag bit (indicates framebuffer info is valid)
+pub const MB_FLAG_VBE: u32 = 2048;        // Bit 11: VBE info present
+pub const MB_FLAG_FRAMEBUFFER: u32 = 4096; // Bit 12: Framebuffer info present
+
 // ============================================================
 // Multiboot Structures
 // ============================================================
@@ -234,5 +238,76 @@ pub fn is_region_available(info: *MultibootInfo, start: u64, size: u64) -> bool 
         }
 
         false
+    }
+}
+
+// ============================================================
+// VBE / Framebuffer Information
+// ============================================================
+
+// Framebuffer info from Multiboot (when flag bit 12 is set)
+// Multiboot info offset 88: framebuffer_addr (8 bytes)
+// Multiboot info offset 96: framebuffer_pitch (4 bytes)
+// Multiboot info offset 100: framebuffer_width (4 bytes)
+// Multiboot info offset 104: framebuffer_height (4 bytes)
+// Multiboot info offset 108: framebuffer_bpp (1 byte)
+// Multiboot info offset 109: framebuffer_type (1 byte)
+
+// Global VBE info storage address
+pub const VBE_INFO_ADDR: i64 = 0x4C0000;
+
+// Check if framebuffer info is available in multiboot info
+pub fn has_framebuffer(info: *MultibootInfo) -> bool {
+    unsafe {
+        let flags = volatile_read_u32(info as *u32);
+        (flags & MB_FLAG_FRAMEBUFFER) != 0
+    }
+}
+
+// Get framebuffer address from multiboot info
+pub fn get_framebuffer_addr(info: *MultibootInfo) -> u64 {
+    unsafe {
+        let fb_addr_ptr = (info as u64 + 88) as *u64;
+        volatile_read_u64(fb_addr_ptr)
+    }
+}
+
+// Get framebuffer pitch (bytes per scanline)
+pub fn get_framebuffer_pitch(info: *MultibootInfo) -> u32 {
+    unsafe {
+        let pitch_ptr = (info as u64 + 96) as *u32;
+        volatile_read_u32(pitch_ptr)
+    }
+}
+
+// Get framebuffer width in pixels
+pub fn get_framebuffer_width(info: *MultibootInfo) -> u32 {
+    unsafe {
+        let width_ptr = (info as u64 + 100) as *u32;
+        volatile_read_u32(width_ptr)
+    }
+}
+
+// Get framebuffer height in pixels
+pub fn get_framebuffer_height(info: *MultibootInfo) -> u32 {
+    unsafe {
+        let height_ptr = (info as u64 + 104) as *u32;
+        volatile_read_u32(height_ptr)
+    }
+}
+
+// Get framebuffer bits per pixel
+pub fn get_framebuffer_bpp(info: *MultibootInfo) -> u8 {
+    unsafe {
+        let bpp_ptr = (info as u64 + 108) as *u8;
+        volatile_read_u8(bpp_ptr)
+    }
+}
+
+// Get framebuffer type (1=indexed, 2=direct RGB)
+pub fn get_framebuffer_type(info: *MultibootInfo) -> u8 {
+    unsafe {
+        let type_ptr = (info as u64 + 109) as *u8;
+        volatile_read_u8(type_ptr)
     }
 }

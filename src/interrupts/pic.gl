@@ -97,9 +97,24 @@ pub fn pic_init() {
     io_wait();
 
     // Restore saved masks (or set new ones)
-    // For now, mask all except timer (IRQ0) and keyboard (IRQ1)
-    outb(PIC1_DATA, 0xFC);         // Enable IRQ0 (timer), IRQ1 (keyboard)
-    outb(PIC2_DATA, 0xFF);         // Mask all slave IRQs
+    // Enable IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade from slave)
+    // IRQ2 must be enabled for slave PIC interrupts to work
+    outb(PIC1_DATA, 0xF8);         // Enable IRQ0, IRQ1, IRQ2 (cascade)
+    // Enable IRQ12 (mouse) on slave PIC
+    // IRQ12 is bit 4 on slave (IRQ 8-15 mapped to bits 0-7)
+    outb(PIC2_DATA, 0xEF);         // Enable IRQ12 (mouse)
+}
+
+/// Enable mouse IRQ (IRQ12)
+/// Call this after mouse initialization
+pub fn pic_enable_mouse() {
+    // Unmask IRQ2 on master (cascade) if not already
+    let master_mask = inb(PIC1_DATA);
+    outb(PIC1_DATA, master_mask & 0xFB);  // Clear bit 2
+
+    // Unmask IRQ12 on slave (bit 4)
+    let slave_mask = inb(PIC2_DATA);
+    outb(PIC2_DATA, slave_mask & 0xEF);   // Clear bit 4
 }
 
 /// Send End of Interrupt to PIC

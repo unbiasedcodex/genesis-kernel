@@ -3183,6 +3183,12 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         64 => syscall_net_getip(),                  // SYS_NET_GETIP
         65 => syscall_net_getmac(arg1),             // SYS_NET_GETMAC
         66 => syscall_net_poll(),                   // SYS_NET_POLL
+        // Graphics syscalls (70-76)
+        70 => syscall_fb_info(arg1),                 // SYS_FB_INFO
+        71 => syscall_fb_pixel(arg1, arg2, arg3),    // SYS_FB_PIXEL
+        72 => syscall_fb_rect(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_RECT (5 args)
+        73 => syscall_fb_swap(),                     // SYS_FB_SWAP
+        74 => syscall_fb_clear(arg1),                // SYS_FB_CLEAR
         _ => -1,                                // Unknown syscall
     }
 }
@@ -8379,6 +8385,517 @@ fn syscall_net_poll() -> i64 {
     return 0;
 }
 
+// ============================================================
+// Graphics Syscalls (Hello Graphics)
+// ============================================================
+
+const FB_STATE_BASE_SYS: i64 = 0x4C1000;
+const FB_GFX_STATE_ADDR_SYS: i64 = 0x4C2000;
+
+fn syscall_fb_info(which: i64) -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return 0;
+    }
+
+    if which == 0 {
+        let ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+        unsafe {
+            volatile_read_u32(ptr) as i64
+        }
+    } else if which == 1 {
+        let ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+        unsafe {
+            volatile_read_u32(ptr) as i64
+        }
+    } else {
+        0
+    }
+}
+
+const BACK_BUFFER_ADDR_SYS: i64 = 0x02000000;
+
+fn syscall_fb_pixel(x: i64, y: i64, color: i64) -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return -1;
+    }
+
+    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let width: i64;
+    let height: i64;
+    let pitch: i64;
+    unsafe {
+        width = volatile_read_u32(width_ptr) as i64;
+        height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    if x < 0 || x >= width || y < 0 || y >= height {
+        return -1;
+    }
+
+    // Convert color from RGB to BGR
+    // Use division instead of shift to avoid parser issues
+    let b = color & 0xFF;
+    let g = (color / 256) & 0xFF;
+    let r = (color / 65536) & 0xFF;
+    let g_shifted = g * 256;
+    let r_shifted = r * 65536;
+    let pixel = b | g_shifted | r_shifted;
+
+    let offset = y * pitch + x * 4;
+    let addr = (BACK_BUFFER_ADDR_SYS + offset) as *mut u32;
+    unsafe {
+        volatile_write_u32(addr, pixel as u32);
+    }
+    0
+}
+
+fn syscall_fb_rect(x: i64, y: i64, w: i64, h: i64, color: i64) -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return -1;
+    }
+
+    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let screen_width: i64;
+    let screen_height: i64;
+    let pitch: i64;
+    unsafe {
+        screen_width = volatile_read_u32(width_ptr) as i64;
+        screen_height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    // Clamp coordinates
+    let x0 = if x < 0 { 0 } else { x };
+    let y0 = if y < 0 { 0 } else { y };
+    let x1 = if x + w > screen_width { screen_width } else { x + w };
+    let y1 = if y + h > screen_height { screen_height } else { y + h };
+
+    if x0 >= x1 || y0 >= y1 {
+        return -1;
+    }
+
+    // Convert color
+    let b = color & 0xFF;
+    let g = (color / 256) & 0xFF;
+    let r = (color / 65536) & 0xFF;
+    let g_shifted = g * 256;
+    let r_shifted = r * 65536;
+    let pixel_tmp = b | g_shifted | r_shifted;
+    let pixel = pixel_tmp as u32;
+
+    // Fill rectangle
+    let mut py = y0;
+    while py < y1 {
+        let row_addr = BACK_BUFFER_ADDR_SYS + py * pitch;
+        let mut px = x0;
+        while px < x1 {
+            let addr = (row_addr + px * 4) as *mut u32;
+            unsafe {
+                volatile_write_u32(addr, pixel);
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    0
+}
+
+fn syscall_fb_clear(color: i64) -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return -1;
+    }
+
+    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let width: i64;
+    let height: i64;
+    let pitch: i64;
+    unsafe {
+        width = volatile_read_u32(width_ptr) as i64;
+        height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    // Convert color - match syscall_fb_rect pattern exactly
+    let b = color & 0xFF;
+    let g_div = color / 256;
+    let g = g_div & 0xFF;
+    let r_div = color / 65536;
+    let r = r_div & 0xFF;
+    let g_shifted = g * 256;
+    let r_shifted = r * 65536;
+    let pixel_tmp = b | g_shifted | r_shifted;
+    let pixel = pixel_tmp as u32;
+
+    // Simple 32-bit loop - slower but reliable
+    let total_pixels = width * height;
+    let mut i: i64 = 0;
+    while i < total_pixels {
+        let addr = BACK_BUFFER_ADDR_SYS + i * 4;
+        let ptr = addr as *mut u32;
+        unsafe {
+            volatile_write_u32(ptr, pixel);
+        }
+        i = i + 1;
+    }
+    0
+}
+
+fn syscall_fb_swap() -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return -1;
+    }
+
+    let fb_addr_ptr = (FB_GFX_STATE_ADDR_SYS + 8) as *u64;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let fb_addr: i64;
+    let height: i64;
+    let pitch: i64;
+    unsafe {
+        fb_addr = volatile_read_u64(fb_addr_ptr) as i64;
+        height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    let total_size = pitch * height;
+
+    // Copy back buffer to front buffer in 8-byte chunks
+    let mut offset: i64 = 0;
+    while offset < total_size {
+        let src = (BACK_BUFFER_ADDR_SYS + offset) as *u64;
+        let dst = (fb_addr + offset) as *mut u64;
+        unsafe {
+            let value = volatile_read_u64(src);
+            volatile_write_u64(dst, value);
+        }
+        offset = offset + 8;
+    }
+    0
+}
+
+// VBE initialization - read framebuffer info from multiboot
+fn vbe_init(mb_info_addr: i64) -> bool {
+    // Check if framebuffer flag is set (bit 12)
+    let flags_ptr = mb_info_addr as *u32;
+    let flags: u32;
+    unsafe {
+        flags = volatile_read_u32(flags_ptr);
+    }
+
+    let has_fb = (flags / 4096) & 1;  // Check bit 12
+    if has_fb == 0 {
+        serial_out(86);  // V
+        serial_out(66);  // B
+        serial_out(69);  // E
+        serial_out(58);  // :
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_newline();
+        return false;
+    }
+
+    // Read framebuffer info from multiboot (offset 88-108)
+    let fb_addr_ptr = (mb_info_addr + 88) as *u64;
+    let fb_pitch_ptr = (mb_info_addr + 96) as *u32;
+    let fb_width_ptr = (mb_info_addr + 100) as *u32;
+    let fb_height_ptr = (mb_info_addr + 104) as *u32;
+    let fb_bpp_ptr = (mb_info_addr + 108) as *u8;
+
+    let fb_addr: u64;
+    let fb_pitch: u32;
+    let fb_width: u32;
+    let fb_height: u32;
+    let fb_bpp: u8;
+
+    unsafe {
+        fb_addr = volatile_read_u64(fb_addr_ptr);
+        fb_pitch = volatile_read_u32(fb_pitch_ptr);
+        fb_width = volatile_read_u32(fb_width_ptr);
+        fb_height = volatile_read_u32(fb_height_ptr);
+        fb_bpp = volatile_read_u8(fb_bpp_ptr);
+    }
+
+    if fb_addr == 0 || fb_width == 0 || fb_height == 0 {
+        serial_out(86);  // V
+        serial_out(66);  // B
+        serial_out(69);  // E
+        serial_out(58);  // :
+        serial_out(66);  // B
+        serial_out(65);  // A
+        serial_out(68);  // D
+        serial_newline();
+        return false;
+    }
+
+    // Store framebuffer state at FB_GFX_STATE_ADDR_SYS
+    // Offset 0: initialized flag
+    // Offset 8: physical address
+    // Offset 16: width
+    // Offset 20: height
+    // Offset 24: pitch
+    // Offset 28: bpp
+    unsafe {
+        let init_ptr = FB_GFX_STATE_ADDR_SYS as *mut u8;
+        let addr_ptr = (FB_GFX_STATE_ADDR_SYS + 8) as *mut u64;
+        let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *mut u32;
+        let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *mut u32;
+        let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *mut u32;
+        let bpp_ptr = (FB_GFX_STATE_ADDR_SYS + 28) as *mut u8;
+
+        volatile_write_u64(addr_ptr, fb_addr);
+        volatile_write_u32(width_ptr, fb_width);
+        volatile_write_u32(height_ptr, fb_height);
+        volatile_write_u32(pitch_ptr, fb_pitch);
+        volatile_write_u8(bpp_ptr, fb_bpp);
+        volatile_write_u8(init_ptr, 1);  // Mark as initialized
+    }
+
+    // Map the framebuffer into page tables using 2MB huge pages
+    // Framebuffer is typically at 0xFD000000 or similar high address
+    let map_ok = map_framebuffer_pages(fb_addr, fb_pitch as u64 * fb_height as u64);
+    if !map_ok {
+        serial_out(86);  // V
+        serial_out(66);  // B
+        serial_out(69);  // E
+        serial_out(58);  // :
+        serial_out(77);  // M
+        serial_out(65);  // A
+        serial_out(80);  // P
+        serial_newline();
+        return false;
+    }
+
+    serial_out(86);  // V
+    serial_out(66);  // B
+    serial_out(69);  // E
+    serial_out(58);  // :
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    true
+}
+
+// Map framebuffer using 2MB huge pages
+fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
+    // Get PML4 address from CR3
+    let mut cr3: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %cr3, %rax",
+            lateout("rax") cr3,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    // Clear low 12 bits using division
+    let cr3_div = cr3 / 4096;
+    let pml4_addr = cr3_div * 4096;
+
+    // Calculate how many 2MB pages we need - round up
+    let fb_size_plus = fb_size + 0x1FFFFF;
+    let pages_needed = fb_size_plus / 0x200000;
+    // Align fb_addr to 2MB boundary using division
+    let fb_addr_div = fb_addr / 0x200000;
+    let fb_base = fb_addr_div * 0x200000;
+
+    // For each 2MB page in the framebuffer
+    let mut mapped: u64 = 0;
+    while mapped < pages_needed {
+        let phys = fb_base + mapped * 0x200000;
+
+        // Calculate page table indices
+        let pml4_div = phys / 0x8000000000;
+        let pml4_idx = pml4_div % 512;
+        let pdpt_div = phys / 0x40000000;
+        let pdpt_idx = pdpt_div % 512;
+        let pd_div = phys / 0x200000;
+        let pd_idx = pd_div % 512;
+
+        // Get or create PDPT entry
+        let pml4e_addr = pml4_addr + pml4_idx * 8;
+        let pml4e = read_u64_addr(pml4e_addr as i64);
+
+        let pdpt_addr: u64;
+        if pml4e % 2 == 0 {
+            let new_pdpt: u64 = 0x480000;
+            zero_page(new_pdpt as i64);
+            let new_pdpt_entry = new_pdpt + 7;
+            write_u64_addr(pml4e_addr as i64, new_pdpt_entry);
+            pdpt_addr = new_pdpt;
+        } else {
+            let div = pml4e / 4096;
+            pdpt_addr = div * 4096;
+        }
+
+        // Get or create PD entry
+        let pdpte_addr = pdpt_addr + pdpt_idx * 8;
+        let pdpte = read_u64_addr(pdpte_addr as i64);
+
+        let pd_addr: u64;
+        if pdpte % 2 == 0 {
+            let new_pd: u64 = 0x490000;
+            zero_page(new_pd as i64);
+            let new_pd_entry = new_pd + 7;
+            write_u64_addr(pdpte_addr as i64, new_pd_entry);
+            pd_addr = new_pd;
+        } else {
+            let div = pdpte / 4096;
+            pd_addr = div * 4096;
+        }
+
+        // Set PD entry as 2MB huge page (P + RW + U + WT + CD + HUGE = 0x9B)
+        let pde_addr = pd_addr + pd_idx * 8;
+        let pde_val = phys + 0x9B;
+        write_u64_addr(pde_addr as i64, pde_val);
+
+        // Invalidate TLB
+        unsafe {
+            asm!(
+                "invlpg (%rdi)",
+                in("rdi") phys,
+                options(nostack, att_syntax)
+            );
+        }
+
+        mapped = mapped + 1;
+    }
+
+    true
+}
+
+// Zero a 4KB page
+fn zero_page(addr: i64) {
+    let mut offset: i64 = 0;
+    while offset < 4096 {
+        write_u64_addr(addr + offset, 0);
+        offset = offset + 8;
+    }
+}
+
+// Draw rectangle directly to framebuffer
+fn draw_rect_direct(fb_addr: i64, pitch: i64, x: i64, y: i64, w: i64, h: i64, color: u32) {
+    let mut py = y;
+    while py < y + h {
+        let row_addr = fb_addr + py * pitch;
+        let mut px = x;
+        while px < x + w {
+            let addr = row_addr + px * 4;
+            unsafe {
+                volatile_write_u32(addr as *mut u32, color);
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+// Hello Graphics Demo - draw colored rectangles
+fn hello_graphics_demo() {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        serial_out(71);  // G
+        serial_out(70);  // F
+        serial_out(88);  // X
+        serial_out(58);  // :
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_newline();
+        return;
+    }
+
+    serial_out(71);  // G
+    serial_out(70);  // F
+    serial_out(88);  // X
+    serial_out(58);  // :
+    serial_out(68);  // D
+    serial_out(69);  // E
+    serial_out(77);  // M
+    serial_out(79);  // O
+    serial_newline();
+
+    // Get framebuffer parameters
+    let fb_addr_ptr = (FB_GFX_STATE_ADDR_SYS + 8) as *u64;
+    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let fb_addr: i64;
+    let width: i64;
+    let height: i64;
+    let pitch: i64;
+    unsafe {
+        fb_addr = volatile_read_u64(fb_addr_ptr) as i64;
+        width = volatile_read_u32(width_ptr) as i64;
+        height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    // Draw colored rectangles directly to framebuffer
+    // Red rectangle at top-left
+    draw_rect_direct(fb_addr, pitch, 50, 50, 150, 100, 0x0000FF);
+
+    // Green rectangle
+    draw_rect_direct(fb_addr, pitch, 250, 50, 150, 100, 0x00FF00);
+
+    // Blue rectangle
+    draw_rect_direct(fb_addr, pitch, 450, 50, 150, 100, 0xFF0000);
+
+    // Yellow rectangle
+    draw_rect_direct(fb_addr, pitch, 50, 200, 150, 100, 0x00FFFF);
+
+    // Magenta rectangle
+    draw_rect_direct(fb_addr, pitch, 250, 200, 150, 100, 0xFF00FF);
+
+    // Cyan rectangle
+    draw_rect_direct(fb_addr, pitch, 450, 200, 150, 100, 0xFFFF00);
+
+    // White rectangle
+    draw_rect_direct(fb_addr, pitch, 250, 350, 150, 100, 0xFFFFFF);
+
+    serial_out(71);  // G
+    serial_out(70);  // F
+    serial_out(88);  // X
+    serial_out(58);  // :
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
 // Debug function: check page table entry for an address
 fn debug_check_pte(vaddr: i64) {
     // Get CR3
@@ -8721,6 +9238,14 @@ fn _start() {
     // Read multiboot info address from 0x500 (stored by boot.asm)
     let mb_info_addr: i64 = read_u32_at(0x500, 0) as i64;
     let mm_ok = init_memory(mb_info_addr);
+
+    // Initialize VBE framebuffer
+    let vbe_ok = vbe_init(mb_info_addr);
+
+    // Run graphics demo if VBE is available
+    if vbe_ok {
+        hello_graphics_demo();
+    }
 
     // Initialize ATA disk driver
     ata_init();

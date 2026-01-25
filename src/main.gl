@@ -3189,6 +3189,8 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         72 => syscall_fb_rect(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_RECT (5 args)
         73 => syscall_fb_swap(),                     // SYS_FB_SWAP
         74 => syscall_fb_clear(arg1),                // SYS_FB_CLEAR
+        75 => syscall_fb_blit(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_BLIT
+        76 => syscall_fb_map(),                      // SYS_FB_MAP
         90 => syscall_mouse_pos(),                   // SYS_MOUSE_POS
         91 => syscall_mouse_btn(),                   // SYS_MOUSE_BTN
         92 => syscall_mouse_set(arg1, arg2),         // SYS_MOUSE_SET
@@ -8545,7 +8547,7 @@ fn syscall_fb_clear(color: i64) -> i64 {
         pitch = volatile_read_u32(pitch_ptr) as i64;
     }
 
-    // Convert color - match syscall_fb_rect pattern exactly
+    // Convert color from RGB to BGR
     let b = color & 0xFF;
     let g_div = color / 256;
     let g = g_div & 0xFF;
@@ -8553,19 +8555,23 @@ fn syscall_fb_clear(color: i64) -> i64 {
     let r = r_div & 0xFF;
     let g_shifted = g * 256;
     let r_shifted = r * 65536;
-    let pixel_tmp = b | g_shifted | r_shifted;
+    let pixel_tmp = b + g_shifted + r_shifted;
     let pixel = pixel_tmp as u32;
 
-    // Simple 32-bit loop - slower but reliable
-    let total_pixels = width * height;
-    let mut i: i64 = 0;
-    while i < total_pixels {
-        let addr = BACK_BUFFER_ADDR_SYS + i * 4;
-        let ptr = addr as *mut u32;
-        unsafe {
-            volatile_write_u32(ptr, pixel);
-        }
-        i = i + 1;
+    // Create 64-bit value with two pixels for rep stosq
+    let pixel64 = (pixel as u64) + ((pixel as u64) * 0x100000000);
+    let total_qwords = (width * height) / 2;
+    let dst = BACK_BUFFER_ADDR_SYS;
+
+    // Use rep stosq for fast fill (2 pixels at a time)
+    unsafe {
+        asm!(
+            "rep stosq",
+            in("rdi") dst,
+            in("rax") pixel64,
+            in("rcx") total_qwords,
+            options(nostack, att_syntax)
+        );
     }
     0
 }
@@ -8593,19 +8599,94 @@ fn syscall_fb_swap() -> i64 {
     }
 
     let total_size = pitch * height;
+    let total_qwords = total_size / 8;
+    let src = BACK_BUFFER_ADDR_SYS;
+    let dst = fb_addr;
 
-    // Copy back buffer to front buffer in 8-byte chunks
-    let mut offset: i64 = 0;
-    while offset < total_size {
-        let src = (BACK_BUFFER_ADDR_SYS + offset) as *u64;
-        let dst = (fb_addr + offset) as *mut u64;
-        unsafe {
-            let value = volatile_read_u64(src);
-            volatile_write_u64(dst, value);
-        }
-        offset = offset + 8;
+    // Use rep movsq for fast copy
+    unsafe {
+        asm!(
+            "rep movsq",
+            in("rsi") src,
+            in("rdi") dst,
+            in("rcx") total_qwords,
+            options(nostack, att_syntax)
+        );
     }
     0
+}
+
+// SYS_FB_BLIT - Copy pixel data to back buffer
+// src: source address of pixel data (BGRA format)
+// x, y: destination position
+// w, h: dimensions
+fn syscall_fb_blit(src: i64, x: i64, y: i64, w: i64, h: i64) -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return -1;
+    }
+
+    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
+    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
+    let screen_width: i64;
+    let screen_height: i64;
+    let pitch: i64;
+    unsafe {
+        screen_width = volatile_read_u32(width_ptr) as i64;
+        screen_height = volatile_read_u32(height_ptr) as i64;
+        pitch = volatile_read_u32(pitch_ptr) as i64;
+    }
+
+    // Bounds check
+    if x < 0 || y < 0 || w <= 0 || h <= 0 {
+        return -1;
+    }
+    if x + w > screen_width || y + h > screen_height {
+        return -1;
+    }
+
+    // Copy row by row
+    let src_stride = w * 4;
+    let mut row: i64 = 0;
+    while row < h {
+        let src_row = src + row * src_stride;
+        let dst_row = BACK_BUFFER_ADDR_SYS + (y + row) * pitch + x * 4;
+        let qwords = w / 2;
+
+        // Use rep movsq for fast copy
+        if qwords > 0 {
+            unsafe {
+                asm!(
+                    "rep movsq",
+                    in("rsi") src_row,
+                    in("rdi") dst_row,
+                    in("rcx") qwords,
+                    options(nostack, att_syntax)
+                );
+            }
+        }
+        row = row + 1;
+    }
+    0
+}
+
+// SYS_FB_MAP - Get framebuffer info for direct access
+// Returns: back buffer physical address
+fn syscall_fb_map() -> i64 {
+    let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
+    let initialized: u8;
+    unsafe {
+        initialized = volatile_read_u8(initialized_ptr);
+    }
+    if initialized == 0 {
+        return 0;
+    }
+    BACK_BUFFER_ADDR_SYS
 }
 
 // VBE initialization - read framebuffer info from multiboot
@@ -8992,7 +9073,7 @@ fn volatile_read_i64(ptr: *i64) -> i64 {
     result
 }
 
-// Hello Graphics Demo - draw colored rectangles
+// Hello Graphics Demo - draw colored rectangles using double-buffering
 fn hello_graphics_demo() {
     let initialized_ptr = FB_GFX_STATE_ADDR_SYS as *u8;
     let initialized: u8;
@@ -9020,43 +9101,52 @@ fn hello_graphics_demo() {
     serial_out(79);  // O
     serial_newline();
 
-    // Get framebuffer parameters
-    let fb_addr_ptr = (FB_GFX_STATE_ADDR_SYS + 8) as *u64;
-    let width_ptr = (FB_GFX_STATE_ADDR_SYS + 16) as *u32;
-    let height_ptr = (FB_GFX_STATE_ADDR_SYS + 20) as *u32;
+    // Get framebuffer pitch for back buffer drawing
     let pitch_ptr = (FB_GFX_STATE_ADDR_SYS + 24) as *u32;
-    let fb_addr: i64;
-    let width: i64;
-    let height: i64;
     let pitch: i64;
     unsafe {
-        fb_addr = volatile_read_u64(fb_addr_ptr) as i64;
-        width = volatile_read_u32(width_ptr) as i64;
-        height = volatile_read_u32(height_ptr) as i64;
         pitch = volatile_read_u32(pitch_ptr) as i64;
     }
 
-    // Draw colored rectangles directly to framebuffer
-    // Red rectangle at top-left
-    draw_rect_direct(fb_addr, pitch, 50, 50, 150, 100, 0x0000FF);
+    // Clear back buffer with dark blue background (0x003366 RGB -> BGR)
+    let _ = syscall_fb_clear(0x003366);
 
-    // Green rectangle
-    draw_rect_direct(fb_addr, pitch, 250, 50, 150, 100, 0x00FF00);
+    // Draw colored rectangles to back buffer
+    // Red rectangle at top-left (RGB 0xFF0000 -> BGR 0x0000FF)
+    draw_rect_backbuf(pitch, 50, 50, 150, 100, 0x0000FF);
 
-    // Blue rectangle
-    draw_rect_direct(fb_addr, pitch, 450, 50, 150, 100, 0xFF0000);
+    // Green rectangle (RGB 0x00FF00 -> BGR 0x00FF00)
+    draw_rect_backbuf(pitch, 250, 50, 150, 100, 0x00FF00);
 
-    // Yellow rectangle
-    draw_rect_direct(fb_addr, pitch, 50, 200, 150, 100, 0x00FFFF);
+    // Blue rectangle (RGB 0x0000FF -> BGR 0xFF0000)
+    draw_rect_backbuf(pitch, 450, 50, 150, 100, 0xFF0000);
 
-    // Magenta rectangle
-    draw_rect_direct(fb_addr, pitch, 250, 200, 150, 100, 0xFF00FF);
+    // Yellow rectangle (RGB 0xFFFF00 -> BGR 0x00FFFF)
+    draw_rect_backbuf(pitch, 50, 200, 150, 100, 0x00FFFF);
 
-    // Cyan rectangle
-    draw_rect_direct(fb_addr, pitch, 450, 200, 150, 100, 0xFFFF00);
+    // Magenta rectangle (RGB 0xFF00FF -> BGR 0xFF00FF)
+    draw_rect_backbuf(pitch, 250, 200, 150, 100, 0xFF00FF);
 
-    // White rectangle
-    draw_rect_direct(fb_addr, pitch, 250, 350, 150, 100, 0xFFFFFF);
+    // Cyan rectangle (RGB 0x00FFFF -> BGR 0xFFFF00)
+    draw_rect_backbuf(pitch, 450, 200, 150, 100, 0xFFFF00);
+
+    // White rectangle (RGB 0xFFFFFF -> BGR 0xFFFFFF)
+    draw_rect_backbuf(pitch, 250, 350, 150, 100, 0xFFFFFF);
+
+    // Draw mouse cursor at current position
+    let mx_ptr = (MOUSE_STATE_ADDR + 8) as *i64;
+    let my_ptr = (MOUSE_STATE_ADDR + 16) as *i64;
+    let mx: i64;
+    let my: i64;
+    unsafe {
+        mx = volatile_read_i64(mx_ptr);
+        my = volatile_read_i64(my_ptr);
+    }
+    // Draw white 10x10 cursor to back buffer
+    draw_rect_backbuf(pitch, mx, my, 10, 10, 0xFFFFFF);
+
+    // Swap back buffer to front buffer
+    let _ = syscall_fb_swap();
 
     serial_out(71);  // G
     serial_out(70);  // F
@@ -9065,6 +9155,23 @@ fn hello_graphics_demo() {
     serial_out(79);  // O
     serial_out(75);  // K
     serial_newline();
+}
+
+// Draw rectangle to back buffer
+fn draw_rect_backbuf(pitch: i64, x: i64, y: i64, w: i64, h: i64, color: u32) {
+    let mut py = y;
+    while py < y + h {
+        let row_addr = BACK_BUFFER_ADDR_SYS + py * pitch;
+        let mut px = x;
+        while px < x + w {
+            let addr = row_addr + px * 4;
+            unsafe {
+                volatile_write_u32(addr as *mut u32, color);
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
 }
 
 // Debug function: check page table entry for an address

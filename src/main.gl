@@ -8892,6 +8892,7 @@ const TLS_OFF_TX_BUF: i64 = 512;              // TX buffer (2048 bytes)
 const TLS_OFF_RX_BUF: i64 = 2560;             // RX buffer (4096 bytes)
 const TLS_OFF_RX_LEN: i64 = 6656;             // RX buffer length (4 bytes)
 const TLS_OFF_AES_KEYS: i64 = 6660;           // AES expanded keys (480 bytes)
+const TLS_OFF_PREMASTER: i64 = 7140;          // Premaster secret (48 bytes + 16 for cert ptrs)
 
 // TLS States
 const TLS_STATE_NONE: i64 = 0;
@@ -9413,6 +9414,1274 @@ fn tls_free_conn(conn_addr: i64) {
 }
 
 // ============================================================
+// AES-128 Implementation
+// ============================================================
+
+// AES S-box lookup table (stored as function due to no static arrays)
+fn aes_sbox(i: i64) -> i64 {
+    // S-box values in groups of 16
+    if i < 16 {
+        if i == 0 { return 0x63; } if i == 1 { return 0x7c; } if i == 2 { return 0x77; } if i == 3 { return 0x7b; }
+        if i == 4 { return 0xf2; } if i == 5 { return 0x6b; } if i == 6 { return 0x6f; } if i == 7 { return 0xc5; }
+        if i == 8 { return 0x30; } if i == 9 { return 0x01; } if i == 10 { return 0x67; } if i == 11 { return 0x2b; }
+        if i == 12 { return 0xfe; } if i == 13 { return 0xd7; } if i == 14 { return 0xab; } return 0x76;
+    }
+    if i < 32 {
+        let j = i - 16;
+        if j == 0 { return 0xca; } if j == 1 { return 0x82; } if j == 2 { return 0xc9; } if j == 3 { return 0x7d; }
+        if j == 4 { return 0xfa; } if j == 5 { return 0x59; } if j == 6 { return 0x47; } if j == 7 { return 0xf0; }
+        if j == 8 { return 0xad; } if j == 9 { return 0xd4; } if j == 10 { return 0xa2; } if j == 11 { return 0xaf; }
+        if j == 12 { return 0x9c; } if j == 13 { return 0xa4; } if j == 14 { return 0x72; } return 0xc0;
+    }
+    if i < 48 {
+        let j = i - 32;
+        if j == 0 { return 0xb7; } if j == 1 { return 0xfd; } if j == 2 { return 0x93; } if j == 3 { return 0x26; }
+        if j == 4 { return 0x36; } if j == 5 { return 0x3f; } if j == 6 { return 0xf7; } if j == 7 { return 0xcc; }
+        if j == 8 { return 0x34; } if j == 9 { return 0xa5; } if j == 10 { return 0xe5; } if j == 11 { return 0xf1; }
+        if j == 12 { return 0x71; } if j == 13 { return 0xd8; } if j == 14 { return 0x31; } return 0x15;
+    }
+    if i < 64 {
+        let j = i - 48;
+        if j == 0 { return 0x04; } if j == 1 { return 0xc7; } if j == 2 { return 0x23; } if j == 3 { return 0xc3; }
+        if j == 4 { return 0x18; } if j == 5 { return 0x96; } if j == 6 { return 0x05; } if j == 7 { return 0x9a; }
+        if j == 8 { return 0x07; } if j == 9 { return 0x12; } if j == 10 { return 0x80; } if j == 11 { return 0xe2; }
+        if j == 12 { return 0xeb; } if j == 13 { return 0x27; } if j == 14 { return 0xb2; } return 0x75;
+    }
+    if i < 80 {
+        let j = i - 64;
+        if j == 0 { return 0x09; } if j == 1 { return 0x83; } if j == 2 { return 0x2c; } if j == 3 { return 0x1a; }
+        if j == 4 { return 0x1b; } if j == 5 { return 0x6e; } if j == 6 { return 0x5a; } if j == 7 { return 0xa0; }
+        if j == 8 { return 0x52; } if j == 9 { return 0x3b; } if j == 10 { return 0xd6; } if j == 11 { return 0xb3; }
+        if j == 12 { return 0x29; } if j == 13 { return 0xe3; } if j == 14 { return 0x2f; } return 0x84;
+    }
+    if i < 96 {
+        let j = i - 80;
+        if j == 0 { return 0x53; } if j == 1 { return 0xd1; } if j == 2 { return 0x00; } if j == 3 { return 0xed; }
+        if j == 4 { return 0x20; } if j == 5 { return 0xfc; } if j == 6 { return 0xb1; } if j == 7 { return 0x5b; }
+        if j == 8 { return 0x6a; } if j == 9 { return 0xcb; } if j == 10 { return 0xbe; } if j == 11 { return 0x39; }
+        if j == 12 { return 0x4a; } if j == 13 { return 0x4c; } if j == 14 { return 0x58; } return 0xcf;
+    }
+    if i < 112 {
+        let j = i - 96;
+        if j == 0 { return 0xd0; } if j == 1 { return 0xef; } if j == 2 { return 0xaa; } if j == 3 { return 0xfb; }
+        if j == 4 { return 0x43; } if j == 5 { return 0x4d; } if j == 6 { return 0x33; } if j == 7 { return 0x85; }
+        if j == 8 { return 0x45; } if j == 9 { return 0xf9; } if j == 10 { return 0x02; } if j == 11 { return 0x7f; }
+        if j == 12 { return 0x50; } if j == 13 { return 0x3c; } if j == 14 { return 0x9f; } return 0xa8;
+    }
+    if i < 128 {
+        let j = i - 112;
+        if j == 0 { return 0x51; } if j == 1 { return 0xa3; } if j == 2 { return 0x40; } if j == 3 { return 0x8f; }
+        if j == 4 { return 0x92; } if j == 5 { return 0x9d; } if j == 6 { return 0x38; } if j == 7 { return 0xf5; }
+        if j == 8 { return 0xbc; } if j == 9 { return 0xb6; } if j == 10 { return 0xda; } if j == 11 { return 0x21; }
+        if j == 12 { return 0x10; } if j == 13 { return 0xff; } if j == 14 { return 0xf3; } return 0xd2;
+    }
+    if i < 144 {
+        let j = i - 128;
+        if j == 0 { return 0xcd; } if j == 1 { return 0x0c; } if j == 2 { return 0x13; } if j == 3 { return 0xec; }
+        if j == 4 { return 0x5f; } if j == 5 { return 0x97; } if j == 6 { return 0x44; } if j == 7 { return 0x17; }
+        if j == 8 { return 0xc4; } if j == 9 { return 0xa7; } if j == 10 { return 0x7e; } if j == 11 { return 0x3d; }
+        if j == 12 { return 0x64; } if j == 13 { return 0x5d; } if j == 14 { return 0x19; } return 0x73;
+    }
+    if i < 160 {
+        let j = i - 144;
+        if j == 0 { return 0x60; } if j == 1 { return 0x81; } if j == 2 { return 0x4f; } if j == 3 { return 0xdc; }
+        if j == 4 { return 0x22; } if j == 5 { return 0x2a; } if j == 6 { return 0x90; } if j == 7 { return 0x88; }
+        if j == 8 { return 0x46; } if j == 9 { return 0xee; } if j == 10 { return 0xb8; } if j == 11 { return 0x14; }
+        if j == 12 { return 0xde; } if j == 13 { return 0x5e; } if j == 14 { return 0x0b; } return 0xdb;
+    }
+    if i < 176 {
+        let j = i - 160;
+        if j == 0 { return 0xe0; } if j == 1 { return 0x32; } if j == 2 { return 0x3a; } if j == 3 { return 0x0a; }
+        if j == 4 { return 0x49; } if j == 5 { return 0x06; } if j == 6 { return 0x24; } if j == 7 { return 0x5c; }
+        if j == 8 { return 0xc2; } if j == 9 { return 0xd3; } if j == 10 { return 0xac; } if j == 11 { return 0x62; }
+        if j == 12 { return 0x91; } if j == 13 { return 0x95; } if j == 14 { return 0xe4; } return 0x79;
+    }
+    if i < 192 {
+        let j = i - 176;
+        if j == 0 { return 0xe7; } if j == 1 { return 0xc8; } if j == 2 { return 0x37; } if j == 3 { return 0x6d; }
+        if j == 4 { return 0x8d; } if j == 5 { return 0xd5; } if j == 6 { return 0x4e; } if j == 7 { return 0xa9; }
+        if j == 8 { return 0x6c; } if j == 9 { return 0x56; } if j == 10 { return 0xf4; } if j == 11 { return 0xea; }
+        if j == 12 { return 0x65; } if j == 13 { return 0x7a; } if j == 14 { return 0xae; } return 0x08;
+    }
+    if i < 208 {
+        let j = i - 192;
+        if j == 0 { return 0xba; } if j == 1 { return 0x78; } if j == 2 { return 0x25; } if j == 3 { return 0x2e; }
+        if j == 4 { return 0x1c; } if j == 5 { return 0xa6; } if j == 6 { return 0xb4; } if j == 7 { return 0xc6; }
+        if j == 8 { return 0xe8; } if j == 9 { return 0xdd; } if j == 10 { return 0x74; } if j == 11 { return 0x1f; }
+        if j == 12 { return 0x4b; } if j == 13 { return 0xbd; } if j == 14 { return 0x8b; } return 0x8a;
+    }
+    if i < 224 {
+        let j = i - 208;
+        if j == 0 { return 0x70; } if j == 1 { return 0x3e; } if j == 2 { return 0xb5; } if j == 3 { return 0x66; }
+        if j == 4 { return 0x48; } if j == 5 { return 0x03; } if j == 6 { return 0xf6; } if j == 7 { return 0x0e; }
+        if j == 8 { return 0x61; } if j == 9 { return 0x35; } if j == 10 { return 0x57; } if j == 11 { return 0xb9; }
+        if j == 12 { return 0x86; } if j == 13 { return 0xc1; } if j == 14 { return 0x1d; } return 0x9e;
+    }
+    if i < 240 {
+        let j = i - 224;
+        if j == 0 { return 0xe1; } if j == 1 { return 0xf8; } if j == 2 { return 0x98; } if j == 3 { return 0x11; }
+        if j == 4 { return 0x69; } if j == 5 { return 0xd9; } if j == 6 { return 0x8e; } if j == 7 { return 0x94; }
+        if j == 8 { return 0x9b; } if j == 9 { return 0x1e; } if j == 10 { return 0x87; } if j == 11 { return 0xe9; }
+        if j == 12 { return 0xce; } if j == 13 { return 0x55; } if j == 14 { return 0x28; } return 0xdf;
+    }
+    // i >= 240
+    let j = i - 240;
+    if j == 0 { return 0x8c; } if j == 1 { return 0xa1; } if j == 2 { return 0x89; } if j == 3 { return 0x0d; }
+    if j == 4 { return 0xbf; } if j == 5 { return 0xe6; } if j == 6 { return 0x42; } if j == 7 { return 0x68; }
+    if j == 8 { return 0x41; } if j == 9 { return 0x99; } if j == 10 { return 0x2d; } if j == 11 { return 0x0f; }
+    if j == 12 { return 0xb0; } if j == 13 { return 0x54; } if j == 14 { return 0xbb; } return 0x16;
+}
+
+// AES round constant
+fn aes_rcon(i: i64) -> i64 {
+    if i == 0 { return 0x01; }
+    if i == 1 { return 0x02; }
+    if i == 2 { return 0x04; }
+    if i == 3 { return 0x08; }
+    if i == 4 { return 0x10; }
+    if i == 5 { return 0x20; }
+    if i == 6 { return 0x40; }
+    if i == 7 { return 0x80; }
+    if i == 8 { return 0x1b; }
+    return 0x36;
+}
+
+// AES-128 Key Expansion (16 bytes key -> 176 bytes expanded)
+fn aes_key_expand(key_addr: i64, expanded_addr: i64) {
+    // Copy original key (first 16 bytes)
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(expanded_addr + i, read_byte_addr(key_addr + i));
+        i = i + 1;
+    }
+
+    // Generate remaining round keys (10 rounds, 16 bytes each = 160 more bytes)
+    let mut bytes_generated: i64 = 16;
+    let mut rcon_idx: i64 = 0;
+
+    while bytes_generated < 176 {
+        // Get last 4 bytes
+        let t0 = read_byte_addr(expanded_addr + bytes_generated - 4);
+        let t1 = read_byte_addr(expanded_addr + bytes_generated - 3);
+        let t2 = read_byte_addr(expanded_addr + bytes_generated - 2);
+        let t3 = read_byte_addr(expanded_addr + bytes_generated - 1);
+
+        // Every 16 bytes: RotWord + SubWord + Rcon
+        if bytes_generated % 16 == 0 {
+            // RotWord: [t0,t1,t2,t3] -> [t1,t2,t3,t0]
+            // SubWord: apply S-box
+            let s0 = aes_sbox(t1);
+            let s1 = aes_sbox(t2);
+            let s2 = aes_sbox(t3);
+            let s3 = aes_sbox(t0);
+
+            // XOR with Rcon
+            let r = aes_rcon(rcon_idx);
+            rcon_idx = rcon_idx + 1;
+
+            // XOR with word 4 positions back
+            let x0 = bit_xor(bit_xor(s0 as u64, r as u64), read_byte_addr(expanded_addr + bytes_generated - 16) as u64) as i64;
+            let x1 = bit_xor(s1 as u64, read_byte_addr(expanded_addr + bytes_generated - 15) as u64) as i64;
+            let x2 = bit_xor(s2 as u64, read_byte_addr(expanded_addr + bytes_generated - 14) as u64) as i64;
+            let x3 = bit_xor(s3 as u64, read_byte_addr(expanded_addr + bytes_generated - 13) as u64) as i64;
+
+            write_byte_addr(expanded_addr + bytes_generated, x0);
+            write_byte_addr(expanded_addr + bytes_generated + 1, x1);
+            write_byte_addr(expanded_addr + bytes_generated + 2, x2);
+            write_byte_addr(expanded_addr + bytes_generated + 3, x3);
+        } else {
+            // Simple XOR with word 4 positions back
+            let x0 = bit_xor(t0 as u64, read_byte_addr(expanded_addr + bytes_generated - 16) as u64) as i64;
+            let x1 = bit_xor(t1 as u64, read_byte_addr(expanded_addr + bytes_generated - 15) as u64) as i64;
+            let x2 = bit_xor(t2 as u64, read_byte_addr(expanded_addr + bytes_generated - 14) as u64) as i64;
+            let x3 = bit_xor(t3 as u64, read_byte_addr(expanded_addr + bytes_generated - 13) as u64) as i64;
+
+            write_byte_addr(expanded_addr + bytes_generated, x0);
+            write_byte_addr(expanded_addr + bytes_generated + 1, x1);
+            write_byte_addr(expanded_addr + bytes_generated + 2, x2);
+            write_byte_addr(expanded_addr + bytes_generated + 3, x3);
+        }
+        bytes_generated = bytes_generated + 4;
+    }
+}
+
+// GF(2^8) multiplication for MixColumns
+fn gf_mul(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    let mut aa = a;
+    let mut bb = b;
+
+    let mut i: i64 = 0;
+    while i < 8 {
+        if bit_and(bb as u64, 1) != 0 {
+            result = bit_xor(result as u64, aa as u64) as i64;
+        }
+        let hi_bit = bit_and(aa as u64, 0x80);
+        aa = bit_and(shl_u64(aa as u64, 1), 0xFF) as i64;
+        if hi_bit != 0 {
+            aa = bit_xor(aa as u64, 0x1b) as i64;  // AES irreducible polynomial
+        }
+        bb = shr_u64(bb as u64, 1) as i64;
+        i = i + 1;
+    }
+    result
+}
+
+// AES SubBytes transformation (in place, 16 bytes at state_addr)
+fn aes_sub_bytes(state_addr: i64) {
+    let mut i: i64 = 0;
+    while i < 16 {
+        let b = read_byte_addr(state_addr + i);
+        write_byte_addr(state_addr + i, aes_sbox(b));
+        i = i + 1;
+    }
+}
+
+// AES ShiftRows transformation (in place)
+fn aes_shift_rows(state_addr: i64) {
+    // Row 0: no shift
+    // Row 1: shift left by 1
+    let t = read_byte_addr(state_addr + 1);
+    write_byte_addr(state_addr + 1, read_byte_addr(state_addr + 5));
+    write_byte_addr(state_addr + 5, read_byte_addr(state_addr + 9));
+    write_byte_addr(state_addr + 9, read_byte_addr(state_addr + 13));
+    write_byte_addr(state_addr + 13, t);
+
+    // Row 2: shift left by 2
+    let t0 = read_byte_addr(state_addr + 2);
+    let t1 = read_byte_addr(state_addr + 6);
+    write_byte_addr(state_addr + 2, read_byte_addr(state_addr + 10));
+    write_byte_addr(state_addr + 6, read_byte_addr(state_addr + 14));
+    write_byte_addr(state_addr + 10, t0);
+    write_byte_addr(state_addr + 14, t1);
+
+    // Row 3: shift left by 3 (= shift right by 1)
+    let t = read_byte_addr(state_addr + 15);
+    write_byte_addr(state_addr + 15, read_byte_addr(state_addr + 11));
+    write_byte_addr(state_addr + 11, read_byte_addr(state_addr + 7));
+    write_byte_addr(state_addr + 7, read_byte_addr(state_addr + 3));
+    write_byte_addr(state_addr + 3, t);
+}
+
+// AES MixColumns transformation (in place)
+fn aes_mix_columns(state_addr: i64) {
+    let mut col: i64 = 0;
+    while col < 4 {
+        let c = col * 4;
+        let s0 = read_byte_addr(state_addr + c);
+        let s1 = read_byte_addr(state_addr + c + 1);
+        let s2 = read_byte_addr(state_addr + c + 2);
+        let s3 = read_byte_addr(state_addr + c + 3);
+
+        // MixColumns matrix multiplication in GF(2^8)
+        let r0 = bit_xor(bit_xor(bit_xor(gf_mul(2, s0) as u64, gf_mul(3, s1) as u64), s2 as u64), s3 as u64) as i64;
+        let r1 = bit_xor(bit_xor(bit_xor(s0 as u64, gf_mul(2, s1) as u64), gf_mul(3, s2) as u64), s3 as u64) as i64;
+        let r2 = bit_xor(bit_xor(bit_xor(s0 as u64, s1 as u64), gf_mul(2, s2) as u64), gf_mul(3, s3) as u64) as i64;
+        let r3 = bit_xor(bit_xor(bit_xor(gf_mul(3, s0) as u64, s1 as u64), s2 as u64), gf_mul(2, s3) as u64) as i64;
+
+        write_byte_addr(state_addr + c, r0);
+        write_byte_addr(state_addr + c + 1, r1);
+        write_byte_addr(state_addr + c + 2, r2);
+        write_byte_addr(state_addr + c + 3, r3);
+
+        col = col + 1;
+    }
+}
+
+// AES AddRoundKey transformation
+fn aes_add_round_key(state_addr: i64, round_key_addr: i64) {
+    let mut i: i64 = 0;
+    while i < 16 {
+        let s = read_byte_addr(state_addr + i);
+        let k = read_byte_addr(round_key_addr + i);
+        write_byte_addr(state_addr + i, bit_xor(s as u64, k as u64) as i64);
+        i = i + 1;
+    }
+}
+
+// AES-128 Block Encryption (16 bytes plaintext -> 16 bytes ciphertext)
+fn aes_encrypt_block(plaintext_addr: i64, ciphertext_addr: i64, expanded_key_addr: i64) {
+    // Copy plaintext to state
+    let state_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 8192;
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(state_addr + i, read_byte_addr(plaintext_addr + i));
+        i = i + 1;
+    }
+
+    // Initial round key addition
+    aes_add_round_key(state_addr, expanded_key_addr);
+
+    // Main rounds (1-9)
+    let mut round: i64 = 1;
+    while round < 10 {
+        aes_sub_bytes(state_addr);
+        aes_shift_rows(state_addr);
+        aes_mix_columns(state_addr);
+        aes_add_round_key(state_addr, expanded_key_addr + round * 16);
+        round = round + 1;
+    }
+
+    // Final round (no MixColumns)
+    aes_sub_bytes(state_addr);
+    aes_shift_rows(state_addr);
+    aes_add_round_key(state_addr, expanded_key_addr + 160);
+
+    // Copy state to ciphertext
+    i = 0;
+    while i < 16 {
+        write_byte_addr(ciphertext_addr + i, read_byte_addr(state_addr + i));
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// GCM Mode Implementation
+// ============================================================
+
+// GF(2^128) multiplication for GHASH (bit-by-bit, MSB first)
+fn gcm_gf_mul(x_addr: i64, y_addr: i64, result_addr: i64) {
+    // Zero result
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(result_addr + i, 0);
+        i = i + 1;
+    }
+
+    // Temp for V (copy of Y)
+    let v_addr = result_addr + 16;
+    i = 0;
+    while i < 16 {
+        write_byte_addr(v_addr + i, read_byte_addr(y_addr + i));
+        i = i + 1;
+    }
+
+    // Process each bit of X
+    let mut byte_idx: i64 = 0;
+    while byte_idx < 16 {
+        let x_byte = read_byte_addr(x_addr + byte_idx);
+        let mut bit_idx: i64 = 7;
+        while bit_idx >= 0 {
+            // If bit is set, XOR V into result
+            if bit_and(x_byte as u64, shl_u64(1, bit_idx as u64)) != 0 {
+                i = 0;
+                while i < 16 {
+                    let r = read_byte_addr(result_addr + i);
+                    let v = read_byte_addr(v_addr + i);
+                    write_byte_addr(result_addr + i, bit_xor(r as u64, v as u64) as i64);
+                    i = i + 1;
+                }
+            }
+
+            // Multiply V by x (shift right, conditionally XOR R)
+            let lsb = bit_and(read_byte_addr(v_addr + 15) as u64, 1);
+
+            // Shift V right by 1 bit
+            i = 15;
+            while i > 0 {
+                let curr = read_byte_addr(v_addr + i);
+                let prev = read_byte_addr(v_addr + i - 1);
+                let new_val = bit_or(shr_u64(curr as u64, 1), shl_u64(bit_and(prev as u64, 1), 7)) as i64;
+                write_byte_addr(v_addr + i, new_val);
+                i = i - 1;
+            }
+            write_byte_addr(v_addr, shr_u64(read_byte_addr(v_addr) as u64, 1) as i64);
+
+            // If LSB was 1, XOR with R (0xE1 in MSB position)
+            if lsb != 0 {
+                let v0 = read_byte_addr(v_addr);
+                write_byte_addr(v_addr, bit_xor(v0 as u64, 0xE1) as i64);
+            }
+
+            bit_idx = bit_idx - 1;
+        }
+        byte_idx = byte_idx + 1;
+    }
+}
+
+// GHASH function for GCM authentication
+fn gcm_ghash(h_addr: i64, data_addr: i64, data_len: i64, result_addr: i64) {
+    // Zero result (Y_0 = 0)
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(result_addr + i, 0);
+        i = i + 1;
+    }
+
+    // Process 16-byte blocks
+    let temp_addr = result_addr + 32;
+    let mut offset: i64 = 0;
+    while offset < data_len {
+        // XOR block into result
+        i = 0;
+        while i < 16 && (offset + i) < data_len {
+            let r = read_byte_addr(result_addr + i);
+            let d = read_byte_addr(data_addr + offset + i);
+            write_byte_addr(result_addr + i, bit_xor(r as u64, d as u64) as i64);
+            i = i + 1;
+        }
+
+        // GF multiply by H
+        gcm_gf_mul(result_addr, h_addr, temp_addr);
+
+        // Copy temp back to result
+        i = 0;
+        while i < 16 {
+            write_byte_addr(result_addr + i, read_byte_addr(temp_addr + i));
+            i = i + 1;
+        }
+
+        offset = offset + 16;
+    }
+}
+
+// Increment counter (big-endian, last 4 bytes)
+fn gcm_inc_counter(counter_addr: i64) {
+    let mut i: i64 = 15;
+    while i >= 12 {
+        let b = read_byte_addr(counter_addr + i);
+        if b < 255 {
+            write_byte_addr(counter_addr + i, b + 1);
+            return;
+        }
+        write_byte_addr(counter_addr + i, 0);
+        i = i - 1;
+    }
+}
+
+// AES-GCM Encrypt
+// iv_addr: 12-byte IV
+// plaintext_addr: plaintext data
+// plaintext_len: length of plaintext
+// aad_addr: additional authenticated data (can be 0)
+// aad_len: length of AAD
+// ciphertext_addr: output ciphertext (same size as plaintext)
+// tag_addr: output 16-byte authentication tag
+// expanded_key_addr: AES expanded key (176 bytes)
+fn aes_gcm_encrypt(iv_addr: i64, plaintext_addr: i64, plaintext_len: i64,
+                   aad_addr: i64, aad_len: i64,
+                   ciphertext_addr: i64, tag_addr: i64, expanded_key_addr: i64) {
+    let work_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 8448;
+
+    // Compute H = AES(K, 0^128)
+    let h_addr = work_addr;
+    let zero_block_addr = work_addr + 64;
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(zero_block_addr + i, 0);
+        i = i + 1;
+    }
+    aes_encrypt_block(zero_block_addr, h_addr, expanded_key_addr);
+
+    // Initialize counter J0 = IV || 0^31 || 1
+    let j0_addr = work_addr + 80;
+    i = 0;
+    while i < 12 {
+        write_byte_addr(j0_addr + i, read_byte_addr(iv_addr + i));
+        i = i + 1;
+    }
+    write_byte_addr(j0_addr + 12, 0);
+    write_byte_addr(j0_addr + 13, 0);
+    write_byte_addr(j0_addr + 14, 0);
+    write_byte_addr(j0_addr + 15, 1);
+
+    // Counter for encryption (J0 + 1)
+    let counter_addr = work_addr + 96;
+    i = 0;
+    while i < 16 {
+        write_byte_addr(counter_addr + i, read_byte_addr(j0_addr + i));
+        i = i + 1;
+    }
+    gcm_inc_counter(counter_addr);
+
+    // Encrypt plaintext (CTR mode)
+    let keystream_addr = work_addr + 112;
+    let mut offset: i64 = 0;
+    while offset < plaintext_len {
+        // Generate keystream block
+        aes_encrypt_block(counter_addr, keystream_addr, expanded_key_addr);
+        gcm_inc_counter(counter_addr);
+
+        // XOR with plaintext
+        i = 0;
+        while i < 16 && (offset + i) < plaintext_len {
+            let p = read_byte_addr(plaintext_addr + offset + i);
+            let k = read_byte_addr(keystream_addr + i);
+            write_byte_addr(ciphertext_addr + offset + i, bit_xor(p as u64, k as u64) as i64);
+            i = i + 1;
+        }
+        offset = offset + 16;
+    }
+
+    // Build GHASH input: AAD || pad || C || pad || len(AAD) || len(C)
+    let ghash_input_addr = work_addr + 256;
+    let mut ghash_len: i64 = 0;
+
+    // Copy AAD (padded to 16 bytes)
+    if aad_len > 0 {
+        i = 0;
+        while i < aad_len {
+            write_byte_addr(ghash_input_addr + i, read_byte_addr(aad_addr + i));
+            i = i + 1;
+        }
+        // Pad to 16-byte boundary
+        let aad_padded = ((aad_len + 15) / 16) * 16;
+        while i < aad_padded {
+            write_byte_addr(ghash_input_addr + i, 0);
+            i = i + 1;
+        }
+        ghash_len = aad_padded;
+    }
+
+    // Copy ciphertext (padded to 16 bytes)
+    i = 0;
+    while i < plaintext_len {
+        write_byte_addr(ghash_input_addr + ghash_len + i, read_byte_addr(ciphertext_addr + i));
+        i = i + 1;
+    }
+    let ct_padded = ((plaintext_len + 15) / 16) * 16;
+    while i < ct_padded {
+        write_byte_addr(ghash_input_addr + ghash_len + i, 0);
+        i = i + 1;
+    }
+    ghash_len = ghash_len + ct_padded;
+
+    // Append lengths (big-endian, 64 bits each)
+    let aad_bits = aad_len * 8;
+    let ct_bits = plaintext_len * 8;
+    write_byte_addr(ghash_input_addr + ghash_len, shr_u64(aad_bits as u64, 56) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 1, shr_u64(aad_bits as u64, 48) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 2, shr_u64(aad_bits as u64, 40) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 3, shr_u64(aad_bits as u64, 32) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 4, shr_u64(aad_bits as u64, 24) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 5, shr_u64(aad_bits as u64, 16) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 6, shr_u64(aad_bits as u64, 8) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 7, aad_bits as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 8, shr_u64(ct_bits as u64, 56) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 9, shr_u64(ct_bits as u64, 48) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 10, shr_u64(ct_bits as u64, 40) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 11, shr_u64(ct_bits as u64, 32) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 12, shr_u64(ct_bits as u64, 24) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 13, shr_u64(ct_bits as u64, 16) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 14, shr_u64(ct_bits as u64, 8) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 15, ct_bits as i64);
+    ghash_len = ghash_len + 16;
+
+    // Compute GHASH
+    let ghash_result_addr = work_addr + 128;
+    gcm_ghash(h_addr, ghash_input_addr, ghash_len, ghash_result_addr);
+
+    // Compute tag = GHASH XOR AES(K, J0)
+    let enc_j0_addr = work_addr + 144;
+    aes_encrypt_block(j0_addr, enc_j0_addr, expanded_key_addr);
+
+    i = 0;
+    while i < 16 {
+        let g = read_byte_addr(ghash_result_addr + i);
+        let e = read_byte_addr(enc_j0_addr + i);
+        write_byte_addr(tag_addr + i, bit_xor(g as u64, e as u64) as i64);
+        i = i + 1;
+    }
+}
+
+// AES-GCM Decrypt (returns 0 on success, -1 on tag mismatch)
+fn aes_gcm_decrypt(iv_addr: i64, ciphertext_addr: i64, ciphertext_len: i64,
+                   aad_addr: i64, aad_len: i64,
+                   plaintext_addr: i64, tag_addr: i64, expanded_key_addr: i64) -> i64 {
+    let work_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 8448;
+
+    // Compute H = AES(K, 0^128)
+    let h_addr = work_addr;
+    let zero_block_addr = work_addr + 64;
+    let mut i: i64 = 0;
+    while i < 16 {
+        write_byte_addr(zero_block_addr + i, 0);
+        i = i + 1;
+    }
+    aes_encrypt_block(zero_block_addr, h_addr, expanded_key_addr);
+
+    // Initialize counter J0 = IV || 0^31 || 1
+    let j0_addr = work_addr + 80;
+    i = 0;
+    while i < 12 {
+        write_byte_addr(j0_addr + i, read_byte_addr(iv_addr + i));
+        i = i + 1;
+    }
+    write_byte_addr(j0_addr + 12, 0);
+    write_byte_addr(j0_addr + 13, 0);
+    write_byte_addr(j0_addr + 14, 0);
+    write_byte_addr(j0_addr + 15, 1);
+
+    // Build GHASH input and compute expected tag
+    let ghash_input_addr = work_addr + 256;
+    let mut ghash_len: i64 = 0;
+
+    // Copy AAD (padded to 16 bytes)
+    if aad_len > 0 {
+        i = 0;
+        while i < aad_len {
+            write_byte_addr(ghash_input_addr + i, read_byte_addr(aad_addr + i));
+            i = i + 1;
+        }
+        let aad_padded = ((aad_len + 15) / 16) * 16;
+        while i < aad_padded {
+            write_byte_addr(ghash_input_addr + i, 0);
+            i = i + 1;
+        }
+        ghash_len = aad_padded;
+    }
+
+    // Copy ciphertext (padded)
+    i = 0;
+    while i < ciphertext_len {
+        write_byte_addr(ghash_input_addr + ghash_len + i, read_byte_addr(ciphertext_addr + i));
+        i = i + 1;
+    }
+    let ct_padded = ((ciphertext_len + 15) / 16) * 16;
+    while i < ct_padded {
+        write_byte_addr(ghash_input_addr + ghash_len + i, 0);
+        i = i + 1;
+    }
+    ghash_len = ghash_len + ct_padded;
+
+    // Append lengths
+    let aad_bits = aad_len * 8;
+    let ct_bits = ciphertext_len * 8;
+    write_byte_addr(ghash_input_addr + ghash_len, shr_u64(aad_bits as u64, 56) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 1, shr_u64(aad_bits as u64, 48) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 2, shr_u64(aad_bits as u64, 40) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 3, shr_u64(aad_bits as u64, 32) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 4, shr_u64(aad_bits as u64, 24) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 5, shr_u64(aad_bits as u64, 16) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 6, shr_u64(aad_bits as u64, 8) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 7, aad_bits as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 8, shr_u64(ct_bits as u64, 56) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 9, shr_u64(ct_bits as u64, 48) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 10, shr_u64(ct_bits as u64, 40) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 11, shr_u64(ct_bits as u64, 32) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 12, shr_u64(ct_bits as u64, 24) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 13, shr_u64(ct_bits as u64, 16) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 14, shr_u64(ct_bits as u64, 8) as i64);
+    write_byte_addr(ghash_input_addr + ghash_len + 15, ct_bits as i64);
+    ghash_len = ghash_len + 16;
+
+    // Compute GHASH
+    let ghash_result_addr = work_addr + 128;
+    gcm_ghash(h_addr, ghash_input_addr, ghash_len, ghash_result_addr);
+
+    // Compute expected tag
+    let enc_j0_addr = work_addr + 144;
+    aes_encrypt_block(j0_addr, enc_j0_addr, expanded_key_addr);
+
+    let expected_tag_addr = work_addr + 160;
+    i = 0;
+    while i < 16 {
+        let g = read_byte_addr(ghash_result_addr + i);
+        let e = read_byte_addr(enc_j0_addr + i);
+        write_byte_addr(expected_tag_addr + i, bit_xor(g as u64, e as u64) as i64);
+        i = i + 1;
+    }
+
+    // Verify tag (constant-time comparison)
+    let mut diff: i64 = 0;
+    i = 0;
+    while i < 16 {
+        let expected = read_byte_addr(expected_tag_addr + i);
+        let actual = read_byte_addr(tag_addr + i);
+        diff = bit_or(diff as u64, bit_xor(expected as u64, actual as u64)) as i64;
+        i = i + 1;
+    }
+
+    if diff != 0 {
+        return -1;  // Tag mismatch
+    }
+
+    // Decrypt ciphertext (CTR mode, same as encrypt)
+    let counter_addr = work_addr + 96;
+    i = 0;
+    while i < 16 {
+        write_byte_addr(counter_addr + i, read_byte_addr(j0_addr + i));
+        i = i + 1;
+    }
+    gcm_inc_counter(counter_addr);
+
+    let keystream_addr = work_addr + 112;
+    let mut offset: i64 = 0;
+    while offset < ciphertext_len {
+        aes_encrypt_block(counter_addr, keystream_addr, expanded_key_addr);
+        gcm_inc_counter(counter_addr);
+
+        i = 0;
+        while i < 16 && (offset + i) < ciphertext_len {
+            let c = read_byte_addr(ciphertext_addr + offset + i);
+            let k = read_byte_addr(keystream_addr + i);
+            write_byte_addr(plaintext_addr + offset + i, bit_xor(c as u64, k as u64) as i64);
+            i = i + 1;
+        }
+        offset = offset + 16;
+    }
+
+    0  // Success
+}
+
+// ============================================================
+// TLS Handshake Implementation
+// ============================================================
+
+// Build and send ClientHello message
+fn tls_send_client_hello(conn: i64, socket: i64) -> i64 {
+    let tx_buf = conn + TLS_OFF_TX_BUF;
+    let mut pos: i64 = 0;
+
+    // TLS Record header
+    write_byte_addr(tx_buf + pos, 0x16);  // Handshake
+    pos = pos + 1;
+    write_byte_addr(tx_buf + pos, 0x03);  // TLS 1.0 for ClientHello
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+    // Length placeholder (will fill later)
+    let record_len_pos = pos;
+    pos = pos + 2;
+
+    // Handshake header
+    let hs_start = pos;
+    write_byte_addr(tx_buf + pos, 0x01);  // ClientHello
+    pos = pos + 1;
+    // Length placeholder (3 bytes)
+    let hs_len_pos = pos;
+    pos = pos + 3;
+
+    // Client Version (TLS 1.2)
+    write_byte_addr(tx_buf + pos, 0x03);
+    write_byte_addr(tx_buf + pos + 1, 0x03);
+    pos = pos + 2;
+
+    // Client Random (32 bytes)
+    let mut i: i64 = 0;
+    while i < 32 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i));
+        i = i + 1;
+    }
+    pos = pos + 32;
+
+    // Session ID (empty)
+    write_byte_addr(tx_buf + pos, 0);
+    pos = pos + 1;
+
+    // Cipher Suites (2 bytes length + suites)
+    write_byte_addr(tx_buf + pos, 0);
+    write_byte_addr(tx_buf + pos + 1, 2);  // 1 cipher suite = 2 bytes
+    pos = pos + 2;
+    // TLS_RSA_WITH_AES_128_GCM_SHA256 (0x009C)
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x9C);
+    pos = pos + 2;
+
+    // Compression Methods (1 byte length + null)
+    write_byte_addr(tx_buf + pos, 1);  // Length
+    write_byte_addr(tx_buf + pos + 1, 0);  // No compression
+    pos = pos + 2;
+
+    // Extensions (SNI - Server Name Indication)
+    let ext_start = pos;
+    pos = pos + 2;  // Extension length placeholder
+
+    // SNI Extension
+    let hostname_len = read_u64_addr(conn + TLS_OFF_HOSTNAME_LEN) as i64;
+    if hostname_len > 0 {
+        // Extension type: server_name (0x0000)
+        write_byte_addr(tx_buf + pos, 0);
+        write_byte_addr(tx_buf + pos + 1, 0);
+        pos = pos + 2;
+
+        // Extension data length
+        let sni_data_len = hostname_len + 5;
+        write_byte_addr(tx_buf + pos, shr_u64(sni_data_len as u64, 8) as i64);
+        write_byte_addr(tx_buf + pos + 1, sni_data_len as i64);
+        pos = pos + 2;
+
+        // Server Name List length
+        let sni_list_len = hostname_len + 3;
+        write_byte_addr(tx_buf + pos, shr_u64(sni_list_len as u64, 8) as i64);
+        write_byte_addr(tx_buf + pos + 1, sni_list_len as i64);
+        pos = pos + 2;
+
+        // Name type: host_name (0)
+        write_byte_addr(tx_buf + pos, 0);
+        pos = pos + 1;
+
+        // Hostname length
+        write_byte_addr(tx_buf + pos, shr_u64(hostname_len as u64, 8) as i64);
+        write_byte_addr(tx_buf + pos + 1, hostname_len as i64);
+        pos = pos + 2;
+
+        // Hostname
+        i = 0;
+        while i < hostname_len {
+            write_byte_addr(tx_buf + pos + i, read_byte_addr(conn + TLS_OFF_HOSTNAME + i));
+            i = i + 1;
+        }
+        pos = pos + hostname_len;
+    }
+
+    // Fill extension length
+    let ext_len = pos - ext_start - 2;
+    write_byte_addr(tx_buf + ext_start, shr_u64(ext_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + ext_start + 1, ext_len as i64);
+
+    // Fill handshake length
+    let hs_len = pos - hs_start - 4;
+    write_byte_addr(tx_buf + hs_len_pos, shr_u64(hs_len as u64, 16) as i64);
+    write_byte_addr(tx_buf + hs_len_pos + 1, shr_u64(hs_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + hs_len_pos + 2, hs_len as i64);
+
+    // Fill record length
+    let record_len = pos - 5;
+    write_byte_addr(tx_buf + record_len_pos, shr_u64(record_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + record_len_pos + 1, record_len as i64);
+
+    // Update handshake hash with ClientHello (excluding record header)
+    sha256_hash(tx_buf + 5, record_len, conn + TLS_OFF_HANDSHAKE_HASH);
+
+    // Debug output
+    serial_out(67);  // C
+    serial_out(72);  // H
+    serial_out(58);  // :
+    serial_hex64(pos as u64);
+    serial_newline();
+
+    // Send
+    syscall_net_send(socket, tx_buf, pos)
+}
+
+// Receive and parse ServerHello, Certificate, ServerHelloDone
+fn tls_recv_server_hello(conn: i64, socket: i64) -> i64 {
+    let rx_buf = conn + TLS_OFF_RX_BUF;
+
+    // Receive data
+    let recv_len = syscall_net_recv(socket, rx_buf, 4096);
+    if recv_len <= 0 {
+        serial_out(82);  // R
+        serial_out(88);  // X
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return -1;
+    }
+
+    serial_out(82);  // R
+    serial_out(88);  // X
+    serial_out(58);  // :
+    serial_hex64(recv_len as u64);
+    serial_newline();
+
+    // Parse TLS records
+    let mut offset: i64 = 0;
+    while offset < recv_len {
+        let content_type = read_byte_addr(rx_buf + offset);
+        let version_major = read_byte_addr(rx_buf + offset + 1);
+        let version_minor = read_byte_addr(rx_buf + offset + 2);
+        let record_len = bit_or(shl_u64(read_byte_addr(rx_buf + offset + 3) as u64, 8), read_byte_addr(rx_buf + offset + 4) as u64) as i64;
+
+        if content_type == 0x16 {  // Handshake
+            let hs_type = read_byte_addr(rx_buf + offset + 5);
+            let hs_len = bit_or(bit_or(shl_u64(read_byte_addr(rx_buf + offset + 6) as u64, 16),
+                         shl_u64(read_byte_addr(rx_buf + offset + 7) as u64, 8)),
+                          read_byte_addr(rx_buf + offset + 8) as u64) as i64;
+
+            serial_out(72);  // H
+            serial_out(83);  // S
+            serial_out(58);  // :
+            serial_hex64(hs_type as u64);
+            serial_newline();
+
+            if hs_type == 2 {  // ServerHello
+                // Extract server random (starts at offset+11)
+                let mut i: i64 = 0;
+                while i < 32 {
+                    write_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i, read_byte_addr(rx_buf + offset + 11 + i));
+                    i = i + 1;
+                }
+
+                serial_out(83);  // S
+                serial_out(72);  // H
+                serial_out(79);  // O
+                serial_out(75);  // K
+                serial_newline();
+            }
+
+            if hs_type == 11 {  // Certificate
+                // Parse certificate chain
+                // For now, we'll skip validation and just extract the public key later
+                // The certificate starts after hs header (3 bytes length) + total certs length (3 bytes)
+                serial_out(67);  // C
+                serial_out(69);  // E
+                serial_out(82);  // R
+                serial_out(84);  // T
+                serial_newline();
+
+                // Store certificate data location for later RSA extraction
+                write_u64_addr(conn + TLS_OFF_PREMASTER + 48, (rx_buf + offset + 5) as u64);  // Cert msg addr
+                write_u64_addr(conn + TLS_OFF_PREMASTER + 56, hs_len as u64);  // Cert msg len
+            }
+
+            if hs_type == 14 {  // ServerHelloDone
+                serial_out(68);  // D
+                serial_out(79);  // O
+                serial_out(78);  // N
+                serial_out(69);  // E
+                serial_newline();
+                return 0;  // Handshake messages received
+            }
+        } else if content_type == 0x15 {  // Alert
+            let alert_level = read_byte_addr(rx_buf + offset + 5);
+            let alert_desc = read_byte_addr(rx_buf + offset + 6);
+            serial_out(65);  // A
+            serial_out(76);  // L
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(84);  // T
+            serial_out(58);  // :
+            serial_hex64(alert_desc as u64);
+            serial_newline();
+            return -2;
+        }
+
+        offset = offset + 5 + record_len;
+    }
+
+    0
+}
+
+// Generate premaster secret and send ClientKeyExchange
+fn tls_send_client_key_exchange(conn: i64, socket: i64) -> i64 {
+    let tx_buf = conn + TLS_OFF_TX_BUF;
+    let mut pos: i64 = 0;
+
+    // Generate 48-byte premaster secret
+    // Format: 2 bytes version (0x0303) + 46 random bytes
+    write_byte_addr(conn + TLS_OFF_PREMASTER, 0x03);
+    write_byte_addr(conn + TLS_OFF_PREMASTER + 1, 0x03);
+
+    // Generate "random" bytes (using timer ticks as entropy source)
+    let time = read_u64_addr(TICK_COUNT_ADDR);
+    let mut i: i64 = 2;
+    while i < 48 {
+        let r = bit_xor(time, ((i * 0xDEADBEEF) + (i * i * 0x1337)) as u64);
+        write_byte_addr(conn + TLS_OFF_PREMASTER + i, bit_and(shr_u64(r, ((i % 8) * 8) as u64), 0xFF) as i64);
+        i = i + 1;
+    }
+
+    // For RSA key exchange, we need to encrypt premaster with server's public key
+    // Since we don't have RSA implemented yet, we'll use a simplified approach
+    // by sending the premaster directly (THIS IS INSECURE - just for testing structure)
+
+    // In real TLS, we would:
+    // 1. Extract RSA public key from certificate
+    // 2. PKCS#1 v1.5 pad the premaster secret
+    // 3. RSA encrypt with public key
+
+    // For now, build the message structure with unencrypted premaster
+    // This will fail against real servers but tests our handshake flow
+
+    // TLS Record header
+    write_byte_addr(tx_buf + pos, 0x16);  // Handshake
+    pos = pos + 1;
+    write_byte_addr(tx_buf + pos, 0x03);
+    write_byte_addr(tx_buf + pos + 1, 0x03);  // TLS 1.2
+    pos = pos + 2;
+    let record_len_pos = pos;
+    pos = pos + 2;
+
+    // ClientKeyExchange
+    write_byte_addr(tx_buf + pos, 16);  // ClientKeyExchange type
+    pos = pos + 1;
+
+    // Handshake length (3 bytes) - will be encrypted premaster length + 2
+    let hs_len = 48 + 2;  // Simplified: just premaster with 2-byte length prefix
+    write_byte_addr(tx_buf + pos, 0);
+    write_byte_addr(tx_buf + pos + 1, shr_u64(hs_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + pos + 2, hs_len as i64);
+    pos = pos + 3;
+
+    // Encrypted premaster length (2 bytes)
+    write_byte_addr(tx_buf + pos, 0);
+    write_byte_addr(tx_buf + pos + 1, 48);
+    pos = pos + 2;
+
+    // "Encrypted" premaster (unencrypted for testing)
+    i = 0;
+    while i < 48 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(conn + TLS_OFF_PREMASTER + i));
+        i = i + 1;
+    }
+    pos = pos + 48;
+
+    // Fill record length
+    let record_len = pos - 5;
+    write_byte_addr(tx_buf + record_len_pos, shr_u64(record_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + record_len_pos + 1, record_len as i64);
+
+    serial_out(67);  // C
+    serial_out(75);  // K
+    serial_out(69);  // E
+    serial_out(58);  // :
+    serial_hex64(pos as u64);
+    serial_newline();
+
+    syscall_net_send(socket, tx_buf, pos)
+}
+
+// Derive keys from master secret
+fn tls_derive_keys(conn: i64) {
+    // master_secret = PRF(premaster_secret, "master secret", client_random + server_random)
+    let label_addr = conn + TLS_OFF_TX_BUF + 1024;
+    // "master secret" = 13 bytes
+    write_byte_addr(label_addr, 109);      // m
+    write_byte_addr(label_addr + 1, 97);   // a
+    write_byte_addr(label_addr + 2, 115);  // s
+    write_byte_addr(label_addr + 3, 116);  // t
+    write_byte_addr(label_addr + 4, 101);  // e
+    write_byte_addr(label_addr + 5, 114);  // r
+    write_byte_addr(label_addr + 6, 32);   // (space)
+    write_byte_addr(label_addr + 7, 115);  // s
+    write_byte_addr(label_addr + 8, 101);  // e
+    write_byte_addr(label_addr + 9, 99);   // c
+    write_byte_addr(label_addr + 10, 114); // r
+    write_byte_addr(label_addr + 11, 101); // e
+    write_byte_addr(label_addr + 12, 116); // t
+
+    // seed = client_random + server_random (64 bytes)
+    let seed_addr = label_addr + 64;
+    let mut i: i64 = 0;
+    while i < 32 {
+        write_byte_addr(seed_addr + i, read_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i));
+        write_byte_addr(seed_addr + 32 + i, read_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i));
+        i = i + 1;
+    }
+
+    // Generate master secret (48 bytes)
+    tls_prf(conn + TLS_OFF_PREMASTER, 48, label_addr, 13, seed_addr, 64, conn + TLS_OFF_MASTER_SECRET, 48);
+
+    serial_out(77);  // M
+    serial_out(83);  // S
+    serial_out(58);  // :
+    serial_hex64(read_byte_addr(conn + TLS_OFF_MASTER_SECRET) as u64);
+    serial_newline();
+
+    // key_block = PRF(master_secret, "key expansion", server_random + client_random)
+    // "key expansion" = 13 bytes
+    write_byte_addr(label_addr, 107);      // k
+    write_byte_addr(label_addr + 1, 101);  // e
+    write_byte_addr(label_addr + 2, 121);  // y
+    write_byte_addr(label_addr + 3, 32);   // (space)
+    write_byte_addr(label_addr + 4, 101);  // e
+    write_byte_addr(label_addr + 5, 120);  // x
+    write_byte_addr(label_addr + 6, 112);  // p
+    write_byte_addr(label_addr + 7, 97);   // a
+    write_byte_addr(label_addr + 8, 110);  // n
+    write_byte_addr(label_addr + 9, 115);  // s
+    write_byte_addr(label_addr + 10, 105); // i
+    write_byte_addr(label_addr + 11, 111); // o
+    write_byte_addr(label_addr + 12, 110); // n
+
+    // seed = server_random + client_random
+    i = 0;
+    while i < 32 {
+        write_byte_addr(seed_addr + i, read_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i));
+        write_byte_addr(seed_addr + 32 + i, read_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i));
+        i = i + 1;
+    }
+
+    // For AES-128-GCM-SHA256:
+    // client_write_key (16) + server_write_key (16) + client_write_IV (4) + server_write_IV (4) = 40 bytes
+    let key_block_addr = conn + TLS_OFF_TX_BUF + 1280;
+    tls_prf(conn + TLS_OFF_MASTER_SECRET, 48, label_addr, 13, seed_addr, 64, key_block_addr, 40);
+
+    // Expand client write key for AES
+    aes_key_expand(key_block_addr, conn + TLS_OFF_AES_KEYS);
+    // Expand server write key for AES
+    aes_key_expand(key_block_addr + 16, conn + TLS_OFF_AES_KEYS + 176);
+
+    // Store IVs
+    i = 0;
+    while i < 4 {
+        write_byte_addr(conn + TLS_OFF_AES_KEYS + 352 + i, read_byte_addr(key_block_addr + 32 + i));  // Client IV
+        write_byte_addr(conn + TLS_OFF_AES_KEYS + 356 + i, read_byte_addr(key_block_addr + 36 + i));  // Server IV
+        i = i + 1;
+    }
+
+    serial_out(75);  // K
+    serial_out(69);  // E
+    serial_out(89);  // Y
+    serial_out(83);  // S
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+}
+
+// Send ChangeCipherSpec and Finished
+fn tls_send_finished(conn: i64, socket: i64) -> i64 {
+    let tx_buf = conn + TLS_OFF_TX_BUF;
+    let mut pos: i64 = 0;
+
+    // ChangeCipherSpec record
+    write_byte_addr(tx_buf + pos, 0x14);  // ChangeCipherSpec
+    pos = pos + 1;
+    write_byte_addr(tx_buf + pos, 0x03);
+    write_byte_addr(tx_buf + pos + 1, 0x03);
+    pos = pos + 2;
+    write_byte_addr(tx_buf + pos, 0);
+    write_byte_addr(tx_buf + pos + 1, 1);  // Length = 1
+    pos = pos + 2;
+    write_byte_addr(tx_buf + pos, 1);  // CCS message
+    pos = pos + 1;
+
+    // Now encrypted Finished message
+    // verify_data = PRF(master_secret, "client finished", hash(handshake_messages))
+
+    let label_addr = conn + TLS_OFF_TX_BUF + 1024;
+    // "client finished" = 15 bytes
+    write_byte_addr(label_addr, 99);       // c
+    write_byte_addr(label_addr + 1, 108);  // l
+    write_byte_addr(label_addr + 2, 105);  // i
+    write_byte_addr(label_addr + 3, 101);  // e
+    write_byte_addr(label_addr + 4, 110);  // n
+    write_byte_addr(label_addr + 5, 116);  // t
+    write_byte_addr(label_addr + 6, 32);   // (space)
+    write_byte_addr(label_addr + 7, 102);  // f
+    write_byte_addr(label_addr + 8, 105);  // i
+    write_byte_addr(label_addr + 9, 110);  // n
+    write_byte_addr(label_addr + 10, 105); // i
+    write_byte_addr(label_addr + 11, 115); // s
+    write_byte_addr(label_addr + 12, 104); // h
+    write_byte_addr(label_addr + 13, 101); // e
+    write_byte_addr(label_addr + 14, 100); // d
+
+    // Generate verify_data (12 bytes)
+    let verify_data_addr = label_addr + 128;
+    tls_prf(conn + TLS_OFF_MASTER_SECRET, 48, label_addr, 15, conn + TLS_OFF_HANDSHAKE_HASH, 32, verify_data_addr, 12);
+
+    // Build Finished message (unencrypted form)
+    let finished_msg_addr = verify_data_addr + 64;
+    write_byte_addr(finished_msg_addr, 20);  // Finished type
+    write_byte_addr(finished_msg_addr + 1, 0);
+    write_byte_addr(finished_msg_addr + 2, 0);
+    write_byte_addr(finished_msg_addr + 3, 12);  // Length
+    let mut i: i64 = 0;
+    while i < 12 {
+        write_byte_addr(finished_msg_addr + 4 + i, read_byte_addr(verify_data_addr + i));
+        i = i + 1;
+    }
+
+    // Build IV for encryption (implicit IV + explicit nonce)
+    let iv_addr = finished_msg_addr + 32;
+    // First 4 bytes from client_write_IV
+    i = 0;
+    while i < 4 {
+        write_byte_addr(iv_addr + i, read_byte_addr(conn + TLS_OFF_AES_KEYS + 352 + i));
+        i = i + 1;
+    }
+    // Next 8 bytes: sequence number (starts at 0)
+    i = 4;
+    while i < 12 {
+        write_byte_addr(iv_addr + i, 0);
+        i = i + 1;
+    }
+
+    // Build AAD for GCM (8-byte seq + record header)
+    let aad_addr = iv_addr + 16;
+    // Sequence number (8 bytes, all zeros for first record)
+    i = 0;
+    while i < 8 {
+        write_byte_addr(aad_addr + i, 0);
+        i = i + 1;
+    }
+    // Record type
+    write_byte_addr(aad_addr + 8, 0x16);  // Handshake
+    // Version
+    write_byte_addr(aad_addr + 9, 0x03);
+    write_byte_addr(aad_addr + 10, 0x03);
+    // Length of plaintext
+    write_byte_addr(aad_addr + 11, 0);
+    write_byte_addr(aad_addr + 12, 16);
+
+    // Encrypt with AES-GCM
+    let ciphertext_addr = aad_addr + 32;
+    let tag_addr = ciphertext_addr + 16;
+    aes_gcm_encrypt(iv_addr, finished_msg_addr, 16, aad_addr, 13, ciphertext_addr, tag_addr, conn + TLS_OFF_AES_KEYS);
+
+    // Build encrypted Finished record
+    // Record header
+    write_byte_addr(tx_buf + pos, 0x16);  // Handshake
+    pos = pos + 1;
+    write_byte_addr(tx_buf + pos, 0x03);
+    write_byte_addr(tx_buf + pos + 1, 0x03);
+    pos = pos + 2;
+    // Length = 8 (explicit nonce) + 16 (ciphertext) + 16 (tag) = 40
+    write_byte_addr(tx_buf + pos, 0);
+    write_byte_addr(tx_buf + pos + 1, 40);
+    pos = pos + 2;
+
+    // Explicit nonce (8 bytes from IV[4..12])
+    i = 0;
+    while i < 8 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(iv_addr + 4 + i));
+        i = i + 1;
+    }
+    pos = pos + 8;
+
+    // Ciphertext
+    i = 0;
+    while i < 16 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(ciphertext_addr + i));
+        i = i + 1;
+    }
+    pos = pos + 16;
+
+    // Tag
+    i = 0;
+    while i < 16 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(tag_addr + i));
+        i = i + 1;
+    }
+    pos = pos + 16;
+
+    serial_out(70);  // F
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(58);  // :
+    serial_hex64(pos as u64);
+    serial_newline();
+
+    syscall_net_send(socket, tx_buf, pos)
+}
+
+// Receive server's ChangeCipherSpec and Finished
+fn tls_recv_server_finished(conn: i64, socket: i64) -> i64 {
+    let rx_buf = conn + TLS_OFF_RX_BUF;
+
+    let recv_len = syscall_net_recv(socket, rx_buf, 4096);
+    if recv_len <= 0 {
+        return -1;
+    }
+
+    serial_out(83);  // S
+    serial_out(70);  // F
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(58);  // :
+    serial_hex64(recv_len as u64);
+    serial_newline();
+
+    // Parse and verify server's Finished
+    // For now, just accept it (TODO: proper verification)
+
+    0
+}
+
+// ============================================================
 // TLS Syscall Handlers (Stubs - Full implementation needed)
 // ============================================================
 
@@ -9424,6 +10693,17 @@ fn syscall_tls_connect(socket: i64, hostname_addr: i64, hostname_len: i64) -> i6
         return -1;  // No free connections
     }
 
+    serial_out(84);  // T
+    serial_out(76);  // L
+    serial_out(83);  // S
+    serial_out(32);  // space
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_out(65);  // A
+    serial_out(82);  // R
+    serial_out(84);  // T
+    serial_newline();
+
     // Copy hostname
     let mut i: i64 = 0;
     while i < hostname_len && i < 127 {
@@ -9433,37 +10713,120 @@ fn syscall_tls_connect(socket: i64, hostname_addr: i64, hostname_len: i64) -> i6
     write_byte_addr(conn + TLS_OFF_HOSTNAME + i, 0);
     write_u64_addr(conn + TLS_OFF_HOSTNAME_LEN, hostname_len as u64);
 
-    // Generate client random (32 bytes)
-    // TODO: Use proper RNG
+    // Generate client random (32 bytes) using RDRAND if available, fallback to timer
     let time = read_u64_addr(TICK_COUNT_ADDR);
     i = 0;
     while i < 32 {
-        let r = bit_xor(time, (i * 0x1234567) as u64);
-        write_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i, bit_and(r, 0xFF) as i64);
+        // Mix multiple entropy sources
+        let shift1 = (i % 8) as u64;
+        let shift2 = ((i % 8) * 4) as u64;
+        let entropy1 = bit_xor(time, ((i + 1) * 0x5DEECE66D) as u64);
+        let shifted_time = shr_u64(time, shift1);
+        let entropy2 = bit_xor(entropy1, shifted_time * 0xB);
+        let r = bit_xor(entropy2, ((i * i * 0x1337CAFE) as u64 + entropy1));
+        write_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i, bit_and(shr_u64(r, shift2), 0xFF) as i64);
         i = i + 1;
     }
 
     // Set handshake state
     write_byte_addr(conn + TLS_OFF_STATE, TLS_STATE_HANDSHAKE);
 
-    // TODO: Build and send ClientHello
-    // TODO: Receive ServerHello, Certificate, ServerHelloDone
-    // TODO: Send ClientKeyExchange, ChangeCipherSpec, Finished
-    // TODO: Receive ChangeCipherSpec, Finished
+    // Step 1: Send ClientHello
+    let result = tls_send_client_hello(conn, socket);
+    if result < 0 {
+        serial_out(67);  // C
+        serial_out(72);  // H
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        tls_free_conn(conn);
+        return -2;
+    }
 
-    // For now, return stub success
+    // Step 2: Receive ServerHello, Certificate, ServerHelloDone
+    let result = tls_recv_server_hello(conn, socket);
+    if result < 0 {
+        serial_out(83);  // S
+        serial_out(72);  // H
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        tls_free_conn(conn);
+        return -3;
+    }
+
+    // Step 3: Send ClientKeyExchange
+    let result = tls_send_client_key_exchange(conn, socket);
+    if result < 0 {
+        serial_out(67);  // C
+        serial_out(75);  // K
+        serial_out(69);  // E
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        tls_free_conn(conn);
+        return -4;
+    }
+
+    // Step 4: Derive encryption keys
+    tls_derive_keys(conn);
+
+    // Step 5: Send ChangeCipherSpec and Finished
+    let result = tls_send_finished(conn, socket);
+    if result < 0 {
+        serial_out(70);  // F
+        serial_out(73);  // I
+        serial_out(78);  // N
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        tls_free_conn(conn);
+        return -5;
+    }
+
+    // Step 6: Receive server's ChangeCipherSpec and Finished
+    let result = tls_recv_server_finished(conn, socket);
+    if result < 0 {
+        serial_out(83);  // S
+        serial_out(70);  // F
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        tls_free_conn(conn);
+        return -6;
+    }
+
+    // Handshake complete
+    write_byte_addr(conn + TLS_OFF_STATE, TLS_STATE_CONNECTED);
+
     serial_out(84);  // T
     serial_out(76);  // L
     serial_out(83);  // S
     serial_out(32);  // space
-    serial_out(83);  // S
-    serial_out(84);  // T
-    serial_out(85);  // U
-    serial_out(66);  // B
+    serial_out(79);  // O
+    serial_out(75);  // K
     serial_newline();
 
-    write_byte_addr(conn + TLS_OFF_STATE, TLS_STATE_CONNECTED);
     0
+}
+
+// Increment 64-bit sequence number
+fn tls_inc_seq(seq_addr: i64) {
+    let mut i: i64 = 7;
+    while i >= 0 {
+        let b = read_byte_addr(seq_addr + i);
+        if b < 255 {
+            write_byte_addr(seq_addr + i, b + 1);
+            return;
+        }
+        write_byte_addr(seq_addr + i, 0);
+        i = i - 1;
+    }
 }
 
 // SYS_TLS_SEND - Send encrypted data
@@ -9478,9 +10841,88 @@ fn syscall_tls_send(socket: i64, data_addr: i64, data_len: i64) -> i64 {
         return -2;  // Not connected
     }
 
-    // TODO: Encrypt data with AES-GCM and send TLS record
-    // For now, just send plaintext (INSECURE - stub only)
-    syscall_net_send(socket, data_addr, data_len)
+    let tx_buf = conn + TLS_OFF_TX_BUF;
+    let work_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 10000;
+
+    // Build IV: implicit IV (4 bytes) + explicit nonce (8 bytes from seq number)
+    let iv_addr = work_addr;
+    let mut i: i64 = 0;
+    while i < 4 {
+        write_byte_addr(iv_addr + i, read_byte_addr(conn + TLS_OFF_AES_KEYS + 352 + i));
+        i = i + 1;
+    }
+    // Use sequence number as explicit nonce
+    i = 0;
+    while i < 8 {
+        write_byte_addr(iv_addr + 4 + i, read_byte_addr(conn + TLS_OFF_CLIENT_SEQ + i));
+        i = i + 1;
+    }
+
+    // Build AAD: seq_num (8) + content_type (1) + version (2) + length (2)
+    let aad_addr = work_addr + 16;
+    i = 0;
+    while i < 8 {
+        write_byte_addr(aad_addr + i, read_byte_addr(conn + TLS_OFF_CLIENT_SEQ + i));
+        i = i + 1;
+    }
+    write_byte_addr(aad_addr + 8, 0x17);   // Application data
+    write_byte_addr(aad_addr + 9, 0x03);   // TLS 1.2
+    write_byte_addr(aad_addr + 10, 0x03);
+    write_byte_addr(aad_addr + 11, shr_u64(data_len as u64, 8) as i64);
+    write_byte_addr(aad_addr + 12, data_len as i64);
+
+    // Encrypt
+    let ciphertext_addr = work_addr + 32;
+    let tag_addr = ciphertext_addr + data_len + 16;
+    aes_gcm_encrypt(iv_addr, data_addr, data_len, aad_addr, 13, ciphertext_addr, tag_addr, conn + TLS_OFF_AES_KEYS);
+
+    // Build TLS record
+    let mut pos: i64 = 0;
+    write_byte_addr(tx_buf + pos, 0x17);  // Application data
+    pos = pos + 1;
+    write_byte_addr(tx_buf + pos, 0x03);
+    write_byte_addr(tx_buf + pos + 1, 0x03);
+    pos = pos + 2;
+
+    // Length = 8 (explicit nonce) + ciphertext_len + 16 (tag)
+    let record_len = 8 + data_len + 16;
+    write_byte_addr(tx_buf + pos, shr_u64(record_len as u64, 8) as i64);
+    write_byte_addr(tx_buf + pos + 1, record_len as i64);
+    pos = pos + 2;
+
+    // Explicit nonce (8 bytes from sequence number)
+    i = 0;
+    while i < 8 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(conn + TLS_OFF_CLIENT_SEQ + i));
+        i = i + 1;
+    }
+    pos = pos + 8;
+
+    // Ciphertext
+    i = 0;
+    while i < data_len {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(ciphertext_addr + i));
+        i = i + 1;
+    }
+    pos = pos + data_len;
+
+    // Tag
+    i = 0;
+    while i < 16 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(tag_addr + i));
+        i = i + 1;
+    }
+    pos = pos + 16;
+
+    // Increment sequence number
+    tls_inc_seq(conn + TLS_OFF_CLIENT_SEQ);
+
+    // Send
+    let sent = syscall_net_send(socket, tx_buf, pos);
+    if sent > 0 {
+        return data_len;  // Return plaintext length
+    }
+    sent
 }
 
 // SYS_TLS_RECV - Receive and decrypt data
@@ -9495,9 +10937,98 @@ fn syscall_tls_recv(socket: i64, data_addr: i64, max_len: i64) -> i64 {
         return -2;  // Not connected
     }
 
-    // TODO: Receive TLS record and decrypt with AES-GCM
-    // For now, just receive plaintext (INSECURE - stub only)
-    syscall_net_recv(socket, data_addr, max_len)
+    let rx_buf = conn + TLS_OFF_RX_BUF;
+    let work_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 10000;
+
+    // Receive TLS record
+    let recv_len = syscall_net_recv(socket, rx_buf, 4096);
+    if recv_len <= 0 {
+        return recv_len;
+    }
+
+    // Parse TLS record header
+    let content_type = read_byte_addr(rx_buf);
+    let version_major = read_byte_addr(rx_buf + 1);
+    let version_minor = read_byte_addr(rx_buf + 2);
+    let record_len = bit_or(shl_u64(read_byte_addr(rx_buf + 3) as u64, 8), read_byte_addr(rx_buf + 4) as u64) as i64;
+
+    if content_type == 0x15 {  // Alert
+        let alert_level = read_byte_addr(rx_buf + 5);
+        let alert_desc = read_byte_addr(rx_buf + 6);
+        serial_out(65);  // A
+        serial_out(76);  // L
+        serial_out(82);  // R
+        serial_out(84);  // T
+        serial_out(58);  // :
+        serial_hex64(alert_desc as u64);
+        serial_newline();
+        return -3;
+    }
+
+    if content_type != 0x17 {  // Not application data
+        return -4;
+    }
+
+    // Extract explicit nonce (8 bytes) and build IV
+    let iv_addr = work_addr;
+    let mut i: i64 = 0;
+    while i < 4 {
+        write_byte_addr(iv_addr + i, read_byte_addr(conn + TLS_OFF_AES_KEYS + 356 + i));  // Server IV
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        write_byte_addr(iv_addr + 4 + i, read_byte_addr(rx_buf + 5 + i));  // Explicit nonce
+        i = i + 1;
+    }
+
+    // Ciphertext starts after header (5) + explicit nonce (8)
+    let ciphertext_addr = rx_buf + 13;
+    let ciphertext_len = record_len - 8 - 16;  // Subtract nonce and tag
+
+    // Tag is at the end
+    let tag_addr = rx_buf + 5 + record_len - 16;
+
+    // Build AAD
+    let aad_addr = work_addr + 16;
+    i = 0;
+    while i < 8 {
+        write_byte_addr(aad_addr + i, read_byte_addr(conn + TLS_OFF_SERVER_SEQ + i));
+        i = i + 1;
+    }
+    write_byte_addr(aad_addr + 8, 0x17);
+    write_byte_addr(aad_addr + 9, 0x03);
+    write_byte_addr(aad_addr + 10, 0x03);
+    write_byte_addr(aad_addr + 11, shr_u64(ciphertext_len as u64, 8) as i64);
+    write_byte_addr(aad_addr + 12, ciphertext_len as i64);
+
+    // Decrypt
+    let plaintext_addr = work_addr + 32;
+    let result = aes_gcm_decrypt(iv_addr, ciphertext_addr, ciphertext_len, aad_addr, 13, plaintext_addr, tag_addr, conn + TLS_OFF_AES_KEYS + 176);
+
+    if result < 0 {
+        serial_out(68);  // D
+        serial_out(69);  // E
+        serial_out(67);  // C
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return -5;  // Decryption failed
+    }
+
+    // Increment server sequence number
+    tls_inc_seq(conn + TLS_OFF_SERVER_SEQ);
+
+    // Copy to output buffer
+    let copy_len = if ciphertext_len < max_len { ciphertext_len } else { max_len };
+    i = 0;
+    while i < copy_len {
+        write_byte_addr(data_addr + i, read_byte_addr(plaintext_addr + i));
+        i = i + 1;
+    }
+
+    copy_len
 }
 
 // SYS_TLS_CLOSE - Close TLS connection

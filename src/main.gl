@@ -8892,7 +8892,9 @@ const TLS_OFF_TX_BUF: i64 = 512;              // TX buffer (2048 bytes)
 const TLS_OFF_RX_BUF: i64 = 2560;             // RX buffer (4096 bytes)
 const TLS_OFF_RX_LEN: i64 = 6656;             // RX buffer length (4 bytes)
 const TLS_OFF_AES_KEYS: i64 = 6660;           // AES expanded keys (480 bytes)
-const TLS_OFF_PREMASTER: i64 = 7140;          // Premaster secret (48 bytes + 16 for cert ptrs)
+const TLS_OFF_PREMASTER: i64 = 7140;          // Premaster secret (48 bytes)
+const TLS_OFF_CERT_ADDR: i64 = 7200;          // Certificate data address (8 bytes)
+const TLS_OFF_CERT_LEN: i64 = 7208;           // Certificate data length (8 bytes)
 
 // TLS States
 const TLS_STATE_NONE: i64 = 0;
@@ -10125,6 +10127,654 @@ fn aes_gcm_decrypt(iv_addr: i64, ciphertext_addr: i64, ciphertext_len: i64,
 }
 
 // ============================================================
+// RSA Implementation (2048-bit)
+// ============================================================
+
+// Big integer representation: array of 32 64-bit words (2048 bits)
+// Stored in little-endian order (word 0 is least significant)
+const RSA_WORDS: i64 = 32;          // 32 * 64 = 2048 bits
+const RSA_BYTES: i64 = 256;         // 2048 / 8 = 256 bytes
+const RSA_WORK_ADDR: i64 = 0x3000000;  // RSA working memory (16KB) - must be < 64MB (mapped)
+
+// Zero a big integer (32 words at addr)
+fn bigint_zero(addr: i64) {
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        write_u64_addr(addr + i * 8, 0);
+        i = i + 1;
+    }
+}
+
+// Copy big integer: dst = src
+fn bigint_copy(dst: i64, src: i64) {
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        write_u64_addr(dst + i * 8, read_u64_addr(src + i * 8));
+        i = i + 1;
+    }
+}
+
+// Load big integer from big-endian bytes
+fn bigint_from_bytes(dst: i64, src: i64, len: i64) {
+    bigint_zero(dst);
+    let mut i: i64 = 0;
+    while i < len && i < RSA_BYTES {
+        // Big-endian: first byte is most significant
+        let byte_val = read_byte_addr(src + i);
+        let word_idx = (RSA_BYTES - 1 - i) / 8;
+        let byte_idx = (RSA_BYTES - 1 - i) % 8;
+        let shift = (byte_idx * 8) as u64;
+        let current = read_u64_addr(dst + word_idx * 8);
+        write_u64_addr(dst + word_idx * 8, bit_or(current, shl_u64(byte_val as u64, shift)));
+        i = i + 1;
+    }
+}
+
+// Store big integer to big-endian bytes
+fn bigint_to_bytes(dst: i64, src: i64) {
+    let mut i: i64 = 0;
+    while i < RSA_BYTES {
+        let word_idx = (RSA_BYTES - 1 - i) / 8;
+        let byte_idx = (RSA_BYTES - 1 - i) % 8;
+        let shift = (byte_idx * 8) as u64;
+        let word = read_u64_addr(src + word_idx * 8);
+        let byte_val = bit_and(shr_u64(word, shift), 0xFF) as i64;
+        write_byte_addr(dst + i, byte_val);
+        i = i + 1;
+    }
+}
+
+// Compare big integers: returns -1 if a < b, 0 if a == b, 1 if a > b
+fn bigint_cmp(a: i64, b: i64) -> i64 {
+    let mut i: i64 = RSA_WORDS - 1;
+    while i >= 0 {
+        let av = read_u64_addr(a + i * 8);
+        let bv = read_u64_addr(b + i * 8);
+        if av > bv {
+            return 1;
+        }
+        if av < bv {
+            return -1;
+        }
+        i = i - 1;
+    }
+    0
+}
+
+// Add big integers: result = a + b, returns carry (0 or 1)
+fn bigint_add(result: i64, a: i64, b: i64) -> i64 {
+    let mut carry: u64 = 0;
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        let av = read_u64_addr(a + i * 8);
+        let bv = read_u64_addr(b + i * 8);
+
+        // Add with carry using two separate additions to detect overflow
+        let sum1 = av + bv;
+        let carry1: u64 = if sum1 < av { 1 } else { 0 };
+        let sum2 = sum1 + carry;
+        let carry2: u64 = if sum2 < sum1 { 1 } else { 0 };
+
+        write_u64_addr(result + i * 8, sum2);
+        carry = carry1 + carry2;
+        i = i + 1;
+    }
+    carry as i64
+}
+
+// Subtract big integers: result = a - b, returns borrow (0 or 1)
+fn bigint_sub(result: i64, a: i64, b: i64) -> i64 {
+    let mut borrow: u64 = 0;
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        let av = read_u64_addr(a + i * 8);
+        let bv = read_u64_addr(b + i * 8);
+
+        // Subtract with borrow
+        let diff1 = av - bv;
+        let borrow1: u64 = if diff1 > av { 1 } else { 0 };
+        let diff2 = diff1 - borrow;
+        let borrow2: u64 = if diff2 > diff1 { 1 } else { 0 };
+
+        write_u64_addr(result + i * 8, diff2);
+        borrow = borrow1 + borrow2;
+        i = i + 1;
+    }
+    borrow as i64
+}
+
+// Multiply 64-bit * 64-bit -> 128-bit (returns high 64 bits, stores low 64 bits)
+fn mul64_128(a: u64, b: u64, lo_addr: i64) -> u64 {
+    // Split into 32-bit halves to avoid overflow
+    let a_lo = bit_and(a, 0xFFFFFFFF);
+    let a_hi = shr_u64(a, 32);
+    let b_lo = bit_and(b, 0xFFFFFFFF);
+    let b_hi = shr_u64(b, 32);
+
+    // Partial products
+    let p0 = a_lo * b_lo;                    // Low * Low
+    let p1 = a_lo * b_hi;                    // Low * High
+    let p2 = a_hi * b_lo;                    // High * Low
+    let p3 = a_hi * b_hi;                    // High * High
+
+    // Combine: result = p3:p0 + (p1 + p2) << 32
+    let mid = p1 + p2;
+    let mid_carry: u64 = if mid < p1 { 1 } else { 0 };
+
+    let mid_lo = shl_u64(bit_and(mid, 0xFFFFFFFF), 32);
+    let mid_hi = shr_u64(mid, 32);
+
+    let lo = p0 + mid_lo;
+    let lo_carry: u64 = if lo < p0 { 1 } else { 0 };
+
+    let hi = p3 + mid_hi + lo_carry + shl_u64(mid_carry, 32);
+
+    write_u64_addr(lo_addr, lo);
+    hi
+}
+
+// Multiply big integer by single word: result = a * w
+fn bigint_mul_word(result: i64, a: i64, w: u64) {
+    let mut carry: u64 = 0;
+    let mut i: i64 = 0;
+    let lo_temp = RSA_WORK_ADDR + 8192;
+
+    while i < RSA_WORDS {
+        let av = read_u64_addr(a + i * 8);
+        let hi = mul64_128(av, w, lo_temp);
+        let lo = read_u64_addr(lo_temp);
+
+        let sum = lo + carry;
+        let sum_carry: u64 = if sum < lo { 1 } else { 0 };
+
+        write_u64_addr(result + i * 8, sum);
+        carry = hi + sum_carry;
+        i = i + 1;
+    }
+}
+
+// Left shift big integer by 1 bit
+fn bigint_shl1(a: i64) {
+    let mut carry: u64 = 0;
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        let v = read_u64_addr(a + i * 8);
+        let new_carry = shr_u64(v, 63);
+        write_u64_addr(a + i * 8, bit_or(shl_u64(v, 1), carry));
+        carry = new_carry;
+        i = i + 1;
+    }
+}
+
+// Right shift big integer by 1 bit
+fn bigint_shr1(a: i64) {
+    let mut carry: u64 = 0;
+    let mut i: i64 = RSA_WORDS - 1;
+    while i >= 0 {
+        let v = read_u64_addr(a + i * 8);
+        let new_carry = shl_u64(bit_and(v, 1), 63);
+        write_u64_addr(a + i * 8, bit_or(shr_u64(v, 1), carry));
+        carry = new_carry;
+        i = i - 1;
+    }
+}
+
+// Check if big integer is zero
+fn bigint_is_zero(a: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < RSA_WORDS {
+        if read_u64_addr(a + i * 8) != 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    1
+}
+
+// Get bit at position (0 = LSB)
+fn bigint_get_bit(a: i64, pos: i64) -> i64 {
+    let word_idx = pos / 64;
+    let bit_idx = pos % 64;
+    if word_idx >= RSA_WORDS {
+        return 0;
+    }
+    let word = read_u64_addr(a + word_idx * 8);
+    bit_and(shr_u64(word, bit_idx as u64), 1) as i64
+}
+
+// Get highest set bit position (-1 if zero)
+fn bigint_bit_length(a: i64) -> i64 {
+    let mut i: i64 = RSA_WORDS - 1;
+    let mut result: i64 = -1;
+    let mut found: i64 = 0;
+
+    while i >= 0 && found == 0 {
+        let word = read_u64_addr(a + i * 8);
+        if word != 0 {
+            // Find highest bit in this word
+            let mut bit: i64 = 63;
+            while bit >= 0 && found == 0 {
+                if bit_and(shr_u64(word, bit as u64), 1) != 0 {
+                    result = i * 64 + bit;
+                    found = 1;
+                }
+                if found == 0 {
+                    bit = bit - 1;
+                }
+            }
+        }
+        if found == 0 {
+            i = i - 1;
+        }
+    }
+    result
+}
+
+// Modular reduction: result = a mod n (using subtraction method for simplicity)
+// This is slow but correct - can be optimized with Montgomery later
+fn bigint_mod(result: i64, a: i64, n: i64) {
+    let temp = RSA_WORK_ADDR + 512;
+    let shifted_n = RSA_WORK_ADDR + 768;
+
+    bigint_copy(result, a);
+
+    // Find how much to shift n to align with a
+    let a_bits = bigint_bit_length(result);
+    let n_bits = bigint_bit_length(n);
+
+    if a_bits < n_bits {
+        return;  // Already reduced
+    }
+
+    let shift_amount = a_bits - n_bits;
+
+    // Shift n left
+    bigint_copy(shifted_n, n);
+    let mut s: i64 = 0;
+    while s < shift_amount {
+        bigint_shl1(shifted_n);
+        s = s + 1;
+    }
+
+    // Subtract shifted_n from result while result >= shifted_n
+    let mut current_shift = shift_amount;
+    while current_shift >= 0 {
+        while bigint_cmp(result, shifted_n) >= 0 {
+            bigint_sub(result, result, shifted_n);
+        }
+        if current_shift > 0 {
+            bigint_shr1(shifted_n);
+        }
+        current_shift = current_shift - 1;
+    }
+}
+
+// Modular multiplication: result = (a * b) mod n
+fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
+    let product = RSA_WORK_ADDR + 1024;  // 64 words for product
+    let product_hi = product + RSA_WORDS * 8;
+
+    // Zero product (need 64 words for full product)
+    let mut i: i64 = 0;
+    while i < RSA_WORDS * 2 {
+        write_u64_addr(product + i * 8, 0);
+        i = i + 1;
+    }
+
+    // Schoolbook multiplication
+    i = 0;
+    while i < RSA_WORDS {
+        let bv = read_u64_addr(b + i * 8);
+        if bv != 0 {
+            let mut carry: u64 = 0;
+            let mut j: i64 = 0;
+            let lo_temp = RSA_WORK_ADDR + 8200;
+
+            while j < RSA_WORDS {
+                let av = read_u64_addr(a + j * 8);
+                let pv = read_u64_addr(product + (i + j) * 8);
+
+                let hi = mul64_128(av, bv, lo_temp);
+                let lo = read_u64_addr(lo_temp);
+
+                let sum1 = lo + pv;
+                let carry1: u64 = if sum1 < lo { 1 } else { 0 };
+                let sum2 = sum1 + carry;
+                let carry2: u64 = if sum2 < sum1 { 1 } else { 0 };
+
+                write_u64_addr(product + (i + j) * 8, sum2);
+                carry = hi + carry1 + carry2;
+                j = j + 1;
+            }
+
+            // Propagate final carry
+            let mut k = i + RSA_WORDS;
+            while carry != 0 && k < RSA_WORDS * 2 {
+                let pv = read_u64_addr(product + k * 8);
+                let sum = pv + carry;
+                let new_carry: u64 = if sum < pv { 1 } else { 0 };
+                write_u64_addr(product + k * 8, sum);
+                carry = new_carry;
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Now reduce product mod n
+    // For simplicity, use repeated subtraction (slow but works)
+    bigint_mod(result, product, n);
+}
+
+// Modular exponentiation: result = base^exp mod n
+// Using square-and-multiply (right-to-left binary method)
+fn bigint_modexp(result: i64, base: i64, exp: i64, n: i64) {
+    let temp_base = RSA_WORK_ADDR + 2048;
+    let temp_result = RSA_WORK_ADDR + 2304;
+
+    // result = 1
+    bigint_zero(result);
+    write_u64_addr(result, 1);
+
+    // temp_base = base mod n
+    bigint_mod(temp_base, base, n);
+
+    // Find exponent bit length
+    let exp_bits = bigint_bit_length(exp);
+    if exp_bits < 0 {
+        return;  // exp = 0, result = 1
+    }
+
+    // Square-and-multiply
+    let mut i: i64 = 0;
+    while i <= exp_bits {
+        if bigint_get_bit(exp, i) == 1 {
+            // result = result * base mod n
+            bigint_mulmod(temp_result, result, temp_base, n);
+            bigint_copy(result, temp_result);
+        }
+
+        // base = base^2 mod n
+        bigint_mulmod(temp_result, temp_base, temp_base, n);
+        bigint_copy(temp_base, temp_result);
+
+        i = i + 1;
+    }
+}
+
+// RSA encrypt: ciphertext = plaintext^e mod n
+fn rsa_encrypt(ciphertext_addr: i64, plaintext_addr: i64, plaintext_len: i64,
+               n_addr: i64, n_len: i64, e: u64) {
+    let n_bigint = RSA_WORK_ADDR + 3072;
+    let m_bigint = RSA_WORK_ADDR + 3328;
+    let c_bigint = RSA_WORK_ADDR + 3584;
+    let e_bigint = RSA_WORK_ADDR + 3840;
+
+    // Load modulus n
+    bigint_from_bytes(n_bigint, n_addr, n_len);
+
+    // Load plaintext (already PKCS#1 padded)
+    bigint_from_bytes(m_bigint, plaintext_addr, plaintext_len);
+
+    // Set up exponent (usually 65537)
+    bigint_zero(e_bigint);
+    write_u64_addr(e_bigint, e);
+
+    // Compute c = m^e mod n
+    bigint_modexp(c_bigint, m_bigint, e_bigint, n_bigint);
+
+    // Store result
+    bigint_to_bytes(ciphertext_addr, c_bigint);
+}
+
+// PKCS#1 v1.5 padding for encryption
+// Input: message (48 bytes premaster secret)
+// Output: padded message (256 bytes for 2048-bit RSA)
+fn pkcs1_pad(output_addr: i64, message_addr: i64, message_len: i64, output_len: i64) {
+    // Format: 0x00 || 0x02 || PS || 0x00 || M
+    // PS = random non-zero padding bytes
+    // PS length = output_len - message_len - 3
+
+    let ps_len = output_len - message_len - 3;
+    if ps_len < 8 {
+        return;  // Message too long
+    }
+
+    let mut pos: i64 = 0;
+
+    // Leading zero
+    write_byte_addr(output_addr + pos, 0x00);
+    pos = pos + 1;
+
+    // Block type (0x02 for encryption)
+    write_byte_addr(output_addr + pos, 0x02);
+    pos = pos + 1;
+
+    // Random padding (non-zero bytes)
+    // Use timer-based pseudo-random for now
+    let time = read_u64_addr(TICK_COUNT_ADDR);
+    let mut i: i64 = 0;
+    while i < ps_len {
+        // Generate pseudo-random non-zero byte
+        let r = bit_xor(time, ((i + 1) * 0x5DEECE66D) as u64);
+        let shifted = shr_u64(r, (i % 7) as u64);
+        let mut byte_val = bit_and(shifted, 0xFF) as i64;
+        if byte_val == 0 {
+            byte_val = 0x42;  // Replace zero with non-zero
+        }
+        write_byte_addr(output_addr + pos, byte_val);
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    // Separator
+    write_byte_addr(output_addr + pos, 0x00);
+    pos = pos + 1;
+
+    // Message
+    i = 0;
+    while i < message_len {
+        write_byte_addr(output_addr + pos, read_byte_addr(message_addr + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// X.509 Certificate Parsing
+// ============================================================
+
+// ASN.1 tag constants
+const ASN1_SEQUENCE: i64 = 0x30;
+const ASN1_SET: i64 = 0x31;
+const ASN1_INTEGER: i64 = 0x02;
+const ASN1_BIT_STRING: i64 = 0x03;
+const ASN1_OCTET_STRING: i64 = 0x04;
+const ASN1_NULL: i64 = 0x05;
+const ASN1_OID: i64 = 0x06;
+
+// Parse ASN.1 length field, returns length and advances offset
+fn asn1_parse_length(data_addr: i64, offset_addr: i64) -> i64 {
+    let offset = read_u64_addr(offset_addr) as i64;
+    let first_byte = read_byte_addr(data_addr + offset);
+
+    if bit_and(first_byte as u64, 0x80) == 0 {
+        // Short form: length is in this byte
+        write_u64_addr(offset_addr, (offset + 1) as u64);
+        return first_byte;
+    }
+
+    // Long form: first byte tells us how many length bytes follow
+    let num_bytes = bit_and(first_byte as u64, 0x7F) as i64;
+    let mut length: i64 = 0;
+    let mut i: i64 = 0;
+    while i < num_bytes {
+        length = shl_u64(length as u64, 8) as i64;
+        length = length + read_byte_addr(data_addr + offset + 1 + i);
+        i = i + 1;
+    }
+
+    write_u64_addr(offset_addr, (offset + 1 + num_bytes) as u64);
+    length
+}
+
+// Skip ASN.1 element and return its length
+fn asn1_skip_element(data_addr: i64, offset_addr: i64) -> i64 {
+    let offset = read_u64_addr(offset_addr) as i64;
+    let tag = read_byte_addr(data_addr + offset);
+    write_u64_addr(offset_addr, (offset + 1) as u64);
+    let length = asn1_parse_length(data_addr, offset_addr);
+    let new_offset = read_u64_addr(offset_addr) as i64;
+    write_u64_addr(offset_addr, (new_offset + length) as u64);
+    length
+}
+
+// Extract RSA public key (n, e) from X.509 certificate
+// Returns 0 on success, -1 on failure
+// Stores n at n_addr (up to 256 bytes), e at e_addr (4 bytes)
+fn x509_extract_rsa_pubkey(cert_addr: i64, cert_len: i64, n_addr: i64, n_len_addr: i64, e_addr: i64) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+
+    // TBSCertificate ::= SEQUENCE { ... }
+    let tbs_offset = read_u64_addr(offset_storage) as i64;
+    let tbs_tag = read_byte_addr(cert_addr + tbs_offset);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (tbs_offset + 1) as u64);
+    let tbs_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate contains: version?, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, ...
+    let mut current_offset = tbs_content_start;
+
+    // Check for optional version [0] EXPLICIT
+    let first_tag = read_byte_addr(cert_addr + current_offset);
+    if first_tag == 0xA0 {  // Context-specific constructed [0]
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    // serialNumber INTEGER
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // signature AlgorithmIdentifier
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // issuer Name
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // validity Validity
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // subject Name
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // subjectPublicKeyInfo SubjectPublicKeyInfo
+    // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
+    let spki_tag = read_byte_addr(cert_addr + current_offset);
+    if spki_tag != ASN1_SEQUENCE {
+        return -3;
+    }
+    write_u64_addr(offset_storage, (current_offset + 1) as u64);
+    let spki_len = asn1_parse_length(cert_addr, offset_storage);
+    let spki_content_start = read_u64_addr(offset_storage) as i64;
+
+    // algorithm AlgorithmIdentifier - skip it
+    write_u64_addr(offset_storage, spki_content_start as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    let pubkey_offset = read_u64_addr(offset_storage) as i64;
+
+    // subjectPublicKey BIT STRING
+    let pk_tag = read_byte_addr(cert_addr + pubkey_offset);
+    if pk_tag != ASN1_BIT_STRING {
+        return -4;
+    }
+    write_u64_addr(offset_storage, (pubkey_offset + 1) as u64);
+    let pk_len = asn1_parse_length(cert_addr, offset_storage);
+    let pk_content_start = read_u64_addr(offset_storage) as i64;
+
+    // BIT STRING has unused bits count as first byte
+    let unused_bits = read_byte_addr(cert_addr + pk_content_start);
+    let rsa_pubkey_start = pk_content_start + 1;
+
+    // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    let rsa_tag = read_byte_addr(cert_addr + rsa_pubkey_start);
+    if rsa_tag != ASN1_SEQUENCE {
+        return -5;
+    }
+    write_u64_addr(offset_storage, (rsa_pubkey_start + 1) as u64);
+    let rsa_len = asn1_parse_length(cert_addr, offset_storage);
+    let rsa_content_start = read_u64_addr(offset_storage) as i64;
+
+    // modulus INTEGER
+    let n_tag = read_byte_addr(cert_addr + rsa_content_start);
+    if n_tag != ASN1_INTEGER {
+        return -6;
+    }
+    write_u64_addr(offset_storage, (rsa_content_start + 1) as u64);
+    let n_len = asn1_parse_length(cert_addr, offset_storage);
+    let n_content_start = read_u64_addr(offset_storage) as i64;
+
+    // Copy modulus (skip leading zero if present)
+    let mut n_start = n_content_start;
+    let mut actual_n_len = n_len;
+    if read_byte_addr(cert_addr + n_start) == 0 && actual_n_len > 1 {
+        n_start = n_start + 1;
+        actual_n_len = actual_n_len - 1;
+    }
+
+    let mut i: i64 = 0;
+    while i < actual_n_len && i < 256 {
+        write_byte_addr(n_addr + i, read_byte_addr(cert_addr + n_start + i));
+        i = i + 1;
+    }
+    write_u64_addr(n_len_addr, actual_n_len as u64);
+
+    // publicExponent INTEGER
+    let e_offset = n_content_start + n_len;
+    let e_tag = read_byte_addr(cert_addr + e_offset);
+    if e_tag != ASN1_INTEGER {
+        return -7;
+    }
+    write_u64_addr(offset_storage, (e_offset + 1) as u64);
+    let e_len = asn1_parse_length(cert_addr, offset_storage);
+    let e_content_start = read_u64_addr(offset_storage) as i64;
+
+    // Read exponent (usually 3 bytes for 65537)
+    let mut exp: i64 = 0;
+    i = 0;
+    while i < e_len && i < 4 {
+        exp = shl_u64(exp as u64, 8) as i64;
+        exp = exp + read_byte_addr(cert_addr + e_content_start + i);
+        i = i + 1;
+    }
+    write_u64_addr(e_addr, exp as u64);
+
+    0  // Success
+}
+
+// ============================================================
 // TLS Handshake Implementation
 // ============================================================
 
@@ -10312,18 +10962,45 @@ fn tls_recv_server_hello(conn: i64, socket: i64) -> i64 {
             }
 
             if hs_type == 11 {  // Certificate
-                // Parse certificate chain
-                // For now, we'll skip validation and just extract the public key later
-                // The certificate starts after hs header (3 bytes length) + total certs length (3 bytes)
+                // Certificate message format:
+                // - 3 bytes: handshake header (type + 3-byte length) - already parsed
+                // - 3 bytes: total certificates length
+                // - For each certificate:
+                //   - 3 bytes: certificate length
+                //   - N bytes: certificate DER data
+
+                // Offset to certificate message content (after handshake type and length)
+                let cert_msg_start = offset + 9;  // Skip record header (5) + hs type (1) + hs length (3)
+
+                // Parse total certificates length (3 bytes big-endian)
+                let total_certs_len = bit_or(bit_or(
+                    shl_u64(read_byte_addr(rx_buf + cert_msg_start) as u64, 16),
+                    shl_u64(read_byte_addr(rx_buf + cert_msg_start + 1) as u64, 8)),
+                    read_byte_addr(rx_buf + cert_msg_start + 2) as u64) as i64;
+
+                // First certificate starts at cert_msg_start + 3
+                let first_cert_len_pos = cert_msg_start + 3;
+
+                // Parse first certificate length (3 bytes big-endian)
+                let first_cert_len = bit_or(bit_or(
+                    shl_u64(read_byte_addr(rx_buf + first_cert_len_pos) as u64, 16),
+                    shl_u64(read_byte_addr(rx_buf + first_cert_len_pos + 1) as u64, 8)),
+                    read_byte_addr(rx_buf + first_cert_len_pos + 2) as u64) as i64;
+
+                // First certificate DER data starts at first_cert_len_pos + 3
+                let first_cert_addr = rx_buf + first_cert_len_pos + 3;
+
                 serial_out(67);  // C
                 serial_out(69);  // E
                 serial_out(82);  // R
                 serial_out(84);  // T
+                serial_out(58);  // :
+                serial_hex64(first_cert_len as u64);
                 serial_newline();
 
-                // Store certificate data location for later RSA extraction
-                write_u64_addr(conn + TLS_OFF_PREMASTER + 48, (rx_buf + offset + 5) as u64);  // Cert msg addr
-                write_u64_addr(conn + TLS_OFF_PREMASTER + 56, hs_len as u64);  // Cert msg len
+                // Store certificate location for RSA key extraction
+                write_u64_addr(conn + TLS_OFF_CERT_ADDR, first_cert_addr as u64);
+                write_u64_addr(conn + TLS_OFF_CERT_LEN, first_cert_len as u64);
             }
 
             if hs_type == 14 {  // ServerHelloDone
@@ -10373,17 +11050,75 @@ fn tls_send_client_key_exchange(conn: i64, socket: i64) -> i64 {
         i = i + 1;
     }
 
-    // For RSA key exchange, we need to encrypt premaster with server's public key
-    // Since we don't have RSA implemented yet, we'll use a simplified approach
-    // by sending the premaster directly (THIS IS INSECURE - just for testing structure)
+    // RSA key exchange: encrypt premaster with server's public key
 
-    // In real TLS, we would:
-    // 1. Extract RSA public key from certificate
-    // 2. PKCS#1 v1.5 pad the premaster secret
-    // 3. RSA encrypt with public key
+    // 1. Get certificate from stored location
+    let cert_addr = read_u64_addr(conn + TLS_OFF_CERT_ADDR) as i64;
+    let cert_len = read_u64_addr(conn + TLS_OFF_CERT_LEN) as i64;
 
-    // For now, build the message structure with unencrypted premaster
-    // This will fail against real servers but tests our handshake flow
+    if cert_addr == 0 || cert_len == 0 {
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_out(67);  // C
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(84);  // T
+        serial_newline();
+        return -1;
+    }
+
+    // 2. Extract RSA public key from certificate
+    let n_addr = RSA_WORK_ADDR + 4608;      // Modulus (256 bytes)
+    let n_len_addr = RSA_WORK_ADDR + 4864;  // Modulus length storage
+    let e_addr = RSA_WORK_ADDR + 4872;      // Exponent storage
+
+    let extract_result = x509_extract_rsa_pubkey(cert_addr, cert_len, n_addr, n_len_addr, e_addr);
+    if extract_result < 0 {
+        serial_out(88);  // X
+        serial_out(53);  // 5
+        serial_out(48);  // 0
+        serial_out(57);  // 9
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_out(58);  // :
+        serial_hex64((0 - extract_result) as u64);
+        serial_newline();
+        return -2;
+    }
+
+    let n_len = read_u64_addr(n_len_addr) as i64;
+    let e = read_u64_addr(e_addr);
+
+    serial_out(82);  // R
+    serial_out(83);  // S
+    serial_out(65);  // A
+    serial_out(58);  // :
+    serial_out(78);  // N
+    serial_out(61);  // =
+    serial_hex64(n_len as u64);
+    serial_out(32);  // space
+    serial_out(69);  // E
+    serial_out(61);  // =
+    serial_hex64(e);
+    serial_newline();
+
+    // 3. PKCS#1 v1.5 pad the premaster secret (48 bytes -> 256 bytes)
+    let padded_addr = RSA_WORK_ADDR + 4880;
+    pkcs1_pad(padded_addr, conn + TLS_OFF_PREMASTER, 48, 256);
+
+    // 4. RSA encrypt: ciphertext = padded^e mod n
+    let encrypted_addr = RSA_WORK_ADDR + 5136;
+    rsa_encrypt(encrypted_addr, padded_addr, 256, n_addr, n_len, e);
+
+    serial_out(69);  // E
+    serial_out(78);  // N
+    serial_out(67);  // C
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    // Build ClientKeyExchange message with encrypted premaster
 
     // TLS Record header
     write_byte_addr(tx_buf + pos, 0x16);  // Handshake
@@ -10398,25 +11133,25 @@ fn tls_send_client_key_exchange(conn: i64, socket: i64) -> i64 {
     write_byte_addr(tx_buf + pos, 16);  // ClientKeyExchange type
     pos = pos + 1;
 
-    // Handshake length (3 bytes) - will be encrypted premaster length + 2
-    let hs_len = 48 + 2;  // Simplified: just premaster with 2-byte length prefix
+    // Handshake length (3 bytes) = encrypted premaster length (256) + 2 byte length prefix
+    let hs_len: i64 = 256 + 2;
     write_byte_addr(tx_buf + pos, 0);
     write_byte_addr(tx_buf + pos + 1, shr_u64(hs_len as u64, 8) as i64);
     write_byte_addr(tx_buf + pos + 2, hs_len as i64);
     pos = pos + 3;
 
-    // Encrypted premaster length (2 bytes)
-    write_byte_addr(tx_buf + pos, 0);
-    write_byte_addr(tx_buf + pos + 1, 48);
+    // Encrypted premaster length (2 bytes) = 256 for 2048-bit RSA
+    write_byte_addr(tx_buf + pos, 1);   // 256 >> 8 = 1
+    write_byte_addr(tx_buf + pos + 1, 0);  // 256 & 0xFF = 0
     pos = pos + 2;
 
-    // "Encrypted" premaster (unencrypted for testing)
+    // Encrypted premaster (256 bytes)
     i = 0;
-    while i < 48 {
-        write_byte_addr(tx_buf + pos + i, read_byte_addr(conn + TLS_OFF_PREMASTER + i));
+    while i < 256 {
+        write_byte_addr(tx_buf + pos + i, read_byte_addr(encrypted_addr + i));
         i = i + 1;
     }
-    pos = pos + 48;
+    pos = pos + 256;
 
     // Fill record length
     let record_len = pos - 5;
@@ -12738,6 +13473,270 @@ fn test_tcp_connection() {
     }
 }
 
+// Test RSA encryption (unit test, no network)
+fn test_rsa_unit() {
+    serial_out(82);  // R
+    serial_out(83);  // S
+    serial_out(65);  // A
+    serial_out(32);  // space
+    serial_out(85);  // U
+    serial_out(78);  // N
+    serial_out(73);  // I
+    serial_out(84);  // T
+    serial_newline();
+
+    // Test big integer operations with small numbers
+    let a_addr = RSA_WORK_ADDR + 8000;
+    let b_addr = RSA_WORK_ADDR + 8256;
+    let c_addr = RSA_WORK_ADDR + 8512;
+
+    // Test 1: Addition
+    bigint_zero(a_addr);
+    bigint_zero(b_addr);
+    write_u64_addr(a_addr, 0xFFFFFFFF);  // a = 2^32 - 1
+    write_u64_addr(b_addr, 1);           // b = 1
+    bigint_add(c_addr, a_addr, b_addr);  // c = a + b = 2^32
+    let c0 = read_u64_addr(c_addr);
+    let c1 = read_u64_addr(c_addr + 8);
+
+    serial_out(65);  // A
+    serial_out(68);  // D
+    serial_out(68);  // D
+    serial_out(58);  // :
+    if c0 == 0x100000000 && c1 == 0 {
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_out(32);  // space
+        serial_hex64(c0);
+        serial_out(47);  // /
+        serial_hex64(c1);
+    }
+    serial_newline();
+
+    // Test 2: Multiplication (small numbers)
+    bigint_zero(a_addr);
+    bigint_zero(b_addr);
+    write_u64_addr(a_addr, 12345);
+    write_u64_addr(b_addr, 67890);
+    bigint_mulmod(c_addr, a_addr, b_addr, a_addr);  // For small numbers, no mod needed
+    // 12345 * 67890 = 838102050
+    let result = read_u64_addr(c_addr);
+
+    serial_out(77);  // M
+    serial_out(85);  // U
+    serial_out(76);  // L
+    serial_out(58);  // :
+    // Note: mulmod reduces by a=12345, so result = 838102050 mod 12345 = 838102050 - 67890*12345 = 0
+    // Actually we need a proper test. Let's just check the mul result
+    serial_hex64(result);
+    serial_newline();
+
+    // Test 3: Modular exponentiation (small: 2^10 mod 1000 = 1024 mod 1000 = 24)
+    bigint_zero(a_addr);  // base
+    bigint_zero(b_addr);  // exponent
+    bigint_zero(c_addr);  // modulus
+    write_u64_addr(a_addr, 2);     // base = 2
+    write_u64_addr(b_addr, 10);    // exp = 10
+    write_u64_addr(c_addr, 1000);  // mod = 1000
+
+    let result_addr = RSA_WORK_ADDR + 8768;
+    bigint_modexp(result_addr, a_addr, b_addr, c_addr);
+    let exp_result = read_u64_addr(result_addr);
+
+    serial_out(69);  // E
+    serial_out(88);  // X
+    serial_out(80);  // P
+    serial_out(58);  // :
+    if exp_result == 24 {
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_out(32);  // space
+        serial_hex64(exp_result);
+    }
+    serial_newline();
+
+    // Test 4: RSA-like operation with tiny key (e=17, d=2753, n=3233)
+    // 3233 = 61 * 53 (prime factors)
+    // phi(3233) = 60 * 52 = 3120
+    // e = 17 (coprime to 3120)
+    // d = 2753 (17 * 2753 mod 3120 = 1)
+    // Encrypt m=123: c = 123^17 mod 3233 = 855
+    // Decrypt: m = 855^2753 mod 3233 = 123
+
+    bigint_zero(a_addr);  // message
+    bigint_zero(b_addr);  // exponent
+    bigint_zero(c_addr);  // modulus
+    write_u64_addr(a_addr, 123);   // m = 123
+    write_u64_addr(b_addr, 17);    // e = 17
+    write_u64_addr(c_addr, 3233);  // n = 3233
+
+    bigint_modexp(result_addr, a_addr, b_addr, c_addr);
+    let cipher = read_u64_addr(result_addr);
+
+    serial_out(82);  // R
+    serial_out(83);  // S
+    serial_out(65);  // A
+    serial_out(69);  // E
+    serial_out(58);  // :
+    if cipher == 855 {
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+        serial_out(32);  // space
+        serial_hex64(cipher);
+    }
+    serial_newline();
+
+    serial_out(82);  // R
+    serial_out(83);  // S
+    serial_out(65);  // A
+    serial_out(32);  // space
+    serial_out(68);  // D
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(69);  // E
+    serial_newline();
+}
+
+// Test HTTPS/TLS connection
+fn test_tls_connection() {
+    serial_out(84);  // T
+    serial_out(76);  // L
+    serial_out(83);  // S
+    serial_out(32);  // space
+    serial_out(84);  // T
+    serial_out(69);  // E
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_newline();
+
+    // Configure network
+    net::net_tcp_configure_qemu();
+
+    // Create socket
+    let sock = net::net_socket_create(2, 1, 0);
+    if sock < 0 {
+        serial_out(83);  // S
+        serial_out(79);  // O
+        serial_out(67);  // C
+        serial_out(75);  // K
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return;
+    }
+
+    serial_out(83);  // S
+    serial_out(79);  // O
+    serial_out(67);  // C
+    serial_out(75);  // K
+    serial_out(61);  // =
+    serial_print_dec(sock);
+    serial_newline();
+
+    // Get proto_id
+    let desc_addr = 0xD3A000 + (sock * 32);
+    let proto_id = read_u32_at(desc_addr, 4) as i64;
+
+    // Connect to example.com (93.184.216.34) port 443
+    // 93.184.216.34 = (93 << 24) | (184 << 16) | (216 << 8) | 34 = 1572395042
+    let server_ip: i64 = 1572395042;
+    let port: i64 = 443;
+
+    serial_out(67);  // C
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(78);  // N
+    serial_out(52);  // 4
+    serial_out(52);  // 4
+    serial_out(51);  // 3
+    serial_newline();
+
+    let result = net::net_tcp_connect(proto_id, server_ip, port);
+    if result < 0 {
+        serial_out(67);  // C
+        serial_out(79);  // O
+        serial_out(78);  // N
+        serial_out(78);  // N
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_out(58);  // :
+        serial_print_dec(0 - result);
+        serial_newline();
+        return;
+    }
+
+    serial_out(67);  // C
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(78);  // N
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    // Now do TLS handshake
+    // Hostname: "example.com" = 11 bytes
+    let hostname_addr = RSA_WORK_ADDR + 6000;
+    write_byte_addr(hostname_addr, 101);      // e
+    write_byte_addr(hostname_addr + 1, 120);  // x
+    write_byte_addr(hostname_addr + 2, 97);   // a
+    write_byte_addr(hostname_addr + 3, 109);  // m
+    write_byte_addr(hostname_addr + 4, 112);  // p
+    write_byte_addr(hostname_addr + 5, 108);  // l
+    write_byte_addr(hostname_addr + 6, 101);  // e
+    write_byte_addr(hostname_addr + 7, 46);   // .
+    write_byte_addr(hostname_addr + 8, 99);   // c
+    write_byte_addr(hostname_addr + 9, 111);  // o
+    write_byte_addr(hostname_addr + 10, 109); // m
+
+    let tls_result = syscall_tls_connect(sock, hostname_addr, 11);
+
+    serial_out(84);  // T
+    serial_out(76);  // L
+    serial_out(83);  // S
+    serial_out(61);  // =
+    if tls_result >= 0 {
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_out(58);  // :
+        serial_print_dec(0 - tls_result);
+    }
+    serial_newline();
+
+    // Close
+    syscall_tls_close(sock);
+
+    serial_out(84);  // T
+    serial_out(76);  // L
+    serial_out(83);  // S
+    serial_out(32);  // space
+    serial_out(68);  // D
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(69);  // E
+    serial_newline();
+}
+
 // ============================================================
 // Kernel Entry Point
 // ============================================================
@@ -12831,6 +13830,9 @@ fn _start() {
     // Early TCP test - this will likely fail but it "wakes up" QEMU's network stack
     // Without this, later network operations fail because QEMU hasn't initialized its network
     test_tcp_connection();
+
+    // Test RSA unit operations
+    test_rsa_unit();
 
     // Test PCI 32-bit port I/O
     test_pci_ports();

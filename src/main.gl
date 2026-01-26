@@ -697,8 +697,17 @@ fn i64_to_proc_state(n: i64) -> ProcState {
 // ============================================================
 
 fn shl_u64(value: u64, shift: u64) -> u64 {
+    // Use multiplication instead of broken <<= operator
+    // value << n = value * 2^n
+    if shift >= 64 {
+        return 0;
+    }
     let mut result = value;
-    result <<= shift;
+    let mut count = shift;
+    while count > 0 {
+        result = result * 2;
+        count = count - 1;
+    }
     result
 }
 
@@ -2253,52 +2262,65 @@ fn pmm_mark_free(base: u64, length: u64) {
     let start_page = base / (PAGE_SIZE as u64);
     let end_page = (base + length) / (PAGE_SIZE as u64);
 
-    let mut page = start_page;
-    while page < end_page {
-        let qword_idx = page / 64;
-        let bit_idx = page % 64;
-        let bitmap_offset = (qword_idx * 8) as i64;
+    // Optimized: mark entire qwords as free when possible
+    let start_qword = (start_page + 63) / 64;  // First full qword
+    let end_qword = end_page / 64;              // Last full qword
 
-        // Read current entry
-        let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset);
-
-        // Clear the bit (mark as free)
-        let mask = shl_u64(1, bit_idx);
-        let not_mask = bit_not(mask);
-        let new_entry = bit_and(entry, not_mask);
-
-        write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, new_entry);
-
-        // Update free page count
-        let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
-        write_u64_at(PMM_STATE_ADDR, 8, current_free + 1);
-
-        page = page + 1;
+    // Mark full qwords as 0 (all pages free)
+    let mut qword = start_qword;
+    while qword < end_qword {
+        let bitmap_offset = (qword * 8) as i64;
+        write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, 0);
+        qword = qword + 1;
     }
+
+    // Count pages freed
+    let full_qwords = if end_qword > start_qword { end_qword - start_qword } else { 0 };
+    let pages_freed = full_qwords * 64;
+
+    // Update free count
+    let current_free = read_u64_at(PMM_STATE_ADDR, 8) as u64;
+    write_u64_at(PMM_STATE_ADDR, 8, current_free + pages_freed);
+
 }
 
-fn pmm_alloc_page() -> u64 {
-    let mut idx: u64 = 0;
+// Unused hint address (kept for potential future optimization)
+const PMM_HINT_ADDR: i64 = 0x408020;
 
-    while idx < 4096 {
+fn pmm_alloc_page() -> u64 {
+    // Simple linear search from qword 32 (where free pages start)
+    // Pages 0-2047 are reserved, pages 2048+ are free
+    let mut idx: u64 = 32;
+
+    while idx < 512 {
         let bitmap_offset = (idx * 8) as i64;
         let entry = read_u64_at(PMM_BITMAP_ADDR, bitmap_offset);
 
-        if entry != 0xFFFFFFFFFFFFFFFF {
+        // Fast path: if entry is 0, all 64 pages are free
+        if entry == 0 {
+            write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, 1);
+            let current_free = read_u64_at(PMM_STATE_ADDR, 8);
+            if current_free > 0 {
+                write_u64_at(PMM_STATE_ADDR, 8, current_free - 1);
+            }
+            return (idx * 64) * (PAGE_SIZE as u64);
+        }
+
+        // Check if entry has any free pages (not all 1s)
+        let entry_plus_one = entry + 1;
+        if entry_plus_one != 0 {
+            // Find first free bit
             let mut bit: u64 = 0;
             while bit < 64 {
                 let mask = shl_u64(1, bit);
-                let and_result = bit_and(entry, mask);
-                if and_result == 0 {
+                if bit_and(entry, mask) == 0 {
+                    // Found free page - mark as used
                     write_u64_at(PMM_BITMAP_ADDR, bitmap_offset, bit_or(entry, mask));
-
                     let current_free = read_u64_at(PMM_STATE_ADDR, 8);
                     if current_free > 0 {
                         write_u64_at(PMM_STATE_ADDR, 8, current_free - 1);
                     }
-
-                    let page = idx * 64 + bit;
-                    return page * (PAGE_SIZE as u64);
+                    return (idx * 64 + bit) * (PAGE_SIZE as u64);
                 }
                 bit = bit + 1;
             }
@@ -2306,7 +2328,7 @@ fn pmm_alloc_page() -> u64 {
         idx = idx + 1;
     }
 
-    0
+    0  // Out of memory
 }
 
 fn pmm_free_page(addr: u64) {
@@ -2348,6 +2370,7 @@ fn parse_multiboot(mb_info_addr: i64) -> u64 {
     let usable_start: u64 = 0x800000;   // 8MB
     let usable_end: u64 = 0x8000000;    // 128MB
     pmm_mark_free(usable_start, usable_end - usable_start);
+
     usable_end
 }
 
@@ -4004,6 +4027,428 @@ fn kptpool_alloc() -> u64 {
     }
 
     page
+}
+
+// ============================================================
+// Kernel Heap Functions
+// ============================================================
+
+// Heap state - mirrors structure in mm/heap.gl but managed locally
+const HEAP_START_ADDR: u64 = 0x1000000;     // 16MB - heap start
+const HEAP_MAX_ADDR: u64 = 0x5000000;       // 80MB - heap max (64MB heap space)
+const HEAP_INITIAL_PAGES: u64 = 16;         // 64KB initial heap
+const HEAP_STATE_ADDR: i64 = 0x4B0000;      // Heap state storage
+
+// Heap state offsets
+const HEAP_STATE_START: i64 = 0;       // HEAP_START
+const HEAP_STATE_END: i64 = 8;         // HEAP_END
+const HEAP_STATE_MAX: i64 = 16;        // HEAP_MAX
+const HEAP_STATE_BUMP: i64 = 24;       // HEAP_BUMP
+const HEAP_STATE_FREE_LIST: i64 = 32;  // FREE_LIST
+const HEAP_STATE_TOTAL: i64 = 40;      // TOTAL_ALLOCATED
+const HEAP_STATE_COUNT: i64 = 48;      // ALLOC_COUNT
+const HEAP_STATE_PAGES: i64 = 56;      // HEAP_PAGES
+const HEAP_STATE_INIT: i64 = 64;       // Initialized flag
+
+const HEAP_ALIGNMENT: u64 = 16;
+const HEAP_MIN_ALLOC: u64 = 32;
+const HEAP_ALLOC_MAGIC: u64 = 0xDEADBEEFCAFEBABE;
+
+// Initialize kernel heap with dynamic expansion support
+fn init_heap() -> bool {
+    // Check if already initialized
+    let init_flag = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_INIT);
+    if init_flag == 1 {
+        return true;
+    }
+
+    serial_out(72);  // H
+    serial_out(69);  // E
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(32);  // space
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(73);  // I
+    serial_out(84);  // T
+    serial_newline();
+
+    // Initialize heap state
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_START, HEAP_START_ADDR);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_MAX, HEAP_MAX_ADDR);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END, HEAP_START_ADDR);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_BUMP, HEAP_START_ADDR);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_FREE_LIST, 0);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_TOTAL, 0);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_COUNT, 0);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES, 0);
+
+    // Map initial pages (64KB = 16 pages)
+    let mut addr = HEAP_START_ADDR;
+    let mut i: u64 = 0;
+    while i < HEAP_INITIAL_PAGES {
+        let phys = pmm_alloc_page();
+        if phys == 0 {
+            serial_out(79);  // O
+            serial_out(79);  // O
+            serial_out(77);  // M
+            serial_newline();
+            return false;
+        }
+
+        // Map with write permission (PAGE_PRESENT | PAGE_WRITE = 3)
+        if !mmap_map_page(addr, phys, 3) {
+            serial_out(77);  // M
+            serial_out(65);  // A
+            serial_out(80);  // P
+            serial_out(70);  // F
+            serial_newline();
+            return false;
+        }
+
+        // Zero the page
+        let mut offset: u64 = 0;
+        while offset < 4096 {
+            write_u64_addr((addr + offset) as i64, 0);
+            offset = offset + 8;
+        }
+
+        addr = addr + 4096;
+        i = i + 1;
+    }
+
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END, addr);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES, HEAP_INITIAL_PAGES);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_INIT, 1);
+
+    serial_out(72);  // H
+    serial_out(69);  // E
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(32);  // space
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_out(32);  // space
+    serial_print_dec((HEAP_INITIAL_PAGES * 4) as i64);  // KB
+    serial_out(75);  // K
+    serial_out(66);  // B
+    serial_newline();
+
+    true
+}
+
+// Align size up to alignment boundary
+fn heap_align_up(size: u64, align: u64) -> u64 {
+    bit_and(size + align - 1, bit_not(align - 1))
+}
+
+// Extend heap by allocating more pages
+fn heap_extend(min_size: u64) -> bool {
+    let heap_end = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END);
+    let heap_max = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_MAX);
+    let heap_pages = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES);
+
+    // Calculate pages needed (at least 16 pages = 64KB at a time for efficiency)
+    let min_extend = if min_size < 65536 { 65536 } else { min_size };
+    let needed = heap_align_up(min_extend, 4096);
+    let pages_needed = needed / 4096;
+
+    // Check we won't exceed maximum
+    if heap_end + needed > heap_max {
+        return false;
+    }
+
+    // Allocate and map pages
+    let mut i: u64 = 0;
+    let mut alloc_ok: u64 = 0;
+    while i < pages_needed {
+        let phys = pmm_alloc_page();
+        if phys == 0 {
+            // Update heap end with what we managed to allocate
+            if alloc_ok > 0 {
+                write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END, heap_end + (alloc_ok * 4096));
+                write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES, heap_pages + alloc_ok);
+            }
+            return false;  // Out of physical memory
+        }
+
+        let virt = heap_end + (i * 4096);
+        // Map with write permission (PAGE_PRESENT | PAGE_WRITE = 3)
+        if !mmap_map_page(virt, phys, 3) {
+            // Update heap end with what we managed to allocate
+            if alloc_ok > 0 {
+                write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END, heap_end + (alloc_ok * 4096));
+                write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES, heap_pages + alloc_ok);
+            }
+            return false;  // Failed to map page
+        }
+
+        // Zero the page
+        let mut offset: u64 = 0;
+        while offset < 4096 {
+            write_u64_addr((virt + offset) as i64, 0);
+            offset = offset + 8;
+        }
+
+        alloc_ok = alloc_ok + 1;
+        i = i + 1;
+    }
+
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END, heap_end + needed);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES, heap_pages + pages_needed);
+    true
+}
+
+// Allocate memory from heap
+pub fn heap_alloc(size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+
+    // Check initialization
+    let init_flag = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_INIT);
+    if init_flag != 1 {
+        return 0;
+    }
+
+    // Calculate actual size needed (header + aligned size)
+    let header_size: u64 = 16;
+    let actual_size = heap_align_up(size + header_size, HEAP_ALIGNMENT);
+    let min_size = if actual_size < HEAP_MIN_ALLOC { HEAP_MIN_ALLOC } else { actual_size };
+
+    let mut heap_bump = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_BUMP);
+    let heap_end = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END);
+
+    // Check if we need to extend heap
+    if heap_bump + min_size > heap_end {
+        if !heap_extend(min_size) {
+            return 0;  // Out of memory
+        }
+    }
+
+    // Re-read after potential extension
+    let heap_end_new = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END);
+    if heap_bump + min_size > heap_end_new {
+        return 0;  // Still not enough space
+    }
+
+    let block_addr = heap_bump;
+    heap_bump = heap_bump + min_size;
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_BUMP, heap_bump);
+
+    // Write allocation header (size + magic)
+    write_u64_addr(block_addr as i64, min_size);
+    write_u64_addr((block_addr + 8) as i64, HEAP_ALLOC_MAGIC);
+
+    // Update statistics
+    let total = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_TOTAL);
+    let count = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_COUNT);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_TOTAL, total + min_size);
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_COUNT, count + 1);
+
+    block_addr + 16  // Return pointer after header
+}
+
+// Free allocated memory
+pub fn heap_free(ptr: u64) {
+    if ptr == 0 {
+        return;
+    }
+
+    let block_addr = ptr - 16;
+
+    // Validate magic number
+    let magic = read_u64_addr((block_addr + 8) as i64);
+    if magic != HEAP_ALLOC_MAGIC {
+        return;  // Invalid or double free
+    }
+
+    // Get block size
+    let block_size = read_u64_addr(block_addr as i64);
+
+    // Clear magic to prevent double-free
+    write_u64_addr((block_addr + 8) as i64, 0);
+
+    // Add to free list
+    let free_list = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_FREE_LIST);
+    write_u64_addr(block_addr as i64, block_size);  // Keep size
+    write_u64_addr((block_addr + 8) as i64, free_list);  // Next pointer
+    write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_FREE_LIST, block_addr);
+
+    // Update statistics
+    let total = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_TOTAL);
+    let count = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_COUNT);
+    if total >= block_size {
+        write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_TOTAL, total - block_size);
+    }
+    if count > 0 {
+        write_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_COUNT, count - 1);
+    }
+}
+
+// Get heap statistics
+pub fn heap_get_size() -> u64 {
+    let start = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_START);
+    let end = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_END);
+    end - start
+}
+
+pub fn heap_get_used() -> u64 {
+    let start = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_START);
+    let bump = read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_BUMP);
+    bump - start
+}
+
+pub fn heap_get_pages() -> u64 {
+    read_u64_addr(HEAP_STATE_ADDR + HEAP_STATE_PAGES)
+}
+
+// Test heap with large allocations
+fn test_heap_allocs() {
+    serial_out(72);  // H
+    serial_out(69);  // E
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(32);  // space
+    serial_out(84);  // T
+    serial_out(69);  // E
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_newline();
+
+    // Test 1: Small allocation (1KB)
+    let ptr1 = heap_alloc(1024);
+    serial_out(49);  // 1
+    serial_out(75);  // K
+    serial_out(58);  // :
+    serial_out(32);  // space
+    if ptr1 != 0 {
+        serial_hex(ptr1);
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+    }
+    serial_newline();
+
+    // Test 2: 64KB allocation (forces heap extension)
+    let ptr2 = heap_alloc(65536);
+    serial_out(54);  // 6
+    serial_out(52);  // 4
+    serial_out(75);  // K
+    serial_out(58);  // :
+    serial_out(32);  // space
+    if ptr2 != 0 {
+        serial_hex(ptr2);
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+    }
+    serial_newline();
+
+    // Test 3: 1MB allocation
+    let ptr3 = heap_alloc(1048576);
+    serial_out(49);  // 1
+    serial_out(77);  // M
+    serial_out(58);  // :
+    serial_out(32);  // space
+    if ptr3 != 0 {
+        serial_hex(ptr3);
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+    }
+    serial_newline();
+
+    // Test 4: 4MB allocation
+    let ptr4 = heap_alloc(4194304);
+    serial_out(52);  // 4
+    serial_out(77);  // M
+    serial_out(58);  // :
+    serial_out(32);  // space
+    if ptr4 != 0 {
+        serial_hex(ptr4);
+        serial_out(32);  // space
+        serial_out(79);  // O
+        serial_out(75);  // K
+    } else {
+        serial_out(70);  // F
+        serial_out(65);  // A
+        serial_out(73);  // I
+        serial_out(76);  // L
+    }
+    serial_newline();
+
+    // Print heap stats
+    let heap_size = heap_get_size();
+    let heap_used = heap_get_used();
+    let heap_pages = heap_get_pages();
+
+    serial_out(72);  // H
+    serial_out(83);  // S
+    serial_out(73);  // I
+    serial_out(90);  // Z
+    serial_out(69);  // E
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec((heap_size / 1024) as i64);
+    serial_out(75);  // K
+    serial_out(66);  // B
+    serial_newline();
+
+    serial_out(72);  // H
+    serial_out(85);  // U
+    serial_out(83);  // S
+    serial_out(69);  // E
+    serial_out(68);  // D
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec((heap_used / 1024) as i64);
+    serial_out(75);  // K
+    serial_out(66);  // B
+    serial_newline();
+
+    serial_out(72);  // H
+    serial_out(80);  // P
+    serial_out(65);  // A
+    serial_out(71);  // G
+    serial_out(69);  // E
+    serial_out(83);  // S
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(heap_pages as i64);
+    serial_newline();
+
+    // Free allocations
+    heap_free(ptr1);
+    heap_free(ptr2);
+    heap_free(ptr3);
+    heap_free(ptr4);
+
+    serial_out(72);  // H
+    serial_out(69);  // E
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(32);  // space
+    serial_out(68);  // D
+    serial_out(79);  // O
+    serial_out(78);  // N
+    serial_out(69);  // E
+    serial_newline();
 }
 
 // Map a virtual page to a physical page for demand paging
@@ -10148,6 +10593,13 @@ fn _start() {
 
     // Initialize kernel page table pool early (needed for VBE framebuffer mapping)
     kptpool_init();
+
+    // Initialize kernel heap (64KB initial, expandable to 64MB)
+    let heap_ok = init_heap();
+    if heap_ok {
+        // Test heap with large allocations
+        test_heap_allocs();
+    }
 
     // Initialize VBE framebuffer
     let vbe_ok = vbe_init(mb_info_addr);

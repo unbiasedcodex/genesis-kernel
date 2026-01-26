@@ -13834,6 +13834,9 @@ fn _start() {
     // Test RSA unit operations
     test_rsa_unit();
 
+    // Test TLS/HTTPS with RSA
+    test_tls_connection();
+
     // Test PCI 32-bit port I/O
     test_pci_ports();
 

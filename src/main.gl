@@ -605,6 +605,12 @@ const SYS_NET_RECVFROM: i64 = 64;     // recvfrom(socket, buf, len, ip_out, port
 const SYS_NET_DHCP: i64 = 65;         // start DHCP -> result
 const SYS_NET_POLL: i64 = 66;         // poll network stack -> packets_processed
 
+// TLS Syscalls (80-83)
+const SYS_TLS_CONNECT: i64 = 80;      // tls_connect(socket, hostname_addr, hostname_len) -> result
+const SYS_TLS_SEND: i64 = 81;         // tls_send(socket, data_addr, len) -> bytes_sent
+const SYS_TLS_RECV: i64 = 82;         // tls_recv(socket, data_addr, max_len) -> bytes_recv
+const SYS_TLS_CLOSE: i64 = 83;        // tls_close(socket) -> result
+
 // Network address families
 const NET_AF_INET: i64 = 2;           // IPv4
 
@@ -767,6 +773,21 @@ fn bit_not(a: u64) -> u64 {
             "movq %rdi, %rax
              notq %rax",
             in("rdi") a,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn bit_xor(a: u64, b: u64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             xorq %rsi, %rax",
+            in("rdi") a,
+            in("rsi") b,
             lateout("rax") result,
             options(nostack, att_syntax)
         );
@@ -3216,6 +3237,11 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         76 => syscall_fb_map(),                      // SYS_FB_MAP
         77 => syscall_fb_char(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64), // SYS_FB_CHAR (x, y, char, color)
         78 => syscall_fb_text(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64), // SYS_FB_TEXT (x, y, text_addr, color)
+        // TLS syscalls (80-83)
+        80 => syscall_tls_connect(arg1, arg2, arg3), // SYS_TLS_CONNECT
+        81 => syscall_tls_send(arg1, arg2, arg3),    // SYS_TLS_SEND
+        82 => syscall_tls_recv(arg1, arg2, arg3),    // SYS_TLS_RECV
+        83 => syscall_tls_close(arg1),               // SYS_TLS_CLOSE
         90 => syscall_mouse_pos(),                   // SYS_MOUSE_POS
         91 => syscall_mouse_btn(),                   // SYS_MOUSE_BTN
         92 => syscall_mouse_set(arg1, arg2),         // SYS_MOUSE_SET
@@ -8835,6 +8861,656 @@ fn syscall_net_poll() -> i64 {
     // Would call net_stack_poll()
     // Returns number of packets processed
     return 0;
+}
+
+// ============================================================
+// TLS 1.2 Implementation
+// ============================================================
+
+// TLS Memory Layout (using heap area 0x4000000 - 0x4100000 = 1MB for TLS)
+const TLS_STATE_BASE: i64 = 0x4000000;        // TLS state base
+const TLS_MAX_CONNECTIONS: i64 = 8;           // Max concurrent TLS connections
+const TLS_CONN_SIZE: i64 = 8192;              // 8KB per connection state
+
+// TLS Connection State Offsets
+const TLS_OFF_SOCKET: i64 = 0;                // Socket FD (8 bytes)
+const TLS_OFF_STATE: i64 = 8;                 // Handshake state (1 byte)
+const TLS_OFF_CIPHER: i64 = 9;                // Cipher suite (2 bytes)
+const TLS_OFF_CLIENT_RANDOM: i64 = 16;        // Client random (32 bytes)
+const TLS_OFF_SERVER_RANDOM: i64 = 48;        // Server random (32 bytes)
+const TLS_OFF_MASTER_SECRET: i64 = 80;        // Master secret (48 bytes)
+const TLS_OFF_CLIENT_KEY: i64 = 128;          // Client write key (16 bytes)
+const TLS_OFF_SERVER_KEY: i64 = 144;          // Server write key (16 bytes)
+const TLS_OFF_CLIENT_IV: i64 = 160;           // Client write IV (4 bytes)
+const TLS_OFF_SERVER_IV: i64 = 164;           // Server write IV (4 bytes)
+const TLS_OFF_CLIENT_SEQ: i64 = 168;          // Client sequence number (8 bytes)
+const TLS_OFF_SERVER_SEQ: i64 = 176;          // Server sequence number (8 bytes)
+const TLS_OFF_HOSTNAME: i64 = 192;            // Server hostname (128 bytes)
+const TLS_OFF_HOSTNAME_LEN: i64 = 320;        // Hostname length (2 bytes)
+const TLS_OFF_HANDSHAKE_HASH: i64 = 384;      // Handshake hash state (128 bytes)
+const TLS_OFF_TX_BUF: i64 = 512;              // TX buffer (2048 bytes)
+const TLS_OFF_RX_BUF: i64 = 2560;             // RX buffer (4096 bytes)
+const TLS_OFF_RX_LEN: i64 = 6656;             // RX buffer length (4 bytes)
+const TLS_OFF_AES_KEYS: i64 = 6660;           // AES expanded keys (480 bytes)
+
+// TLS States
+const TLS_STATE_NONE: i64 = 0;
+const TLS_STATE_HANDSHAKE: i64 = 1;
+const TLS_STATE_CONNECTED: i64 = 2;
+const TLS_STATE_ERROR: i64 = 3;
+
+// TLS Versions
+const TLS_VERSION_12: i64 = 0x0303;
+
+// TLS Content Types
+const TLS_CONTENT_CHANGE_CIPHER: i64 = 20;
+const TLS_CONTENT_ALERT: i64 = 21;
+const TLS_CONTENT_HANDSHAKE: i64 = 22;
+const TLS_CONTENT_APPLICATION: i64 = 23;
+
+// TLS Handshake Types
+const TLS_HS_CLIENT_HELLO: i64 = 1;
+const TLS_HS_SERVER_HELLO: i64 = 2;
+const TLS_HS_CERTIFICATE: i64 = 11;
+const TLS_HS_SERVER_KEY_EXCHANGE: i64 = 12;
+const TLS_HS_SERVER_HELLO_DONE: i64 = 14;
+const TLS_HS_CLIENT_KEY_EXCHANGE: i64 = 16;
+const TLS_HS_FINISHED: i64 = 20;
+
+// Cipher Suites
+const TLS_RSA_WITH_AES_128_GCM_SHA256: i64 = 0x009C;
+
+// ============================================================
+// SHA-256 Implementation
+// ============================================================
+
+// SHA-256 initial hash values
+const SHA256_H0: u64 = 0x6a09e667;
+const SHA256_H1: u64 = 0xbb67ae85;
+const SHA256_H2: u64 = 0x3c6ef372;
+const SHA256_H3: u64 = 0xa54ff53a;
+const SHA256_H4: u64 = 0x510e527f;
+const SHA256_H5: u64 = 0x9b05688c;
+const SHA256_H6: u64 = 0x1f83d9ab;
+const SHA256_H7: u64 = 0x5be0cd19;
+
+// SHA-256 round constants (first 32)
+fn sha256_k(i: i64) -> u64 {
+    // First 32 round constants (there are 64 total)
+    if i == 0 { return 0x428a2f98; }
+    if i == 1 { return 0x71374491; }
+    if i == 2 { return 0xb5c0fbcf; }
+    if i == 3 { return 0xe9b5dba5; }
+    if i == 4 { return 0x3956c25b; }
+    if i == 5 { return 0x59f111f1; }
+    if i == 6 { return 0x923f82a4; }
+    if i == 7 { return 0xab1c5ed5; }
+    if i == 8 { return 0xd807aa98; }
+    if i == 9 { return 0x12835b01; }
+    if i == 10 { return 0x243185be; }
+    if i == 11 { return 0x550c7dc3; }
+    if i == 12 { return 0x72be5d74; }
+    if i == 13 { return 0x80deb1fe; }
+    if i == 14 { return 0x9bdc06a7; }
+    if i == 15 { return 0xc19bf174; }
+    if i == 16 { return 0xe49b69c1; }
+    if i == 17 { return 0xefbe4786; }
+    if i == 18 { return 0x0fc19dc6; }
+    if i == 19 { return 0x240ca1cc; }
+    if i == 20 { return 0x2de92c6f; }
+    if i == 21 { return 0x4a7484aa; }
+    if i == 22 { return 0x5cb0a9dc; }
+    if i == 23 { return 0x76f988da; }
+    if i == 24 { return 0x983e5152; }
+    if i == 25 { return 0xa831c66d; }
+    if i == 26 { return 0xb00327c8; }
+    if i == 27 { return 0xbf597fc7; }
+    if i == 28 { return 0xc6e00bf3; }
+    if i == 29 { return 0xd5a79147; }
+    if i == 30 { return 0x06ca6351; }
+    if i == 31 { return 0x14292967; }
+    if i == 32 { return 0x27b70a85; }
+    if i == 33 { return 0x2e1b2138; }
+    if i == 34 { return 0x4d2c6dfc; }
+    if i == 35 { return 0x53380d13; }
+    if i == 36 { return 0x650a7354; }
+    if i == 37 { return 0x766a0abb; }
+    if i == 38 { return 0x81c2c92e; }
+    if i == 39 { return 0x92722c85; }
+    if i == 40 { return 0xa2bfe8a1; }
+    if i == 41 { return 0xa81a664b; }
+    if i == 42 { return 0xc24b8b70; }
+    if i == 43 { return 0xc76c51a3; }
+    if i == 44 { return 0xd192e819; }
+    if i == 45 { return 0xd6990624; }
+    if i == 46 { return 0xf40e3585; }
+    if i == 47 { return 0x106aa070; }
+    if i == 48 { return 0x19a4c116; }
+    if i == 49 { return 0x1e376c08; }
+    if i == 50 { return 0x2748774c; }
+    if i == 51 { return 0x34b0bcb5; }
+    if i == 52 { return 0x391c0cb3; }
+    if i == 53 { return 0x4ed8aa4a; }
+    if i == 54 { return 0x5b9cca4f; }
+    if i == 55 { return 0x682e6ff3; }
+    if i == 56 { return 0x748f82ee; }
+    if i == 57 { return 0x78a5636f; }
+    if i == 58 { return 0x84c87814; }
+    if i == 59 { return 0x8cc70208; }
+    if i == 60 { return 0x90befffa; }
+    if i == 61 { return 0xa4506ceb; }
+    if i == 62 { return 0xbef9a3f7; }
+    if i == 63 { return 0xc67178f2; }
+    0
+}
+
+// Right rotate 32-bit value
+fn sha256_rotr(x: u64, n: i64) -> u64 {
+    let x32 = bit_and(x, 0xFFFFFFFF);
+    let shifted_right = x32 / shl_u64(1, n as u64);
+    let shifted_left = shl_u64(x32, (32 - n) as u64);
+    bit_and(bit_or(shifted_right, shifted_left), 0xFFFFFFFF)
+}
+
+// SHA-256 compression function Sigma0
+fn sha256_sigma0(x: u64) -> u64 {
+    let r2 = sha256_rotr(x, 2);
+    let r13 = sha256_rotr(x, 13);
+    let r22 = sha256_rotr(x, 22);
+    bit_and(bit_xor(bit_xor(r2, r13), r22), 0xFFFFFFFF)
+}
+
+// SHA-256 compression function Sigma1
+fn sha256_sigma1(x: u64) -> u64 {
+    let r6 = sha256_rotr(x, 6);
+    let r11 = sha256_rotr(x, 11);
+    let r25 = sha256_rotr(x, 25);
+    bit_and(bit_xor(bit_xor(r6, r11), r25), 0xFFFFFFFF)
+}
+
+// SHA-256 message schedule sigma0
+fn sha256_sig0(x: u64) -> u64 {
+    let r7 = sha256_rotr(x, 7);
+    let r18 = sha256_rotr(x, 18);
+    let s3 = bit_and(x, 0xFFFFFFFF) / 8;  // x >> 3
+    bit_and(bit_xor(bit_xor(r7, r18), s3), 0xFFFFFFFF)
+}
+
+// SHA-256 message schedule sigma1
+fn sha256_sig1(x: u64) -> u64 {
+    let r17 = sha256_rotr(x, 17);
+    let r19 = sha256_rotr(x, 19);
+    let s10 = bit_and(x, 0xFFFFFFFF) / 1024;  // x >> 10
+    bit_and(bit_xor(bit_xor(r17, r19), s10), 0xFFFFFFFF)
+}
+
+// SHA-256 Ch function
+fn sha256_ch(x: u64, y: u64, z: u64) -> u64 {
+    bit_and(bit_xor(bit_and(x, y), bit_and(bit_not(x), z)), 0xFFFFFFFF)
+}
+
+// SHA-256 Maj function
+fn sha256_maj(x: u64, y: u64, z: u64) -> u64 {
+    bit_and(bit_xor(bit_xor(bit_and(x, y), bit_and(x, z)), bit_and(y, z)), 0xFFFFFFFF)
+}
+
+// SHA-256 hash a single 64-byte block
+// state_addr: address of 32-byte hash state (8 x u32)
+// block_addr: address of 64-byte message block
+fn sha256_process_block(state_addr: i64, block_addr: i64) {
+    // Message schedule W[0..63]
+    let w_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE;  // Temp buffer
+
+    // Initialize W[0..15] from block (big-endian)
+    let mut i: i64 = 0;
+    while i < 16 {
+        let b0 = read_byte_addr(block_addr + i * 4) as u64;
+        let b1 = read_byte_addr(block_addr + i * 4 + 1) as u64;
+        let b2 = read_byte_addr(block_addr + i * 4 + 2) as u64;
+        let b3 = read_byte_addr(block_addr + i * 4 + 3) as u64;
+        let w = bit_or(bit_or(bit_or(shl_u64(b0, 24), shl_u64(b1, 16)), shl_u64(b2, 8)), b3);
+        write_u64_addr(w_addr + i * 8, w);
+        i = i + 1;
+    }
+
+    // Extend W[16..63]
+    while i < 64 {
+        let w2 = read_u64_addr(w_addr + (i - 2) * 8);
+        let w7 = read_u64_addr(w_addr + (i - 7) * 8);
+        let w15 = read_u64_addr(w_addr + (i - 15) * 8);
+        let w16 = read_u64_addr(w_addr + (i - 16) * 8);
+        let s1 = sha256_sig1(w2);
+        let s0 = sha256_sig0(w15);
+        let w = bit_and(s1 + w7 + s0 + w16, 0xFFFFFFFF);
+        write_u64_addr(w_addr + i * 8, w);
+        i = i + 1;
+    }
+
+    // Initialize working variables
+    let mut a = read_u64_addr(state_addr) as u64;
+    let mut b = read_u64_addr(state_addr + 8) as u64;
+    let mut c = read_u64_addr(state_addr + 16) as u64;
+    let mut d = read_u64_addr(state_addr + 24) as u64;
+    let mut e = read_u64_addr(state_addr + 32) as u64;
+    let mut f = read_u64_addr(state_addr + 40) as u64;
+    let mut g = read_u64_addr(state_addr + 48) as u64;
+    let mut h = read_u64_addr(state_addr + 56) as u64;
+
+    // 64 rounds
+    i = 0;
+    while i < 64 {
+        let wi = read_u64_addr(w_addr + i * 8);
+        let ki = sha256_k(i);
+        let s1 = sha256_sigma1(e);
+        let ch = sha256_ch(e, f, g);
+        let t1 = bit_and(h + s1 + ch + ki + wi, 0xFFFFFFFF);
+        let s0 = sha256_sigma0(a);
+        let maj = sha256_maj(a, b, c);
+        let t2 = bit_and(s0 + maj, 0xFFFFFFFF);
+
+        h = g;
+        g = f;
+        f = e;
+        e = bit_and(d + t1, 0xFFFFFFFF);
+        d = c;
+        c = b;
+        b = a;
+        a = bit_and(t1 + t2, 0xFFFFFFFF);
+
+        i = i + 1;
+    }
+
+    // Add to hash state
+    write_u64_addr(state_addr, bit_and(read_u64_addr(state_addr) as u64 + a, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 8, bit_and(read_u64_addr(state_addr + 8) as u64 + b, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 16, bit_and(read_u64_addr(state_addr + 16) as u64 + c, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 24, bit_and(read_u64_addr(state_addr + 24) as u64 + d, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 32, bit_and(read_u64_addr(state_addr + 32) as u64 + e, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 40, bit_and(read_u64_addr(state_addr + 40) as u64 + f, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 48, bit_and(read_u64_addr(state_addr + 48) as u64 + g, 0xFFFFFFFF));
+    write_u64_addr(state_addr + 56, bit_and(read_u64_addr(state_addr + 56) as u64 + h, 0xFFFFFFFF));
+}
+
+// SHA-256 hash complete message
+// data_addr: address of input data
+// data_len: length of input data
+// hash_addr: address to store 32-byte hash output
+fn sha256_hash(data_addr: i64, data_len: i64, hash_addr: i64) {
+    // Initialize state
+    let state_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 512;
+    write_u64_addr(state_addr, SHA256_H0);
+    write_u64_addr(state_addr + 8, SHA256_H1);
+    write_u64_addr(state_addr + 16, SHA256_H2);
+    write_u64_addr(state_addr + 24, SHA256_H3);
+    write_u64_addr(state_addr + 32, SHA256_H4);
+    write_u64_addr(state_addr + 40, SHA256_H5);
+    write_u64_addr(state_addr + 48, SHA256_H6);
+    write_u64_addr(state_addr + 56, SHA256_H7);
+
+    // Process complete 64-byte blocks
+    let block_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 1024;
+    let mut offset: i64 = 0;
+    while offset + 64 <= data_len {
+        // Copy block
+        let mut i: i64 = 0;
+        while i < 64 {
+            write_byte_addr(block_addr + i, read_byte_addr(data_addr + offset + i));
+            i = i + 1;
+        }
+        sha256_process_block(state_addr, block_addr);
+        offset = offset + 64;
+    }
+
+    // Final block with padding
+    let remaining = data_len - offset;
+    let mut i: i64 = 0;
+    while i < remaining {
+        write_byte_addr(block_addr + i, read_byte_addr(data_addr + offset + i));
+        i = i + 1;
+    }
+
+    // Add 0x80 padding byte
+    write_byte_addr(block_addr + remaining, 0x80);
+
+    // If not enough room for length, process this block and start new one
+    let mut start_pad: i64 = remaining + 1;
+    i = remaining + 1;
+    if remaining >= 56 {
+        while i < 64 {
+            write_byte_addr(block_addr + i, 0);
+            i = i + 1;
+        }
+        sha256_process_block(state_addr, block_addr);
+        start_pad = 0;
+    }
+
+    // Pad with zeros until 56 bytes
+    i = start_pad;
+    while i < 56 {
+        write_byte_addr(block_addr + i, 0);
+        i = i + 1;
+    }
+
+    // Append message length in bits (big-endian 64-bit)
+    let bit_len = (data_len * 8) as u64;
+    write_byte_addr(block_addr + 56, (bit_len / shl_u64(1, 56)) as i64);
+    write_byte_addr(block_addr + 57, (bit_and(bit_len, shl_u64(0xFF, 48)) / shl_u64(1, 48)) as i64);
+    write_byte_addr(block_addr + 58, (bit_and(bit_len, shl_u64(0xFF, 40)) / shl_u64(1, 40)) as i64);
+    write_byte_addr(block_addr + 59, (bit_and(bit_len, shl_u64(0xFF, 32)) / shl_u64(1, 32)) as i64);
+    write_byte_addr(block_addr + 60, (bit_and(bit_len, shl_u64(0xFF, 24)) / shl_u64(1, 24)) as i64);
+    write_byte_addr(block_addr + 61, (bit_and(bit_len, shl_u64(0xFF, 16)) / shl_u64(1, 16)) as i64);
+    write_byte_addr(block_addr + 62, (bit_and(bit_len, shl_u64(0xFF, 8)) / shl_u64(1, 8)) as i64);
+    write_byte_addr(block_addr + 63, bit_and(bit_len, 0xFF) as i64);
+
+    sha256_process_block(state_addr, block_addr);
+
+    // Output hash (big-endian)
+    i = 0;
+    while i < 8 {
+        let h = read_u64_addr(state_addr + i * 8) as u64;
+        write_byte_addr(hash_addr + i * 4, (bit_and(h, shl_u64(0xFF, 24)) / shl_u64(1, 24)) as i64);
+        write_byte_addr(hash_addr + i * 4 + 1, (bit_and(h, shl_u64(0xFF, 16)) / shl_u64(1, 16)) as i64);
+        write_byte_addr(hash_addr + i * 4 + 2, (bit_and(h, shl_u64(0xFF, 8)) / shl_u64(1, 8)) as i64);
+        write_byte_addr(hash_addr + i * 4 + 3, bit_and(h, 0xFF) as i64);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// HMAC-SHA256 Implementation
+// ============================================================
+
+// HMAC-SHA256: keyed hash
+// key_addr: address of key
+// key_len: length of key (max 64 bytes recommended)
+// data_addr: address of data
+// data_len: length of data
+// out_addr: address for 32-byte output
+fn hmac_sha256(key_addr: i64, key_len: i64, data_addr: i64, data_len: i64, out_addr: i64) {
+    let ipad_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 2048;
+    let opad_addr = ipad_addr + 64;
+    let temp_addr = opad_addr + 64;
+
+    // If key > 64 bytes, hash it first
+    let mut actual_key_addr = key_addr;
+    let mut actual_key_len = key_len;
+    if key_len > 64 {
+        actual_key_len = 32;
+        actual_key_addr = temp_addr;
+        sha256_hash(key_addr, key_len, temp_addr);
+    }
+
+    // Initialize ipad and opad
+    let mut i: i64 = 0;
+    while i < 64 {
+        if i < actual_key_len {
+            let k = read_byte_addr(actual_key_addr + i);
+            write_byte_addr(ipad_addr + i, bit_xor(k as u64, 0x36) as i64);
+            write_byte_addr(opad_addr + i, bit_xor(k as u64, 0x5C) as i64);
+        } else {
+            write_byte_addr(ipad_addr + i, 0x36);
+            write_byte_addr(opad_addr + i, 0x5C);
+        }
+        i = i + 1;
+    }
+
+    // Inner hash: H(ipad || message)
+    // Build ipad || message in temp buffer
+    let inner_addr = temp_addr + 64;
+    i = 0;
+    while i < 64 {
+        write_byte_addr(inner_addr + i, read_byte_addr(ipad_addr + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < data_len {
+        write_byte_addr(inner_addr + 64 + i, read_byte_addr(data_addr + i));
+        i = i + 1;
+    }
+    let inner_hash_addr = temp_addr + 2048;
+    sha256_hash(inner_addr, 64 + data_len, inner_hash_addr);
+
+    // Outer hash: H(opad || inner_hash)
+    let outer_addr = inner_addr;
+    i = 0;
+    while i < 64 {
+        write_byte_addr(outer_addr + i, read_byte_addr(opad_addr + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 32 {
+        write_byte_addr(outer_addr + 64 + i, read_byte_addr(inner_hash_addr + i));
+        i = i + 1;
+    }
+    sha256_hash(outer_addr, 96, out_addr);
+}
+
+// ============================================================
+// TLS PRF (Pseudo-Random Function)
+// ============================================================
+
+// PRF for TLS 1.2: P_SHA256
+// secret_addr: address of secret
+// secret_len: length of secret
+// label_addr: address of label string
+// label_len: length of label
+// seed_addr: address of seed
+// seed_len: length of seed
+// out_addr: address for output
+// out_len: desired output length
+fn tls_prf(secret_addr: i64, secret_len: i64, label_addr: i64, label_len: i64,
+           seed_addr: i64, seed_len: i64, out_addr: i64, out_len: i64) {
+    // Build label + seed
+    let ls_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 4096;
+    let mut i: i64 = 0;
+    while i < label_len {
+        write_byte_addr(ls_addr + i, read_byte_addr(label_addr + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < seed_len {
+        write_byte_addr(ls_addr + label_len + i, read_byte_addr(seed_addr + i));
+        i = i + 1;
+    }
+    let ls_len = label_len + seed_len;
+
+    // A(0) = seed (label + seed)
+    // A(i) = HMAC(secret, A(i-1))
+    let a_addr = ls_addr + 512;
+    i = 0;
+    while i < ls_len {
+        write_byte_addr(a_addr + i, read_byte_addr(ls_addr + i));
+        i = i + 1;
+    }
+    let mut a_len = ls_len;
+
+    // P(secret, seed) = HMAC(secret, A(1) + seed) + HMAC(secret, A(2) + seed) + ...
+    let p_addr = a_addr + 256;
+    let mut out_pos: i64 = 0;
+
+    while out_pos < out_len {
+        // A(i) = HMAC(secret, A(i-1))
+        let new_a_addr = p_addr + 256;
+        hmac_sha256(secret_addr, secret_len, a_addr, a_len, new_a_addr);
+
+        // Copy new A back
+        i = 0;
+        while i < 32 {
+            write_byte_addr(a_addr + i, read_byte_addr(new_a_addr + i));
+            i = i + 1;
+        }
+        a_len = 32;
+
+        // Build A(i) + seed for HMAC
+        let as_addr = new_a_addr + 64;
+        i = 0;
+        while i < 32 {
+            write_byte_addr(as_addr + i, read_byte_addr(a_addr + i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < ls_len {
+            write_byte_addr(as_addr + 32 + i, read_byte_addr(ls_addr + i));
+            i = i + 1;
+        }
+
+        // P_i = HMAC(secret, A(i) + seed)
+        let pi_addr = as_addr + 512;
+        hmac_sha256(secret_addr, secret_len, as_addr, 32 + ls_len, pi_addr);
+
+        // Copy to output
+        i = 0;
+        while i < 32 && out_pos < out_len {
+            write_byte_addr(out_addr + out_pos, read_byte_addr(pi_addr + i));
+            out_pos = out_pos + 1;
+            i = i + 1;
+        }
+    }
+}
+
+// ============================================================
+// TLS Connection Management
+// ============================================================
+
+// Find or allocate TLS connection for socket
+fn tls_get_conn(socket: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < TLS_MAX_CONNECTIONS {
+        let conn_addr = TLS_STATE_BASE + i * TLS_CONN_SIZE;
+        let conn_socket = read_u64_addr(conn_addr + TLS_OFF_SOCKET) as i64;
+        if conn_socket == socket {
+            return conn_addr;
+        }
+        i = i + 1;
+    }
+    return -1;  // Not found
+}
+
+// Allocate new TLS connection
+fn tls_alloc_conn(socket: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < TLS_MAX_CONNECTIONS {
+        let conn_addr = TLS_STATE_BASE + i * TLS_CONN_SIZE;
+        let conn_socket = read_u64_addr(conn_addr + TLS_OFF_SOCKET) as i64;
+        if conn_socket == 0 {
+            // Clear connection state
+            let mut j: i64 = 0;
+            while j < TLS_CONN_SIZE {
+                write_byte_addr(conn_addr + j, 0);
+                j = j + 1;
+            }
+            write_u64_addr(conn_addr + TLS_OFF_SOCKET, socket as u64);
+            return conn_addr;
+        }
+        i = i + 1;
+    }
+    return -1;  // No free slots
+}
+
+// Free TLS connection
+fn tls_free_conn(conn_addr: i64) {
+    write_u64_addr(conn_addr + TLS_OFF_SOCKET, 0);
+}
+
+// ============================================================
+// TLS Syscall Handlers (Stubs - Full implementation needed)
+// ============================================================
+
+// SYS_TLS_CONNECT - Perform TLS handshake on socket
+fn syscall_tls_connect(socket: i64, hostname_addr: i64, hostname_len: i64) -> i64 {
+    // Allocate connection
+    let conn = tls_alloc_conn(socket);
+    if conn < 0 {
+        return -1;  // No free connections
+    }
+
+    // Copy hostname
+    let mut i: i64 = 0;
+    while i < hostname_len && i < 127 {
+        write_byte_addr(conn + TLS_OFF_HOSTNAME + i, read_byte_addr(hostname_addr + i));
+        i = i + 1;
+    }
+    write_byte_addr(conn + TLS_OFF_HOSTNAME + i, 0);
+    write_u64_addr(conn + TLS_OFF_HOSTNAME_LEN, hostname_len as u64);
+
+    // Generate client random (32 bytes)
+    // TODO: Use proper RNG
+    let time = read_u64_addr(TICK_COUNT_ADDR);
+    i = 0;
+    while i < 32 {
+        let r = bit_xor(time, (i * 0x1234567) as u64);
+        write_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i, bit_and(r, 0xFF) as i64);
+        i = i + 1;
+    }
+
+    // Set handshake state
+    write_byte_addr(conn + TLS_OFF_STATE, TLS_STATE_HANDSHAKE);
+
+    // TODO: Build and send ClientHello
+    // TODO: Receive ServerHello, Certificate, ServerHelloDone
+    // TODO: Send ClientKeyExchange, ChangeCipherSpec, Finished
+    // TODO: Receive ChangeCipherSpec, Finished
+
+    // For now, return stub success
+    serial_out(84);  // T
+    serial_out(76);  // L
+    serial_out(83);  // S
+    serial_out(32);  // space
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_out(85);  // U
+    serial_out(66);  // B
+    serial_newline();
+
+    write_byte_addr(conn + TLS_OFF_STATE, TLS_STATE_CONNECTED);
+    0
+}
+
+// SYS_TLS_SEND - Send encrypted data
+fn syscall_tls_send(socket: i64, data_addr: i64, data_len: i64) -> i64 {
+    let conn = tls_get_conn(socket);
+    if conn < 0 {
+        return -1;  // No TLS connection
+    }
+
+    let state = read_byte_addr(conn + TLS_OFF_STATE);
+    if state != TLS_STATE_CONNECTED {
+        return -2;  // Not connected
+    }
+
+    // TODO: Encrypt data with AES-GCM and send TLS record
+    // For now, just send plaintext (INSECURE - stub only)
+    syscall_net_send(socket, data_addr, data_len)
+}
+
+// SYS_TLS_RECV - Receive and decrypt data
+fn syscall_tls_recv(socket: i64, data_addr: i64, max_len: i64) -> i64 {
+    let conn = tls_get_conn(socket);
+    if conn < 0 {
+        return -1;  // No TLS connection
+    }
+
+    let state = read_byte_addr(conn + TLS_OFF_STATE);
+    if state != TLS_STATE_CONNECTED {
+        return -2;  // Not connected
+    }
+
+    // TODO: Receive TLS record and decrypt with AES-GCM
+    // For now, just receive plaintext (INSECURE - stub only)
+    syscall_net_recv(socket, data_addr, max_len)
+}
+
+// SYS_TLS_CLOSE - Close TLS connection
+fn syscall_tls_close(socket: i64) -> i64 {
+    let conn = tls_get_conn(socket);
+    if conn < 0 {
+        return 0;  // Already closed
+    }
+
+    // TODO: Send close_notify alert
+
+    tls_free_conn(conn);
+    0
 }
 
 // ============================================================

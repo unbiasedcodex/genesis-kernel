@@ -1,0 +1,657 @@
+// Font Rasterizer
+// Converts glyph outlines to bitmaps using scanline fill
+
+use super::ttf::{TtfFont, Glyph, GlyphPoint, GlyphContour};
+
+// ============================================================
+// Rasterized Glyph Bitmap
+// ============================================================
+
+const MAX_GLYPH_SIZE: u32 = 256;
+
+#[repr(C)]
+pub struct GlyphBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub bearing_x: i32,      // Offset from cursor to left edge
+    pub bearing_y: i32,      // Offset from baseline to top edge
+    pub advance: i32,        // Horizontal advance after glyph
+    pub pixels: [u8; 65536], // Alpha values (256x256 max)
+}
+
+impl GlyphBitmap {
+    pub fn new() -> GlyphBitmap {
+        GlyphBitmap {
+            width: 0,
+            height: 0,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance: 0,
+            pixels: [0; 65536],
+        }
+    }
+
+    pub fn get_pixel(&self, x: u32, y: u32) -> u8 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        self.pixels[(y * self.width + x) as usize]
+    }
+
+    pub fn set_pixel(&mut self, x: u32, y: u32, value: u8) {
+        if x < self.width && y < self.height {
+            self.pixels[(y * self.width + x) as usize] = value;
+        }
+    }
+}
+
+// ============================================================
+// Edge Structure for Scanline Fill
+// ============================================================
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Edge {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    direction: i32,  // +1 going up, -1 going down
+}
+
+// ============================================================
+// Rasterization
+// ============================================================
+
+// Rasterize a glyph at given scale
+pub fn rasterize_glyph(font: &TtfFont, glyph: &Glyph, scale: f64, subpixel: bool) -> GlyphBitmap {
+    let mut bitmap = GlyphBitmap::new();
+
+    if glyph.num_contours == 0 {
+        // Empty glyph (like space)
+        bitmap.advance = ((glyph.advance_width as f64) * scale) as i32;
+        return bitmap;
+    }
+
+    // Calculate scaled bounds with padding
+    let padding = 2;
+    let x_min = ((glyph.x_min as f64) * scale).floor() as i32 - padding;
+    let y_min = ((glyph.y_min as f64) * scale).floor() as i32 - padding;
+    let x_max = ((glyph.x_max as f64) * scale).ceil() as i32 + padding;
+    let y_max = ((glyph.y_max as f64) * scale).ceil() as i32 + padding;
+
+    let width = (x_max - x_min) as u32;
+    let height = (y_max - y_min) as u32;
+
+    if width > MAX_GLYPH_SIZE || height > MAX_GLYPH_SIZE || width == 0 || height == 0 {
+        bitmap.advance = ((glyph.advance_width as f64) * scale) as i32;
+        return bitmap;
+    }
+
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.bearing_x = x_min;
+    bitmap.bearing_y = y_max;  // Top edge relative to baseline
+    bitmap.advance = ((glyph.advance_width as f64) * scale) as i32;
+
+    // Collect edges from all contours
+    let mut edges: [Edge; 2048] = [Edge { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, direction: 0 }; 2048];
+    let mut num_edges: usize = 0;
+
+    let mut contour_idx: u16 = 0;
+    while contour_idx < glyph.num_contours {
+        let contour = &glyph.contours[contour_idx as usize];
+        num_edges = collect_contour_edges(contour, scale, x_min as f64, y_min as f64, &mut edges, num_edges);
+        contour_idx = contour_idx + 1;
+    }
+
+    if num_edges == 0 {
+        return bitmap;
+    }
+
+    // Rasterize using scanline fill with anti-aliasing
+    if subpixel {
+        rasterize_subpixel(&mut bitmap, &edges, num_edges);
+    } else {
+        rasterize_coverage(&mut bitmap, &edges, num_edges);
+    }
+
+    bitmap
+}
+
+// Collect edges from a contour, handling bezier curves
+fn collect_contour_edges(
+    contour: &GlyphContour,
+    scale: f64,
+    offset_x: f64,
+    offset_y: f64,
+    edges: &mut [Edge; 2048],
+    mut num_edges: usize
+) -> usize {
+    let n = contour.num_points as usize;
+    if n < 2 {
+        return num_edges;
+    }
+
+    // Process points, flattening bezier curves
+    let mut i: usize = 0;
+    while i < n {
+        let p0 = contour.points[i];
+        let p1 = contour.points[(i + 1) % n];
+
+        let x0 = (p0.x as f64) * scale - offset_x;
+        let y0 = (p0.y as f64) * scale - offset_y;
+        let x1 = (p1.x as f64) * scale - offset_x;
+        let y1 = (p1.y as f64) * scale - offset_y;
+
+        if p0.on_curve && p1.on_curve {
+            // Line segment
+            if num_edges < 2048 {
+                add_edge(edges, &mut num_edges, x0, y0, x1, y1);
+            }
+            i = i + 1;
+        } else if p0.on_curve && !p1.on_curve {
+            // Quadratic bezier: p0 is on curve, p1 is control point
+            let p2_idx = (i + 2) % n;
+            let p2 = contour.points[p2_idx];
+
+            let (end_x, end_y) = if p2.on_curve {
+                ((p2.x as f64) * scale - offset_x, (p2.y as f64) * scale - offset_y)
+            } else {
+                // Implied on-curve point between two off-curve points
+                let mx = ((p1.x + p2.x) / 2) as f64 * scale - offset_x;
+                let my = ((p1.y + p2.y) / 2) as f64 * scale - offset_y;
+                (mx, my)
+            };
+
+            // Flatten bezier curve
+            flatten_quadratic_bezier(x0, y0, x1, y1, end_x, end_y, edges, &mut num_edges);
+
+            if p2.on_curve {
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+        } else if !p0.on_curve && p1.on_curve {
+            // This shouldn't happen in well-formed glyphs
+            i = i + 1;
+        } else {
+            // Two consecutive off-curve points - implied on-curve point
+            let mid_x = ((p0.x + p1.x) / 2) as f64 * scale - offset_x;
+            let mid_y = ((p0.y + p1.y) / 2) as f64 * scale - offset_y;
+
+            // We need the previous on-curve point
+            // For simplicity, just add edge to midpoint
+            if num_edges < 2048 {
+                add_edge(edges, &mut num_edges, x0, y0, mid_x, mid_y);
+            }
+            i = i + 1;
+        }
+    }
+
+    num_edges
+}
+
+// Add an edge with proper direction
+fn add_edge(edges: &mut [Edge; 2048], num_edges: &mut usize, x0: f64, y0: f64, x1: f64, y1: f64) {
+    // Skip horizontal edges
+    if (y0 - y1).abs() < 0.001 {
+        return;
+    }
+
+    let direction = if y0 < y1 { 1 } else { -1 };
+
+    // Ensure y0 <= y1 for consistent scanline processing
+    let (x0, y0, x1, y1) = if y0 > y1 {
+        (x1, y1, x0, y0)
+    } else {
+        (x0, y0, x1, y1)
+    };
+
+    edges[*num_edges] = Edge { x0, y0, x1, y1, direction };
+    *num_edges = *num_edges + 1;
+}
+
+// Flatten quadratic bezier curve into line segments
+fn flatten_quadratic_bezier(
+    x0: f64, y0: f64,
+    x1: f64, y1: f64,
+    x2: f64, y2: f64,
+    edges: &mut [Edge; 2048],
+    num_edges: &mut usize
+) {
+    // Adaptive subdivision based on flatness
+    let flatness_threshold = 0.25;
+
+    // Calculate flatness: distance from midpoint to control point
+    let mid_x = (x0 + x2) / 2.0;
+    let mid_y = (y0 + y2) / 2.0;
+    let dx = x1 - mid_x;
+    let dy = y1 - mid_y;
+    let flatness = dx * dx + dy * dy;
+
+    if flatness < flatness_threshold || *num_edges >= 2040 {
+        // Flat enough, output line segment
+        add_edge(edges, num_edges, x0, y0, x2, y2);
+    } else {
+        // Subdivide
+        let x01 = (x0 + x1) / 2.0;
+        let y01 = (y0 + y1) / 2.0;
+        let x12 = (x1 + x2) / 2.0;
+        let y12 = (y1 + y2) / 2.0;
+        let x012 = (x01 + x12) / 2.0;
+        let y012 = (y01 + y12) / 2.0;
+
+        flatten_quadratic_bezier(x0, y0, x01, y01, x012, y012, edges, num_edges);
+        flatten_quadratic_bezier(x012, y012, x12, y12, x2, y2, edges, num_edges);
+    }
+}
+
+// Rasterize using coverage-based anti-aliasing
+fn rasterize_coverage(bitmap: &mut GlyphBitmap, edges: &[Edge; 2048], num_edges: usize) {
+    let height = bitmap.height;
+    let width = bitmap.width;
+
+    // For each scanline
+    let mut y: u32 = 0;
+    while y < height {
+        let scan_y = y as f64 + 0.5;  // Sample at pixel center
+
+        // Collect x-intersections with active edges
+        let mut intersections: [f64; 256] = [0.0; 256];
+        let mut intersection_dirs: [i32; 256] = [0; 256];
+        let mut num_intersections: usize = 0;
+
+        let mut e: usize = 0;
+        while e < num_edges {
+            let edge = &edges[e];
+
+            // Check if edge is active at this scanline
+            if scan_y >= edge.y0 && scan_y < edge.y1 {
+                // Calculate x intersection
+                let t = (scan_y - edge.y0) / (edge.y1 - edge.y0);
+                let x = edge.x0 + t * (edge.x1 - edge.x0);
+
+                if num_intersections < 256 {
+                    intersections[num_intersections] = x;
+                    intersection_dirs[num_intersections] = edge.direction;
+                    num_intersections = num_intersections + 1;
+                }
+            }
+
+            e = e + 1;
+        }
+
+        // Sort intersections by x
+        sort_intersections(&mut intersections, &mut intersection_dirs, num_intersections);
+
+        // Fill pixels using non-zero winding rule
+        let mut winding: i32 = 0;
+        let mut i: usize = 0;
+
+        while i < num_intersections {
+            let x0 = intersections[i];
+            winding = winding + intersection_dirs[i];
+
+            if winding != 0 && i + 1 < num_intersections {
+                let x1 = intersections[i + 1];
+
+                // Fill pixels from x0 to x1
+                let start_x = x0.floor() as i32;
+                let end_x = x1.ceil() as i32;
+
+                let mut px = start_x;
+                while px < end_x {
+                    if px >= 0 && px < width as i32 {
+                        let pixel_start = px as f64;
+                        let pixel_end = (px + 1) as f64;
+
+                        // Calculate coverage
+                        let coverage_start = if x0 > pixel_start { x0 } else { pixel_start };
+                        let coverage_end = if x1 < pixel_end { x1 } else { pixel_end };
+
+                        if coverage_end > coverage_start {
+                            let coverage = (coverage_end - coverage_start) * 255.0;
+                            let old_value = bitmap.get_pixel(px as u32, y);
+                            let new_value = ((old_value as f64 + coverage).min(255.0)) as u8;
+                            bitmap.set_pixel(px as u32, y, new_value);
+                        }
+                    }
+                    px = px + 1;
+                }
+            }
+
+            i = i + 1;
+        }
+
+        y = y + 1;
+    }
+}
+
+// Rasterize with subpixel rendering (4x supersampling)
+fn rasterize_subpixel(bitmap: &mut GlyphBitmap, edges: &[Edge; 2048], num_edges: usize) {
+    let height = bitmap.height;
+    let width = bitmap.width;
+    let samples = 4;  // 4x vertical supersampling
+
+    // For each output pixel row
+    let mut y: u32 = 0;
+    while y < height {
+        // Sample multiple sub-scanlines
+        let mut sub: u32 = 0;
+        while sub < samples {
+            let scan_y = y as f64 + (sub as f64 + 0.5) / (samples as f64);
+
+            // Collect x-intersections
+            let mut intersections: [f64; 256] = [0.0; 256];
+            let mut intersection_dirs: [i32; 256] = [0; 256];
+            let mut num_intersections: usize = 0;
+
+            let mut e: usize = 0;
+            while e < num_edges {
+                let edge = &edges[e];
+
+                if scan_y >= edge.y0 && scan_y < edge.y1 {
+                    let t = (scan_y - edge.y0) / (edge.y1 - edge.y0);
+                    let x = edge.x0 + t * (edge.x1 - edge.x0);
+
+                    if num_intersections < 256 {
+                        intersections[num_intersections] = x;
+                        intersection_dirs[num_intersections] = edge.direction;
+                        num_intersections = num_intersections + 1;
+                    }
+                }
+
+                e = e + 1;
+            }
+
+            sort_intersections(&mut intersections, &mut intersection_dirs, num_intersections);
+
+            // Fill using non-zero winding
+            let mut winding: i32 = 0;
+            let mut i: usize = 0;
+
+            while i < num_intersections {
+                winding = winding + intersection_dirs[i];
+
+                if winding != 0 && i + 1 < num_intersections {
+                    let x0 = intersections[i];
+                    let x1 = intersections[i + 1];
+
+                    let start_x = x0.floor() as i32;
+                    let end_x = x1.ceil() as i32;
+
+                    let mut px = start_x;
+                    while px < end_x {
+                        if px >= 0 && px < width as i32 {
+                            let pixel_start = px as f64;
+                            let pixel_end = (px + 1) as f64;
+
+                            let coverage_start = if x0 > pixel_start { x0 } else { pixel_start };
+                            let coverage_end = if x1 < pixel_end { x1 } else { pixel_end };
+
+                            if coverage_end > coverage_start {
+                                // Add contribution from this subsample
+                                let coverage = (coverage_end - coverage_start) * 255.0 / (samples as f64);
+                                let old_value = bitmap.get_pixel(px as u32, y);
+                                let new_value = ((old_value as f64 + coverage).min(255.0)) as u8;
+                                bitmap.set_pixel(px as u32, y, new_value);
+                            }
+                        }
+                        px = px + 1;
+                    }
+                }
+
+                i = i + 1;
+            }
+
+            sub = sub + 1;
+        }
+
+        y = y + 1;
+    }
+}
+
+// Sort intersections by x coordinate (simple insertion sort)
+fn sort_intersections(intersections: &mut [f64; 256], dirs: &mut [i32; 256], n: usize) {
+    let mut i: usize = 1;
+    while i < n {
+        let key = intersections[i];
+        let key_dir = dirs[i];
+        let mut j = i;
+
+        while j > 0 && intersections[j - 1] > key {
+            intersections[j] = intersections[j - 1];
+            dirs[j] = dirs[j - 1];
+            j = j - 1;
+        }
+
+        intersections[j] = key;
+        dirs[j] = key_dir;
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Glyph Cache
+// ============================================================
+
+const CACHE_SIZE: usize = 256;
+
+#[repr(C)]
+struct CacheEntry {
+    font_id: u32,
+    glyph_index: u16,
+    size: u16,
+    bitmap: GlyphBitmap,
+    used: bool,
+    last_access: u64,
+}
+
+static mut GLYPH_CACHE: [CacheEntry; 256] = [CacheEntry {
+    font_id: 0,
+    glyph_index: 0,
+    size: 0,
+    bitmap: GlyphBitmap {
+        width: 0,
+        height: 0,
+        bearing_x: 0,
+        bearing_y: 0,
+        advance: 0,
+        pixels: [0; 65536],
+    },
+    used: false,
+    last_access: 0,
+}; 256];
+
+static mut CACHE_ACCESS_COUNTER: u64 = 0;
+
+// Get or create cached glyph
+pub fn get_cached_glyph(font: &TtfFont, font_id: u32, glyph_index: u16, size: u16) -> &'static GlyphBitmap {
+    unsafe {
+        CACHE_ACCESS_COUNTER = CACHE_ACCESS_COUNTER + 1;
+
+        // Look for existing entry
+        let mut i: usize = 0;
+        while i < CACHE_SIZE {
+            let entry = &mut GLYPH_CACHE[i];
+            if entry.used && entry.font_id == font_id &&
+               entry.glyph_index == glyph_index && entry.size == size {
+                entry.last_access = CACHE_ACCESS_COUNTER;
+                return &entry.bitmap;
+            }
+            i = i + 1;
+        }
+
+        // Find slot for new entry (LRU eviction)
+        let mut best_slot: usize = 0;
+        let mut oldest_access: u64 = CACHE_ACCESS_COUNTER;
+
+        i = 0;
+        while i < CACHE_SIZE {
+            if !GLYPH_CACHE[i].used {
+                best_slot = i;
+                break;
+            }
+            if GLYPH_CACHE[i].last_access < oldest_access {
+                oldest_access = GLYPH_CACHE[i].last_access;
+                best_slot = i;
+            }
+            i = i + 1;
+        }
+
+        // Rasterize glyph
+        let scale = (size as f64) / (font.units_per_em as f64);
+        let glyph = super::ttf::load_glyph(font, glyph_index);
+        let bitmap = rasterize_glyph(font, &glyph, scale, true);
+
+        // Store in cache
+        let entry = &mut GLYPH_CACHE[best_slot];
+        entry.font_id = font_id;
+        entry.glyph_index = glyph_index;
+        entry.size = size;
+        entry.bitmap = bitmap;
+        entry.used = true;
+        entry.last_access = CACHE_ACCESS_COUNTER;
+
+        &entry.bitmap
+    }
+}
+
+// Clear glyph cache
+pub fn clear_cache() {
+    unsafe {
+        let mut i: usize = 0;
+        while i < CACHE_SIZE {
+            GLYPH_CACHE[i].used = false;
+            i = i + 1;
+        }
+    }
+}
+
+// ============================================================
+// Text Rendering
+// ============================================================
+
+// Render text to a buffer
+// Returns width of rendered text
+pub fn render_text(
+    font: &TtfFont,
+    font_id: u32,
+    text: &[u8],
+    size: u16,
+    buffer: u64,
+    buffer_width: u32,
+    buffer_height: u32,
+    x: i32,
+    y: i32,
+    color: u32
+) -> i32 {
+    let scale = (size as f64) / (font.units_per_em as f64);
+    let (ascender, _, _) = super::ttf::get_font_metrics_scaled(font, scale);
+
+    let mut cursor_x = x;
+    let baseline = y + ascender as i32;
+
+    let mut i: usize = 0;
+    while i < text.len() {
+        let ch = text[i];
+        if ch == 0 {
+            break;
+        }
+
+        let glyph_index = super::ttf::get_glyph_index(font, ch as u32);
+        let bitmap = get_cached_glyph(font, font_id, glyph_index, size);
+
+        // Draw glyph
+        let glyph_x = cursor_x + bitmap.bearing_x;
+        let glyph_y = baseline - bitmap.bearing_y;
+
+        draw_glyph_bitmap(bitmap, buffer, buffer_width, buffer_height, glyph_x, glyph_y, color);
+
+        cursor_x = cursor_x + bitmap.advance;
+        i = i + 1;
+    }
+
+    cursor_x - x
+}
+
+// Draw a glyph bitmap to a buffer with color
+fn draw_glyph_bitmap(
+    bitmap: &GlyphBitmap,
+    buffer: u64,
+    buffer_width: u32,
+    buffer_height: u32,
+    x: i32,
+    y: i32,
+    color: u32
+) {
+    let r = ((color >> 16) & 0xFF) as u32;
+    let g = ((color >> 8) & 0xFF) as u32;
+    let b = (color & 0xFF) as u32;
+
+    let mut by: u32 = 0;
+    while by < bitmap.height {
+        let dst_y = y + by as i32;
+        if dst_y < 0 || dst_y >= buffer_height as i32 {
+            by = by + 1;
+            continue;
+        }
+
+        let mut bx: u32 = 0;
+        while bx < bitmap.width {
+            let dst_x = x + bx as i32;
+            if dst_x < 0 || dst_x >= buffer_width as i32 {
+                bx = bx + 1;
+                continue;
+            }
+
+            let alpha = bitmap.get_pixel(bx, by) as u32;
+            if alpha > 0 {
+                unsafe {
+                    let dst_offset = (dst_y as u64) * (buffer_width as u64) * 4 + (dst_x as u64) * 4;
+                    let dst_ptr = (buffer + dst_offset) as *mut u32;
+                    let dst = volatile_read_u32(dst_ptr as *u32);
+
+                    let dst_r = ((dst >> 16) & 0xFF) as u32;
+                    let dst_g = ((dst >> 8) & 0xFF) as u32;
+                    let dst_b = (dst & 0xFF) as u32;
+
+                    let inv_alpha = 255 - alpha;
+                    let out_r = (r * alpha + dst_r * inv_alpha) / 255;
+                    let out_g = (g * alpha + dst_g * inv_alpha) / 255;
+                    let out_b = (b * alpha + dst_b * inv_alpha) / 255;
+
+                    let result = 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+                    volatile_write_u32(dst_ptr, result);
+                }
+            }
+
+            bx = bx + 1;
+        }
+
+        by = by + 1;
+    }
+}
+
+// Measure text width without rendering
+pub fn measure_text(font: &TtfFont, text: &[u8], size: u16) -> i32 {
+    let scale = (size as f64) / (font.units_per_em as f64);
+    let mut width: f64 = 0.0;
+
+    let mut i: usize = 0;
+    while i < text.len() {
+        let ch = text[i];
+        if ch == 0 {
+            break;
+        }
+
+        let glyph_index = super::ttf::get_glyph_index(font, ch as u32);
+        let glyph = super::ttf::load_glyph(font, glyph_index);
+        width = width + (glyph.advance_width as f64) * scale;
+
+        i = i + 1;
+    }
+
+    width as i32
+}

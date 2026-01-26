@@ -1,0 +1,619 @@
+// TrueType Font Parser
+// Parses TTF file format and extracts glyph outlines
+
+// ============================================================
+// TTF Table Tags
+// ============================================================
+
+const TAG_CMAP: u32 = 0x636D6170;  // 'cmap'
+const TAG_GLYF: u32 = 0x676C7966;  // 'glyf'
+const TAG_HEAD: u32 = 0x68656164;  // 'head'
+const TAG_HHEA: u32 = 0x68686561;  // 'hhea'
+const TAG_HMTX: u32 = 0x686D7478;  // 'hmtx'
+const TAG_LOCA: u32 = 0x6C6F6361;  // 'loca'
+const TAG_MAXP: u32 = 0x6D617870;  // 'maxp'
+const TAG_NAME: u32 = 0x6E616D65;  // 'name'
+const TAG_POST: u32 = 0x706F7374;  // 'post'
+const TAG_OS2:  u32 = 0x4F532F32;  // 'OS/2'
+
+// ============================================================
+// Font Data Structures
+// ============================================================
+
+#[repr(C)]
+pub struct TtfFont {
+    data: u64,              // Pointer to font data
+    data_len: u64,          // Length of font data
+
+    // Table offsets
+    cmap_offset: u32,
+    glyf_offset: u32,
+    head_offset: u32,
+    hhea_offset: u32,
+    hmtx_offset: u32,
+    loca_offset: u32,
+    maxp_offset: u32,
+
+    // Font metrics
+    pub units_per_em: u16,
+    pub ascender: i16,
+    pub descender: i16,
+    pub line_gap: i16,
+    pub num_glyphs: u16,
+    loca_format: i16,       // 0 = short, 1 = long
+
+    // Character map
+    cmap_format: u16,
+    cmap_subtable_offset: u32,
+
+    pub valid: bool,
+}
+
+impl TtfFont {
+    pub fn new() -> TtfFont {
+        TtfFont {
+            data: 0,
+            data_len: 0,
+            cmap_offset: 0,
+            glyf_offset: 0,
+            head_offset: 0,
+            hhea_offset: 0,
+            hmtx_offset: 0,
+            loca_offset: 0,
+            maxp_offset: 0,
+            units_per_em: 0,
+            ascender: 0,
+            descender: 0,
+            line_gap: 0,
+            num_glyphs: 0,
+            loca_format: 0,
+            cmap_format: 0,
+            cmap_subtable_offset: 0,
+            valid: false,
+        }
+    }
+}
+
+// Glyph outline point
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GlyphPoint {
+    pub x: i16,
+    pub y: i16,
+    pub on_curve: bool,     // true = on curve, false = off curve (control point)
+}
+
+// Glyph contour (sequence of points)
+#[repr(C)]
+pub struct GlyphContour {
+    pub points: [GlyphPoint; 256],
+    pub num_points: u16,
+}
+
+// Complete glyph data
+#[repr(C)]
+pub struct Glyph {
+    pub x_min: i16,
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
+    pub advance_width: u16,
+    pub left_side_bearing: i16,
+    pub contours: [GlyphContour; 16],
+    pub num_contours: u16,
+    pub is_composite: bool,
+}
+
+impl Glyph {
+    pub fn new() -> Glyph {
+        Glyph {
+            x_min: 0,
+            y_min: 0,
+            x_max: 0,
+            y_max: 0,
+            advance_width: 0,
+            left_side_bearing: 0,
+            contours: [GlyphContour { points: [GlyphPoint { x: 0, y: 0, on_curve: false }; 256], num_points: 0 }; 16],
+            num_contours: 0,
+            is_composite: false,
+        }
+    }
+}
+
+// ============================================================
+// Font Parsing
+// ============================================================
+
+// Load and parse a TTF font from memory
+pub fn load_font(data: u64, len: u64) -> TtfFont {
+    let mut font = TtfFont::new();
+    font.data = data;
+    font.data_len = len;
+
+    if len < 12 {
+        return font;
+    }
+
+    // Read offset table
+    let sfnt_version = read_u32(data, 0);
+
+    // Check for valid TrueType font
+    if sfnt_version != 0x00010000 && sfnt_version != 0x74727565 {  // 1.0 or 'true'
+        return font;
+    }
+
+    let num_tables = read_u16(data, 4);
+
+    // Parse table directory
+    let mut i: u16 = 0;
+    while i < num_tables {
+        let offset = 12 + (i as u32) * 16;
+        let tag = read_u32(data, offset);
+        let table_offset = read_u32(data, offset + 8);
+
+        match tag {
+            TAG_CMAP => font.cmap_offset = table_offset,
+            TAG_GLYF => font.glyf_offset = table_offset,
+            TAG_HEAD => font.head_offset = table_offset,
+            TAG_HHEA => font.hhea_offset = table_offset,
+            TAG_HMTX => font.hmtx_offset = table_offset,
+            TAG_LOCA => font.loca_offset = table_offset,
+            TAG_MAXP => font.maxp_offset = table_offset,
+            _ => {}
+        }
+
+        i = i + 1;
+    }
+
+    // Parse required tables
+    if font.head_offset == 0 || font.maxp_offset == 0 || font.cmap_offset == 0 ||
+       font.loca_offset == 0 || font.glyf_offset == 0 || font.hhea_offset == 0 {
+        return font;
+    }
+
+    // Parse head table
+    font.units_per_em = read_u16(data, font.head_offset + 18);
+    font.loca_format = read_i16(data, font.head_offset + 50);
+
+    // Parse maxp table
+    font.num_glyphs = read_u16(data, font.maxp_offset + 4);
+
+    // Parse hhea table
+    font.ascender = read_i16(data, font.hhea_offset + 4);
+    font.descender = read_i16(data, font.hhea_offset + 6);
+    font.line_gap = read_i16(data, font.hhea_offset + 8);
+
+    // Parse cmap table - find best subtable
+    if !parse_cmap(&mut font) {
+        return font;
+    }
+
+    font.valid = true;
+    font
+}
+
+// Parse cmap table to find character mapping
+fn parse_cmap(font: &mut TtfFont) -> bool {
+    let data = font.data;
+    let cmap = font.cmap_offset;
+
+    let num_tables = read_u16(data, cmap + 2);
+
+    // Find best encoding: prefer Unicode BMP (3,1) or Unicode full (0,3/0,4)
+    let mut best_offset: u32 = 0;
+    let mut best_format: u16 = 0;
+
+    let mut i: u16 = 0;
+    while i < num_tables {
+        let record_offset = cmap + 4 + (i as u32) * 8;
+        let platform_id = read_u16(data, record_offset);
+        let encoding_id = read_u16(data, record_offset + 2);
+        let subtable_offset = cmap + read_u32(data, record_offset + 4);
+        let format = read_u16(data, subtable_offset);
+
+        // Prefer format 4 (Unicode BMP) or format 12 (Unicode full)
+        if (platform_id == 0 || platform_id == 3) && (format == 4 || format == 12) {
+            if format == 12 || (format == 4 && best_format != 12) {
+                best_offset = subtable_offset;
+                best_format = format;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    if best_offset == 0 {
+        return false;
+    }
+
+    font.cmap_subtable_offset = best_offset;
+    font.cmap_format = best_format;
+    true
+}
+
+// ============================================================
+// Character to Glyph Mapping
+// ============================================================
+
+// Get glyph index for a Unicode codepoint
+pub fn get_glyph_index(font: &TtfFont, codepoint: u32) -> u16 {
+    if !font.valid {
+        return 0;
+    }
+
+    let data = font.data;
+    let subtable = font.cmap_subtable_offset;
+
+    match font.cmap_format {
+        4 => get_glyph_index_format4(data, subtable, codepoint as u16),
+        12 => get_glyph_index_format12(data, subtable, codepoint),
+        _ => 0
+    }
+}
+
+// Format 4: Segment mapping to delta values (BMP only)
+fn get_glyph_index_format4(data: u64, subtable: u32, codepoint: u16) -> u16 {
+    let seg_count = read_u16(data, subtable + 6) / 2;
+
+    // Binary search through segments
+    let end_code_offset = subtable + 14;
+    let start_code_offset = end_code_offset + (seg_count as u32) * 2 + 2;
+    let id_delta_offset = start_code_offset + (seg_count as u32) * 2;
+    let id_range_offset_base = id_delta_offset + (seg_count as u32) * 2;
+
+    let mut low: u16 = 0;
+    let mut high = seg_count - 1;
+
+    while low <= high {
+        let mid = (low + high) / 2;
+        let end_code = read_u16(data, end_code_offset + (mid as u32) * 2);
+
+        if end_code < codepoint {
+            low = mid + 1;
+        } else {
+            let start_code = read_u16(data, start_code_offset + (mid as u32) * 2);
+            if start_code > codepoint {
+                if mid == 0 {
+                    break;
+                }
+                high = mid - 1;
+            } else {
+                // Found segment
+                let id_delta = read_i16(data, id_delta_offset + (mid as u32) * 2);
+                let id_range_offset = read_u16(data, id_range_offset_base + (mid as u32) * 2);
+
+                if id_range_offset == 0 {
+                    return ((codepoint as i32 + id_delta as i32) & 0xFFFF) as u16;
+                } else {
+                    let glyph_addr = id_range_offset_base + (mid as u32) * 2
+                        + id_range_offset as u32
+                        + (codepoint - start_code) as u32 * 2;
+                    let glyph = read_u16(data, glyph_addr);
+                    if glyph != 0 {
+                        return ((glyph as i32 + id_delta as i32) & 0xFFFF) as u16;
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
+    0  // Not found
+}
+
+// Format 12: Segmented coverage (full Unicode)
+fn get_glyph_index_format12(data: u64, subtable: u32, codepoint: u32) -> u16 {
+    let num_groups = read_u32(data, subtable + 12);
+
+    // Binary search through groups
+    let mut low: u32 = 0;
+    let mut high = num_groups - 1;
+
+    while low <= high {
+        let mid = (low + high) / 2;
+        let group_offset = subtable + 16 + mid * 12;
+
+        let start_code = read_u32(data, group_offset);
+        let end_code = read_u32(data, group_offset + 4);
+
+        if codepoint < start_code {
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
+        } else if codepoint > end_code {
+            low = mid + 1;
+        } else {
+            let start_glyph = read_u32(data, group_offset + 8);
+            return (start_glyph + codepoint - start_code) as u16;
+        }
+    }
+
+    0  // Not found
+}
+
+// ============================================================
+// Glyph Loading
+// ============================================================
+
+// Get glyph offset in glyf table
+fn get_glyph_offset(font: &TtfFont, glyph_index: u16) -> u32 {
+    if glyph_index >= font.num_glyphs {
+        return 0;
+    }
+
+    let data = font.data;
+    let loca = font.loca_offset;
+
+    if font.loca_format == 0 {
+        // Short format: offsets are u16, multiplied by 2
+        (read_u16(data, loca + (glyph_index as u32) * 2) as u32) * 2
+    } else {
+        // Long format: offsets are u32
+        read_u32(data, loca + (glyph_index as u32) * 4)
+    }
+}
+
+// Get glyph horizontal metrics
+fn get_glyph_hmetrics(font: &TtfFont, glyph_index: u16) -> (u16, i16) {
+    let data = font.data;
+    let hmtx = font.hmtx_offset;
+
+    // Get number of hMetrics from hhea table
+    let num_hmetrics = read_u16(data, font.hhea_offset + 34);
+
+    if glyph_index < num_hmetrics {
+        let offset = hmtx + (glyph_index as u32) * 4;
+        let advance = read_u16(data, offset);
+        let lsb = read_i16(data, offset + 2);
+        (advance, lsb)
+    } else {
+        // Use last advance width, but get individual lsb
+        let advance = read_u16(data, hmtx + (num_hmetrics as u32 - 1) * 4);
+        let lsb_index = glyph_index - num_hmetrics;
+        let lsb = read_i16(data, hmtx + (num_hmetrics as u32) * 4 + (lsb_index as u32) * 2);
+        (advance, lsb)
+    }
+}
+
+// Load a glyph by index
+pub fn load_glyph(font: &TtfFont, glyph_index: u16) -> Glyph {
+    let mut glyph = Glyph::new();
+
+    if !font.valid || glyph_index >= font.num_glyphs {
+        return glyph;
+    }
+
+    // Get horizontal metrics
+    let (advance, lsb) = get_glyph_hmetrics(font, glyph_index);
+    glyph.advance_width = advance;
+    glyph.left_side_bearing = lsb;
+
+    // Get glyph data offset
+    let offset = get_glyph_offset(font, glyph_index);
+    let next_offset = get_glyph_offset(font, glyph_index + 1);
+
+    // Check for empty glyph (like space)
+    if offset == next_offset {
+        return glyph;
+    }
+
+    let data = font.data;
+    let glyph_data = font.glyf_offset + offset;
+
+    // Read glyph header
+    let num_contours = read_i16(data, glyph_data);
+    glyph.x_min = read_i16(data, glyph_data + 2);
+    glyph.y_min = read_i16(data, glyph_data + 4);
+    glyph.x_max = read_i16(data, glyph_data + 6);
+    glyph.y_max = read_i16(data, glyph_data + 8);
+
+    if num_contours < 0 {
+        // Composite glyph - not implemented yet
+        glyph.is_composite = true;
+        return glyph;
+    }
+
+    glyph.num_contours = num_contours as u16;
+
+    // Read simple glyph
+    parse_simple_glyph(font, &mut glyph, glyph_data + 10, num_contours as u16);
+
+    glyph
+}
+
+// Parse simple glyph data
+fn parse_simple_glyph(font: &TtfFont, glyph: &mut Glyph, offset: u32, num_contours: u16) {
+    if num_contours == 0 || num_contours > 16 {
+        return;
+    }
+
+    let data = font.data;
+
+    // Read end points of each contour
+    let mut end_points: [u16; 16] = [0; 16];
+    let mut max_point: u16 = 0;
+
+    let mut i: u16 = 0;
+    while i < num_contours {
+        end_points[i as usize] = read_u16(data, offset + (i as u32) * 2);
+        if end_points[i as usize] > max_point {
+            max_point = end_points[i as usize];
+        }
+        i = i + 1;
+    }
+
+    let num_points = max_point + 1;
+    if num_points > 256 {
+        return;  // Too many points
+    }
+
+    // Skip instructions
+    let instructions_offset = offset + (num_contours as u32) * 2;
+    let instructions_len = read_u16(data, instructions_offset);
+    let flags_offset = instructions_offset + 2 + instructions_len as u32;
+
+    // Read flags
+    let mut flags: [u8; 256] = [0; 256];
+    let mut flag_offset = flags_offset;
+    let mut point_idx: u16 = 0;
+
+    while point_idx < num_points {
+        let flag = read_u8(data, flag_offset);
+        flags[point_idx as usize] = flag;
+        flag_offset = flag_offset + 1;
+
+        // Check for repeat flag
+        if (flag & 0x08) != 0 {
+            let repeat_count = read_u8(data, flag_offset);
+            flag_offset = flag_offset + 1;
+
+            let mut r: u8 = 0;
+            while r < repeat_count && point_idx + 1 < num_points {
+                point_idx = point_idx + 1;
+                flags[point_idx as usize] = flag;
+                r = r + 1;
+            }
+        }
+
+        point_idx = point_idx + 1;
+    }
+
+    // Read X coordinates
+    let mut x_coords: [i16; 256] = [0; 256];
+    let mut x_offset = flag_offset;
+    let mut x: i16 = 0;
+
+    point_idx = 0;
+    while point_idx < num_points {
+        let flag = flags[point_idx as usize];
+        if (flag & 0x02) != 0 {
+            // 1 byte
+            let dx = read_u8(data, x_offset) as i16;
+            x_offset = x_offset + 1;
+            if (flag & 0x10) != 0 {
+                x = x + dx;
+            } else {
+                x = x - dx;
+            }
+        } else if (flag & 0x10) == 0 {
+            // 2 bytes
+            x = x + read_i16(data, x_offset);
+            x_offset = x_offset + 2;
+        }
+        // else: same as previous (x unchanged)
+        x_coords[point_idx as usize] = x;
+        point_idx = point_idx + 1;
+    }
+
+    // Read Y coordinates
+    let mut y_coords: [i16; 256] = [0; 256];
+    let mut y_offset = x_offset;
+    let mut y: i16 = 0;
+
+    point_idx = 0;
+    while point_idx < num_points {
+        let flag = flags[point_idx as usize];
+        if (flag & 0x04) != 0 {
+            // 1 byte
+            let dy = read_u8(data, y_offset) as i16;
+            y_offset = y_offset + 1;
+            if (flag & 0x20) != 0 {
+                y = y + dy;
+            } else {
+                y = y - dy;
+            }
+        } else if (flag & 0x20) == 0 {
+            // 2 bytes
+            y = y + read_i16(data, y_offset);
+            y_offset = y_offset + 2;
+        }
+        y_coords[point_idx as usize] = y;
+        point_idx = point_idx + 1;
+    }
+
+    // Build contours
+    let mut start_point: u16 = 0;
+    let mut contour_idx: u16 = 0;
+
+    while contour_idx < num_contours {
+        let end_point = end_points[contour_idx as usize];
+        let contour = &mut glyph.contours[contour_idx as usize];
+
+        let mut p = start_point;
+        let mut contour_point_idx: u16 = 0;
+
+        while p <= end_point && contour_point_idx < 256 {
+            contour.points[contour_point_idx as usize] = GlyphPoint {
+                x: x_coords[p as usize],
+                y: y_coords[p as usize],
+                on_curve: (flags[p as usize] & 0x01) != 0,
+            };
+            contour_point_idx = contour_point_idx + 1;
+            p = p + 1;
+        }
+
+        contour.num_points = contour_point_idx;
+        start_point = end_point + 1;
+        contour_idx = contour_idx + 1;
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn read_u8(data: u64, offset: u32) -> u8 {
+    unsafe {
+        let ptr = (data + offset as u64) as *u8;
+        volatile_read_u8(ptr)
+    }
+}
+
+fn read_u16(data: u64, offset: u32) -> u16 {
+    // Big-endian
+    let b0 = read_u8(data, offset) as u16;
+    let b1 = read_u8(data, offset + 1) as u16;
+    (b0 << 8) | b1
+}
+
+fn read_i16(data: u64, offset: u32) -> i16 {
+    read_u16(data, offset) as i16
+}
+
+fn read_u32(data: u64, offset: u32) -> u32 {
+    // Big-endian
+    let b0 = read_u8(data, offset) as u32;
+    let b1 = read_u8(data, offset + 1) as u32;
+    let b2 = read_u8(data, offset + 2) as u32;
+    let b3 = read_u8(data, offset + 3) as u32;
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+// ============================================================
+// Font Scale Calculation
+// ============================================================
+
+// Calculate scale factor for desired pixel size
+pub fn get_scale_for_pixel_height(font: &TtfFont, pixel_height: f64) -> f64 {
+    if font.units_per_em == 0 {
+        return 1.0;
+    }
+    pixel_height / (font.units_per_em as f64)
+}
+
+// Calculate scale factor for em size
+pub fn get_scale_for_em(font: &TtfFont, em_size: f64) -> f64 {
+    if font.units_per_em == 0 {
+        return 1.0;
+    }
+    em_size / (font.units_per_em as f64)
+}
+
+// Get scaled font metrics
+pub fn get_font_metrics_scaled(font: &TtfFont, scale: f64) -> (f64, f64, f64) {
+    let ascender = (font.ascender as f64) * scale;
+    let descender = (font.descender as f64) * scale;
+    let line_gap = (font.line_gap as f64) * scale;
+    (ascender, descender, line_gap)
+}

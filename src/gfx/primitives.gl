@@ -1,0 +1,915 @@
+// 2D Graphics Primitives
+// Provides line, circle, rectangle, and alpha blending operations
+
+// ============================================================
+// Buffer Context
+// ============================================================
+
+// Graphics context for drawing operations
+#[repr(C)]
+pub struct GfxContext {
+    pub buffer: u64,       // Pixel buffer address
+    pub width: u32,        // Buffer width in pixels
+    pub height: u32,       // Buffer height in pixels
+    pub pitch: u32,        // Bytes per row (usually width * 4 for 32-bit)
+    pub clip_x: i32,       // Clip region left
+    pub clip_y: i32,       // Clip region top
+    pub clip_w: u32,       // Clip region width
+    pub clip_h: u32,       // Clip region height
+}
+
+impl GfxContext {
+    pub fn new(buffer: u64, width: u32, height: u32) -> GfxContext {
+        GfxContext {
+            buffer: buffer,
+            width: width,
+            height: height,
+            pitch: width * 4,
+            clip_x: 0,
+            clip_y: 0,
+            clip_w: width,
+            clip_h: height,
+        }
+    }
+
+    pub fn with_pitch(buffer: u64, width: u32, height: u32, pitch: u32) -> GfxContext {
+        GfxContext {
+            buffer: buffer,
+            width: width,
+            height: height,
+            pitch: pitch,
+            clip_x: 0,
+            clip_y: 0,
+            clip_w: width,
+            clip_h: height,
+        }
+    }
+
+    pub fn set_clip(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        self.clip_x = x;
+        self.clip_y = y;
+        self.clip_w = w;
+        self.clip_h = h;
+    }
+
+    pub fn reset_clip(&mut self) {
+        self.clip_x = 0;
+        self.clip_y = 0;
+        self.clip_w = self.width;
+        self.clip_h = self.height;
+    }
+
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        x >= self.clip_x && x < self.clip_x + self.clip_w as i32
+            && y >= self.clip_y && y < self.clip_y + self.clip_h as i32
+    }
+
+    fn in_bounds(&self, x: i32, y: i32) -> bool {
+        x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32
+    }
+}
+
+// ============================================================
+// Pixel Operations
+// ============================================================
+
+// Set pixel (no blending)
+pub fn set_pixel(ctx: &GfxContext, x: i32, y: i32, color: u32) {
+    if !ctx.in_bounds(x, y) || !ctx.in_clip(x, y) {
+        return;
+    }
+    unsafe {
+        let addr = (ctx.buffer + (y as u64) * (ctx.pitch as u64) + (x as u64) * 4) as *mut u32;
+        volatile_write_u32(addr, color);
+    }
+}
+
+// Get pixel
+pub fn get_pixel(ctx: &GfxContext, x: i32, y: i32) -> u32 {
+    if !ctx.in_bounds(x, y) {
+        return 0;
+    }
+    unsafe {
+        let addr = (ctx.buffer + (y as u64) * (ctx.pitch as u64) + (x as u64) * 4) as *u32;
+        volatile_read_u32(addr)
+    }
+}
+
+// Blend pixel with alpha (src over dst)
+// Color format: 0xAARRGGBB
+pub fn blend_pixel(ctx: &GfxContext, x: i32, y: i32, color: u32) {
+    if !ctx.in_bounds(x, y) || !ctx.in_clip(x, y) {
+        return;
+    }
+
+    let alpha = (color >> 24) & 0xFF;
+    if alpha == 0 {
+        return;  // Fully transparent
+    }
+    if alpha == 255 {
+        set_pixel(ctx, x, y, color);  // Fully opaque
+        return;
+    }
+
+    let dst = get_pixel(ctx, x, y);
+
+    let src_r = ((color >> 16) & 0xFF) as u32;
+    let src_g = ((color >> 8) & 0xFF) as u32;
+    let src_b = (color & 0xFF) as u32;
+
+    let dst_r = ((dst >> 16) & 0xFF) as u32;
+    let dst_g = ((dst >> 8) & 0xFF) as u32;
+    let dst_b = (dst & 0xFF) as u32;
+
+    let inv_alpha = 255 - alpha;
+
+    let out_r = (src_r * alpha + dst_r * inv_alpha) / 255;
+    let out_g = (src_g * alpha + dst_g * inv_alpha) / 255;
+    let out_b = (src_b * alpha + dst_b * inv_alpha) / 255;
+
+    let result = 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+    set_pixel(ctx, x, y, result);
+}
+
+// ============================================================
+// Line Drawing (Bresenham's Algorithm)
+// ============================================================
+
+pub fn draw_line(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    let dx = abs_i32(x1 - x0);
+    let dy = abs_i32(y1 - y0);
+    let sx: i32 = if x0 < x1 { 1 } else { -1 };
+    let sy: i32 = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx - dy;
+
+    let mut x = x0;
+    let mut y = y0;
+
+    loop {
+        set_pixel(ctx, x, y, color);
+
+        if x == x1 && y == y1 {
+            break;
+        }
+
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err = err - dy;
+            x = x + sx;
+        }
+        if e2 < dx {
+            err = err + dx;
+            y = y + sy;
+        }
+    }
+}
+
+// Draw line with anti-aliasing (Wu's algorithm)
+pub fn draw_line_aa(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    let steep = abs_i32(y1 - y0) > abs_i32(x1 - x0);
+
+    let (x0, y0, x1, y1) = if steep {
+        (y0, x0, y1, x1)
+    } else {
+        (x0, y0, x1, y1)
+    };
+
+    let (x0, y0, x1, y1) = if x0 > x1 {
+        (x1, y1, x0, y0)
+    } else {
+        (x0, y0, x1, y1)
+    };
+
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let gradient = if dx == 0 { 1.0 } else { (dy as f64) / (dx as f64) };
+
+    // Handle first endpoint
+    let xend = x0;
+    let yend = y0 as f64;
+    let xpxl1 = xend;
+    let ypxl1 = yend as i32;
+
+    if steep {
+        plot_aa(ctx, ypxl1, xpxl1, color, 255);
+    } else {
+        plot_aa(ctx, xpxl1, ypxl1, color, 255);
+    }
+
+    let mut intery = yend + gradient;
+
+    // Handle second endpoint
+    let xend = x1;
+    let yend = y1 as f64;
+    let xpxl2 = xend;
+    let ypxl2 = yend as i32;
+
+    if steep {
+        plot_aa(ctx, ypxl2, xpxl2, color, 255);
+    } else {
+        plot_aa(ctx, xpxl2, ypxl2, color, 255);
+    }
+
+    // Main loop
+    let mut x = xpxl1 + 1;
+    while x < xpxl2 {
+        let y = intery as i32;
+        let frac = intery - (intery as i32) as f64;
+        let alpha1 = ((1.0 - frac) * 255.0) as u32;
+        let alpha2 = (frac * 255.0) as u32;
+
+        if steep {
+            plot_aa(ctx, y, x, color, alpha1);
+            plot_aa(ctx, y + 1, x, color, alpha2);
+        } else {
+            plot_aa(ctx, x, y, color, alpha1);
+            plot_aa(ctx, x, y + 1, color, alpha2);
+        }
+
+        intery = intery + gradient;
+        x = x + 1;
+    }
+}
+
+fn plot_aa(ctx: &GfxContext, x: i32, y: i32, color: u32, alpha: u32) {
+    let a = (alpha & 0xFF) << 24;
+    let c = (color & 0x00FFFFFF) | a;
+    blend_pixel(ctx, x, y, c);
+}
+
+// ============================================================
+// Circle Drawing (Midpoint Algorithm)
+// ============================================================
+
+pub fn draw_circle(ctx: &GfxContext, cx: i32, cy: i32, r: i32, color: u32) {
+    if r <= 0 {
+        return;
+    }
+
+    let mut x = r;
+    let mut y: i32 = 0;
+    let mut err = 1 - r;
+
+    while x >= y {
+        // Draw 8 octants
+        set_pixel(ctx, cx + x, cy + y, color);
+        set_pixel(ctx, cx - x, cy + y, color);
+        set_pixel(ctx, cx + x, cy - y, color);
+        set_pixel(ctx, cx - x, cy - y, color);
+        set_pixel(ctx, cx + y, cy + x, color);
+        set_pixel(ctx, cx - y, cy + x, color);
+        set_pixel(ctx, cx + y, cy - x, color);
+        set_pixel(ctx, cx - y, cy - x, color);
+
+        y = y + 1;
+        if err < 0 {
+            err = err + 2 * y + 1;
+        } else {
+            x = x - 1;
+            err = err + 2 * (y - x) + 1;
+        }
+    }
+}
+
+pub fn fill_circle(ctx: &GfxContext, cx: i32, cy: i32, r: i32, color: u32) {
+    if r <= 0 {
+        return;
+    }
+
+    let mut x = r;
+    let mut y: i32 = 0;
+    let mut err = 1 - r;
+
+    while x >= y {
+        // Draw horizontal lines for filled circle
+        draw_hline(ctx, cx - x, cx + x, cy + y, color);
+        draw_hline(ctx, cx - x, cx + x, cy - y, color);
+        draw_hline(ctx, cx - y, cx + y, cy + x, color);
+        draw_hline(ctx, cx - y, cx + y, cy - x, color);
+
+        y = y + 1;
+        if err < 0 {
+            err = err + 2 * y + 1;
+        } else {
+            x = x - 1;
+            err = err + 2 * (y - x) + 1;
+        }
+    }
+}
+
+// ============================================================
+// Rectangle Drawing
+// ============================================================
+
+pub fn draw_rect(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, color: u32) {
+    let x2 = x + w as i32 - 1;
+    let y2 = y + h as i32 - 1;
+
+    draw_hline(ctx, x, x2, y, color);
+    draw_hline(ctx, x, x2, y2, color);
+    draw_vline(ctx, x, y, y2, color);
+    draw_vline(ctx, x2, y, y2, color);
+}
+
+pub fn fill_rect(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, color: u32) {
+    let mut py = y;
+    let end_y = y + h as i32;
+    while py < end_y {
+        draw_hline(ctx, x, x + w as i32 - 1, py, color);
+        py = py + 1;
+    }
+}
+
+pub fn fill_rect_blend(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, color: u32) {
+    let mut py = y;
+    let end_y = y + h as i32;
+    while py < end_y {
+        let mut px = x;
+        let end_x = x + w as i32;
+        while px < end_x {
+            blend_pixel(ctx, px, py, color);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+// Rounded rectangle
+pub fn draw_rounded_rect(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, r: i32, color: u32) {
+    if r <= 0 {
+        draw_rect(ctx, x, y, w, h, color);
+        return;
+    }
+
+    let r = if r > (w as i32 / 2) { w as i32 / 2 } else { r };
+    let r = if r > (h as i32 / 2) { h as i32 / 2 } else { r };
+
+    let x2 = x + w as i32 - 1;
+    let y2 = y + h as i32 - 1;
+
+    // Draw straight edges
+    draw_hline(ctx, x + r, x2 - r, y, color);
+    draw_hline(ctx, x + r, x2 - r, y2, color);
+    draw_vline(ctx, x, y + r, y2 - r, color);
+    draw_vline(ctx, x2, y + r, y2 - r, color);
+
+    // Draw corner arcs
+    draw_corner_arc(ctx, x + r, y + r, r, 2, color);      // Top-left
+    draw_corner_arc(ctx, x2 - r, y + r, r, 1, color);     // Top-right
+    draw_corner_arc(ctx, x + r, y2 - r, r, 3, color);     // Bottom-left
+    draw_corner_arc(ctx, x2 - r, y2 - r, r, 0, color);    // Bottom-right
+}
+
+pub fn fill_rounded_rect(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, r: i32, color: u32) {
+    if r <= 0 {
+        fill_rect(ctx, x, y, w, h, color);
+        return;
+    }
+
+    let r = if r > (w as i32 / 2) { w as i32 / 2 } else { r };
+    let r = if r > (h as i32 / 2) { h as i32 / 2 } else { r };
+
+    // Fill main rectangle (excluding corners)
+    fill_rect(ctx, x + r, y, (w as i32 - 2 * r) as u32, h, color);
+    fill_rect(ctx, x, y + r, w, (h as i32 - 2 * r) as u32, color);
+
+    // Fill corner circles
+    let x2 = x + w as i32 - 1;
+    let y2 = y + h as i32 - 1;
+    fill_corner(ctx, x + r, y + r, r, 2, color);      // Top-left
+    fill_corner(ctx, x2 - r, y + r, r, 1, color);     // Top-right
+    fill_corner(ctx, x + r, y2 - r, r, 3, color);     // Bottom-left
+    fill_corner(ctx, x2 - r, y2 - r, r, 0, color);    // Bottom-right
+}
+
+// ============================================================
+// Ellipse Drawing
+// ============================================================
+
+pub fn draw_ellipse(ctx: &GfxContext, cx: i32, cy: i32, rx: i32, ry: i32, color: u32) {
+    if rx <= 0 || ry <= 0 {
+        return;
+    }
+
+    let rx2 = rx * rx;
+    let ry2 = ry * ry;
+    let two_rx2 = 2 * rx2;
+    let two_ry2 = 2 * ry2;
+
+    let mut x = rx;
+    let mut y: i32 = 0;
+    let mut px = two_ry2 * x;
+    let mut py: i32 = 0;
+
+    // Region 1
+    let mut p = ry2 - rx2 * ry + rx2 / 4;
+    while px >= py {
+        set_pixel(ctx, cx + x, cy + y, color);
+        set_pixel(ctx, cx - x, cy + y, color);
+        set_pixel(ctx, cx + x, cy - y, color);
+        set_pixel(ctx, cx - x, cy - y, color);
+
+        y = y + 1;
+        py = py + two_rx2;
+        if p < 0 {
+            p = p + ry2 + py;
+        } else {
+            x = x - 1;
+            px = px - two_ry2;
+            p = p + ry2 + py - px;
+        }
+    }
+
+    // Region 2
+    p = ry2 * (x * x + x) + rx2 * (y - ry) * (y - ry) - rx2 * ry2 + ry2 / 4;
+    while x >= 0 {
+        set_pixel(ctx, cx + x, cy + y, color);
+        set_pixel(ctx, cx - x, cy + y, color);
+        set_pixel(ctx, cx + x, cy - y, color);
+        set_pixel(ctx, cx - x, cy - y, color);
+
+        x = x - 1;
+        px = px - two_ry2;
+        if p > 0 {
+            p = p + rx2 - px;
+        } else {
+            y = y + 1;
+            py = py + two_rx2;
+            p = p + rx2 - px + py;
+        }
+    }
+}
+
+pub fn fill_ellipse(ctx: &GfxContext, cx: i32, cy: i32, rx: i32, ry: i32, color: u32) {
+    if rx <= 0 || ry <= 0 {
+        return;
+    }
+
+    let rx2 = rx * rx;
+    let ry2 = ry * ry;
+
+    let mut x = rx;
+    let mut y: i32 = 0;
+    let mut px = 2 * ry2 * x;
+    let mut py: i32 = 0;
+
+    // Region 1
+    let mut p = ry2 - rx2 * ry + rx2 / 4;
+    while px >= py {
+        draw_hline(ctx, cx - x, cx + x, cy + y, color);
+        draw_hline(ctx, cx - x, cx + x, cy - y, color);
+
+        y = y + 1;
+        py = py + 2 * rx2;
+        if p < 0 {
+            p = p + ry2 + py;
+        } else {
+            x = x - 1;
+            px = px - 2 * ry2;
+            p = p + ry2 + py - px;
+        }
+    }
+
+    // Region 2
+    p = ry2 * (x * x + x) + rx2 * (y - ry) * (y - ry) - rx2 * ry2 + ry2 / 4;
+    while x >= 0 {
+        draw_hline(ctx, cx - x, cx + x, cy + y, color);
+        draw_hline(ctx, cx - x, cx + x, cy - y, color);
+
+        x = x - 1;
+        px = px - 2 * ry2;
+        if p > 0 {
+            p = p + rx2 - px;
+        } else {
+            y = y + 1;
+            py = py + 2 * rx2;
+            p = p + rx2 - px + py;
+        }
+    }
+}
+
+// ============================================================
+// Triangle Drawing
+// ============================================================
+
+pub fn draw_triangle(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    draw_line(ctx, x0, y0, x1, y1, color);
+    draw_line(ctx, x1, y1, x2, y2, color);
+    draw_line(ctx, x2, y2, x0, y0, color);
+}
+
+pub fn fill_triangle(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    // Sort vertices by y coordinate
+    let (x0, y0, x1, y1, x2, y2) = if y0 > y1 {
+        (x1, y1, x0, y0, x2, y2)
+    } else {
+        (x0, y0, x1, y1, x2, y2)
+    };
+    let (x0, y0, x1, y1, x2, y2) = if y0 > y2 {
+        (x2, y2, x1, y1, x0, y0)
+    } else {
+        (x0, y0, x1, y1, x2, y2)
+    };
+    let (x0, y0, x1, y1, x2, y2) = if y1 > y2 {
+        (x0, y0, x2, y2, x1, y1)
+    } else {
+        (x0, y0, x1, y1, x2, y2)
+    };
+
+    let total_height = y2 - y0;
+    if total_height == 0 {
+        return;
+    }
+
+    // Fill bottom flat triangle and top flat triangle
+    let mut y = y0;
+    while y <= y2 {
+        let second_half = y > y1 || y1 == y0;
+        let segment_height = if second_half { y2 - y1 } else { y1 - y0 };
+        if segment_height == 0 {
+            y = y + 1;
+            continue;
+        }
+
+        let alpha = (y - y0) as f64 / total_height as f64;
+        let beta = if second_half {
+            (y - y1) as f64 / segment_height as f64
+        } else {
+            (y - y0) as f64 / segment_height as f64
+        };
+
+        let ax = x0 + ((x2 - x0) as f64 * alpha) as i32;
+        let bx = if second_half {
+            x1 + ((x2 - x1) as f64 * beta) as i32
+        } else {
+            x0 + ((x1 - x0) as f64 * beta) as i32
+        };
+
+        let (start_x, end_x) = if ax < bx { (ax, bx) } else { (bx, ax) };
+        draw_hline(ctx, start_x, end_x, y, color);
+
+        y = y + 1;
+    }
+}
+
+// ============================================================
+// Bezier Curves
+// ============================================================
+
+// Quadratic bezier curve
+pub fn draw_bezier_quad(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    let steps = 32;
+    let mut prev_x = x0;
+    let mut prev_y = y0;
+
+    let mut i = 1;
+    while i <= steps {
+        let t = (i as f64) / (steps as f64);
+        let t2 = t * t;
+        let mt = 1.0 - t;
+        let mt2 = mt * mt;
+
+        let x = (mt2 * (x0 as f64) + 2.0 * mt * t * (x1 as f64) + t2 * (x2 as f64)) as i32;
+        let y = (mt2 * (y0 as f64) + 2.0 * mt * t * (y1 as f64) + t2 * (y2 as f64)) as i32;
+
+        draw_line(ctx, prev_x, prev_y, x, y, color);
+        prev_x = x;
+        prev_y = y;
+
+        i = i + 1;
+    }
+}
+
+// Cubic bezier curve
+pub fn draw_bezier_cubic(ctx: &GfxContext, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, color: u32) {
+    let steps = 48;
+    let mut prev_x = x0;
+    let mut prev_y = y0;
+
+    let mut i = 1;
+    while i <= steps {
+        let t = (i as f64) / (steps as f64);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let mt = 1.0 - t;
+        let mt2 = mt * mt;
+        let mt3 = mt2 * mt;
+
+        let x = (mt3 * (x0 as f64) + 3.0 * mt2 * t * (x1 as f64) + 3.0 * mt * t2 * (x2 as f64) + t3 * (x3 as f64)) as i32;
+        let y = (mt3 * (y0 as f64) + 3.0 * mt2 * t * (y1 as f64) + 3.0 * mt * t2 * (y2 as f64) + t3 * (y3 as f64)) as i32;
+
+        draw_line(ctx, prev_x, prev_y, x, y, color);
+        prev_x = x;
+        prev_y = y;
+
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Polygon Drawing
+// ============================================================
+
+pub fn draw_polygon(ctx: &GfxContext, points: &[(i32, i32)], color: u32) {
+    if points.len() < 2 {
+        return;
+    }
+
+    let mut i: usize = 0;
+    while i < points.len() - 1 {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[i + 1];
+        draw_line(ctx, x0, y0, x1, y1, color);
+        i = i + 1;
+    }
+
+    // Close polygon
+    let (x0, y0) = points[points.len() - 1];
+    let (x1, y1) = points[0];
+    draw_line(ctx, x0, y0, x1, y1, color);
+}
+
+// ============================================================
+// Gradient Fills
+// ============================================================
+
+pub fn fill_rect_gradient_h(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, color1: u32, color2: u32) {
+    let r1 = ((color1 >> 16) & 0xFF) as i32;
+    let g1 = ((color1 >> 8) & 0xFF) as i32;
+    let b1 = (color1 & 0xFF) as i32;
+
+    let r2 = ((color2 >> 16) & 0xFF) as i32;
+    let g2 = ((color2 >> 8) & 0xFF) as i32;
+    let b2 = (color2 & 0xFF) as i32;
+
+    let mut px = 0;
+    while px < w as i32 {
+        let t = (px * 255) / (w as i32 - 1);
+        let r = r1 + ((r2 - r1) * t) / 255;
+        let g = g1 + ((g2 - g1) * t) / 255;
+        let b = b1 + ((b2 - b1) * t) / 255;
+        let color = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+
+        draw_vline(ctx, x + px, y, y + h as i32 - 1, color);
+        px = px + 1;
+    }
+}
+
+pub fn fill_rect_gradient_v(ctx: &GfxContext, x: i32, y: i32, w: u32, h: u32, color1: u32, color2: u32) {
+    let r1 = ((color1 >> 16) & 0xFF) as i32;
+    let g1 = ((color1 >> 8) & 0xFF) as i32;
+    let b1 = (color1 & 0xFF) as i32;
+
+    let r2 = ((color2 >> 16) & 0xFF) as i32;
+    let g2 = ((color2 >> 8) & 0xFF) as i32;
+    let b2 = (color2 & 0xFF) as i32;
+
+    let mut py = 0;
+    while py < h as i32 {
+        let t = (py * 255) / (h as i32 - 1);
+        let r = r1 + ((r2 - r1) * t) / 255;
+        let g = g1 + ((g2 - g1) * t) / 255;
+        let b = b1 + ((b2 - b1) * t) / 255;
+        let color = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+
+        draw_hline(ctx, x, x + w as i32 - 1, y + py, color);
+        py = py + 1;
+    }
+}
+
+// ============================================================
+// Bitmap Blitting
+// ============================================================
+
+// Blit source buffer to context (no alpha)
+pub fn blit(ctx: &GfxContext, x: i32, y: i32, src: u64, src_w: u32, src_h: u32) {
+    let mut sy: i32 = 0;
+    while sy < src_h as i32 {
+        let dy = y + sy;
+        if dy < 0 || dy >= ctx.height as i32 {
+            sy = sy + 1;
+            continue;
+        }
+
+        let mut sx: i32 = 0;
+        while sx < src_w as i32 {
+            let dx = x + sx;
+            if dx >= 0 && dx < ctx.width as i32 {
+                unsafe {
+                    let src_addr = (src + (sy as u64) * (src_w as u64) * 4 + (sx as u64) * 4) as *u32;
+                    let pixel = volatile_read_u32(src_addr);
+                    set_pixel(ctx, dx, dy, pixel);
+                }
+            }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+}
+
+// Blit with alpha blending
+pub fn blit_blend(ctx: &GfxContext, x: i32, y: i32, src: u64, src_w: u32, src_h: u32) {
+    let mut sy: i32 = 0;
+    while sy < src_h as i32 {
+        let dy = y + sy;
+        if dy < 0 || dy >= ctx.height as i32 {
+            sy = sy + 1;
+            continue;
+        }
+
+        let mut sx: i32 = 0;
+        while sx < src_w as i32 {
+            let dx = x + sx;
+            if dx >= 0 && dx < ctx.width as i32 {
+                unsafe {
+                    let src_addr = (src + (sy as u64) * (src_w as u64) * 4 + (sx as u64) * 4) as *u32;
+                    let pixel = volatile_read_u32(src_addr);
+                    blend_pixel(ctx, dx, dy, pixel);
+                }
+            }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn abs_i32(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+
+fn draw_hline(ctx: &GfxContext, x0: i32, x1: i32, y: i32, color: u32) {
+    if y < 0 || y >= ctx.height as i32 {
+        return;
+    }
+
+    let start = if x0 < x1 { x0 } else { x1 };
+    let end = if x0 < x1 { x1 } else { x0 };
+
+    let mut x = start;
+    while x <= end {
+        set_pixel(ctx, x, y, color);
+        x = x + 1;
+    }
+}
+
+fn draw_vline(ctx: &GfxContext, x: i32, y0: i32, y1: i32, color: u32) {
+    if x < 0 || x >= ctx.width as i32 {
+        return;
+    }
+
+    let start = if y0 < y1 { y0 } else { y1 };
+    let end = if y0 < y1 { y1 } else { y0 };
+
+    let mut y = start;
+    while y <= end {
+        set_pixel(ctx, x, y, color);
+        y = y + 1;
+    }
+}
+
+// Draw corner arc for rounded rectangle (quadrant: 0=BR, 1=TR, 2=TL, 3=BL)
+fn draw_corner_arc(ctx: &GfxContext, cx: i32, cy: i32, r: i32, quadrant: i32, color: u32) {
+    let mut x = r;
+    let mut y: i32 = 0;
+    let mut err = 1 - r;
+
+    while x >= y {
+        match quadrant {
+            0 => {  // Bottom-right
+                set_pixel(ctx, cx + x, cy + y, color);
+                set_pixel(ctx, cx + y, cy + x, color);
+            },
+            1 => {  // Top-right
+                set_pixel(ctx, cx + x, cy - y, color);
+                set_pixel(ctx, cx + y, cy - x, color);
+            },
+            2 => {  // Top-left
+                set_pixel(ctx, cx - x, cy - y, color);
+                set_pixel(ctx, cx - y, cy - x, color);
+            },
+            3 => {  // Bottom-left
+                set_pixel(ctx, cx - x, cy + y, color);
+                set_pixel(ctx, cx - y, cy + x, color);
+            },
+            _ => {}
+        }
+
+        y = y + 1;
+        if err < 0 {
+            err = err + 2 * y + 1;
+        } else {
+            x = x - 1;
+            err = err + 2 * (y - x) + 1;
+        }
+    }
+}
+
+// Fill corner quadrant
+fn fill_corner(ctx: &GfxContext, cx: i32, cy: i32, r: i32, quadrant: i32, color: u32) {
+    let mut x = r;
+    let mut y: i32 = 0;
+    let mut err = 1 - r;
+
+    while x >= y {
+        match quadrant {
+            0 => {  // Bottom-right
+                draw_hline(ctx, cx, cx + x, cy + y, color);
+                draw_hline(ctx, cx, cx + y, cy + x, color);
+            },
+            1 => {  // Top-right
+                draw_hline(ctx, cx, cx + x, cy - y, color);
+                draw_hline(ctx, cx, cx + y, cy - x, color);
+            },
+            2 => {  // Top-left
+                draw_hline(ctx, cx - x, cx, cy - y, color);
+                draw_hline(ctx, cx - y, cx, cy - x, color);
+            },
+            3 => {  // Bottom-left
+                draw_hline(ctx, cx - x, cx, cy + y, color);
+                draw_hline(ctx, cx - y, cx, cy + x, color);
+            },
+            _ => {}
+        }
+
+        y = y + 1;
+        if err < 0 {
+            err = err + 2 * y + 1;
+        } else {
+            x = x - 1;
+            err = err + 2 * (y - x) + 1;
+        }
+    }
+}
+
+// ============================================================
+// Color Utilities
+// ============================================================
+
+// Create color from RGB components
+pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+// Create color from RGBA components
+pub fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+// Extract components from color
+pub fn get_alpha(color: u32) -> u8 {
+    ((color >> 24) & 0xFF) as u8
+}
+
+pub fn get_red(color: u32) -> u8 {
+    ((color >> 16) & 0xFF) as u8
+}
+
+pub fn get_green(color: u32) -> u8 {
+    ((color >> 8) & 0xFF) as u8
+}
+
+pub fn get_blue(color: u32) -> u8 {
+    (color & 0xFF) as u8
+}
+
+// Lighten color
+pub fn lighten(color: u32, amount: u8) -> u32 {
+    let a = get_alpha(color);
+    let r = (get_red(color) as u32 + amount as u32).min(255) as u8;
+    let g = (get_green(color) as u32 + amount as u32).min(255) as u8;
+    let b = (get_blue(color) as u32 + amount as u32).min(255) as u8;
+    rgba(r, g, b, a)
+}
+
+// Darken color
+pub fn darken(color: u32, amount: u8) -> u32 {
+    let a = get_alpha(color);
+    let r = (get_red(color) as i32 - amount as i32).max(0) as u8;
+    let g = (get_green(color) as i32 - amount as i32).max(0) as u8;
+    let b = (get_blue(color) as i32 - amount as i32).max(0) as u8;
+    rgba(r, g, b, a)
+}
+
+// Blend two colors
+pub fn blend_colors(c1: u32, c2: u32, t: u8) -> u32 {
+    let r1 = get_red(c1) as u32;
+    let g1 = get_green(c1) as u32;
+    let b1 = get_blue(c1) as u32;
+
+    let r2 = get_red(c2) as u32;
+    let g2 = get_green(c2) as u32;
+    let b2 = get_blue(c2) as u32;
+
+    let t32 = t as u32;
+    let inv_t = 255 - t32;
+
+    let r = (r1 * inv_t + r2 * t32) / 255;
+    let g = (g1 * inv_t + g2 * t32) / 255;
+    let b = (b1 * inv_t + b2 * t32) / 255;
+
+    rgb(r as u8, g as u8, b as u8)
+}

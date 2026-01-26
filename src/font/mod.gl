@@ -1,0 +1,14 @@
+// Font Module
+// TrueType font parsing and rendering
+
+pub mod ttf;
+pub mod rasterizer;
+
+// Re-export commonly used items
+pub use ttf::{TtfFont, Glyph, GlyphPoint, GlyphContour};
+pub use ttf::{load_font, get_glyph_index, load_glyph};
+pub use ttf::{get_scale_for_pixel_height, get_scale_for_em, get_font_metrics_scaled};
+
+pub use rasterizer::{GlyphBitmap, rasterize_glyph};
+pub use rasterizer::{get_cached_glyph, clear_cache};
+pub use rasterizer::{render_text, measure_text};

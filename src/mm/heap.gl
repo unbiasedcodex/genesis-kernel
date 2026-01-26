@@ -7,7 +7,7 @@
 
 const PAGE_SIZE: u64 = 4096;
 const HEAP_INITIAL_PAGES: u64 = 16;   // 64KB initial heap
-const HEAP_MAX_PAGES: u64 = 256;      // 1MB max heap
+const HEAP_MAX_PAGES: u64 = 16384;    // 64MB max heap
 const MIN_ALLOC_SIZE: u64 = 32;       // Minimum allocation size
 const ALIGNMENT: u64 = 16;            // Allocation alignment
 
@@ -42,6 +42,11 @@ static mut HEAP_BUMP: u64 = 0;         // Current bump pointer
 static mut FREE_LIST: u64 = 0;         // Head of free list
 static mut TOTAL_ALLOCATED: u64 = 0;   // Total bytes allocated
 static mut ALLOC_COUNT: u64 = 0;       // Number of allocations
+static mut HEAP_PAGES: u64 = 0;        // Current number of heap pages
+
+// Function pointers for dynamic heap expansion
+static mut PAGE_ALLOC_FN: u64 = 0;     // fn() -> u64 stored as u64
+static mut MAP_PAGE_FN: u64 = 0;       // fn(u64, u64, u64, fn() -> u64) -> bool stored as u64
 
 // ============================================================
 // Initialization
@@ -52,15 +57,19 @@ static mut ALLOC_COUNT: u64 = 0;       // Number of allocations
 // map_page: function to map pages
 pub fn init(page_alloc: fn() -> u64, map_fn: fn(u64, u64, u64, fn() -> u64) -> bool) -> bool {
     unsafe {
-        // Allocate initial heap pages
-        // Use a fixed virtual address range for heap (16MB - 32MB)
-        HEAP_START = 0x1000000;  // 16MB
-        HEAP_MAX = 0x2000000;    // 32MB
+        // Store function pointers for later use in extend_heap
+        PAGE_ALLOC_FN = page_alloc as u64;
+        MAP_PAGE_FN = map_fn as u64;
+
+        // Use a fixed virtual address range for heap (16MB - 80MB for 64MB heap)
+        HEAP_START = 0x1000000;   // 16MB
+        HEAP_MAX = 0x5000000;     // 80MB (allows 64MB heap)
         HEAP_END = HEAP_START;
         HEAP_BUMP = HEAP_START;
         FREE_LIST = 0;
         TOTAL_ALLOCATED = 0;
         ALLOC_COUNT = 0;
+        HEAP_PAGES = 0;
 
         // Map initial pages
         let mut addr = HEAP_START;
@@ -81,6 +90,7 @@ pub fn init(page_alloc: fn() -> u64, map_fn: fn(u64, u64, u64, fn() -> u64) -> b
         }
 
         HEAP_END = addr;
+        HEAP_PAGES = HEAP_INITIAL_PAGES;
         true
     }
 }
@@ -200,20 +210,50 @@ fn find_free_block(size: u64) -> u64 {
 // Extend heap by allocating more pages
 fn extend_heap(min_size: u64) -> bool {
     unsafe {
-        // Calculate pages needed
-        let needed = align_up(min_size, PAGE_SIZE);
-        let pages_needed = needed / PAGE_SIZE;
-
-        if HEAP_END + needed > HEAP_MAX {
-            return false;  // Would exceed maximum heap size
+        // Check if function pointers are initialized
+        if PAGE_ALLOC_FN == 0 || MAP_PAGE_FN == 0 {
+            return false;
         }
 
-        // Note: We can't call page_alloc/map_page here directly
-        // In a real implementation, we'd store function pointers
-        // For now, return false to indicate we can't grow
-        // The initial heap size should be sufficient for basic operations
+        // Calculate pages needed (at least 16 pages = 64KB at a time for efficiency)
+        let min_extend = if min_size < PAGE_SIZE * 16 { PAGE_SIZE * 16 } else { min_size };
+        let needed = align_up(min_extend, PAGE_SIZE);
+        let pages_needed = needed / PAGE_SIZE;
 
-        false
+        // Check we won't exceed maximum
+        if HEAP_END + needed > HEAP_MAX {
+            return false;
+        }
+
+        // Check we won't exceed max pages
+        if HEAP_PAGES + pages_needed > HEAP_MAX_PAGES {
+            return false;
+        }
+
+        // Cast function pointers back to functions
+        let page_alloc: fn() -> u64 = core::mem::transmute(PAGE_ALLOC_FN);
+        let map_fn: fn(u64, u64, u64, fn() -> u64) -> bool = core::mem::transmute(MAP_PAGE_FN);
+
+        // Allocate and map pages
+        let mut i: u64 = 0;
+        while i < pages_needed {
+            let phys = page_alloc();
+            if phys == 0 {
+                return false;  // Out of physical memory
+            }
+
+            let virt = HEAP_END + (i * PAGE_SIZE);
+            // Map with write permission (PAGE_PRESENT | PAGE_WRITE = 3)
+            if !map_fn(virt, phys, 3, page_alloc) {
+                return false;  // Failed to map page
+            }
+
+            i = i + 1;
+        }
+
+        HEAP_END = HEAP_END + needed;
+        HEAP_PAGES = HEAP_PAGES + pages_needed;
+        true
     }
 }
 
@@ -281,4 +321,69 @@ pub fn get_heap_used() -> u64 {
 
 pub fn get_heap_free() -> u64 {
     unsafe { HEAP_END - HEAP_BUMP }
+}
+
+pub fn get_heap_pages() -> u64 {
+    unsafe { HEAP_PAGES }
+}
+
+pub fn get_heap_max() -> u64 {
+    unsafe { HEAP_MAX - HEAP_START }
+}
+
+// Reallocate memory block to new size
+pub fn realloc(ptr: *mut u8, new_size: u64) -> *mut u8 {
+    if ptr as u64 == 0 {
+        return alloc(new_size);
+    }
+
+    if new_size == 0 {
+        free(ptr);
+        return 0 as *mut u8;
+    }
+
+    unsafe {
+        let block_addr = (ptr as u64) - 16;
+
+        // Validate magic number
+        let magic_ptr = (block_addr + 8) as *u64;
+        let magic = volatile_read_u64(magic_ptr);
+
+        if magic != ALLOC_MAGIC {
+            return 0 as *mut u8;  // Invalid pointer
+        }
+
+        // Get old block size
+        let size_ptr = block_addr as *u64;
+        let old_size = volatile_read_u64(size_ptr);
+        let old_data_size = old_size - 16;  // Subtract header
+
+        // If new size fits in old block, just return same pointer
+        let header_size: u64 = 16;
+        let actual_new_size = align_up(new_size + header_size, ALIGNMENT);
+        if actual_new_size <= old_size {
+            return ptr;
+        }
+
+        // Allocate new block
+        let new_ptr = alloc(new_size);
+        if new_ptr as u64 == 0 {
+            return 0 as *mut u8;
+        }
+
+        // Copy old data to new block
+        let copy_size = if old_data_size < new_size { old_data_size } else { new_size };
+        let mut i: u64 = 0;
+        while i < copy_size {
+            let src = (ptr as u64 + i) as *u8;
+            let dst = (new_ptr as u64 + i) as *mut u8;
+            volatile_write_u8(dst, volatile_read_u8(src));
+            i = i + 1;
+        }
+
+        // Free old block
+        free(ptr);
+
+        new_ptr
+    }
 }

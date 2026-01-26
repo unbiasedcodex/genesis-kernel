@@ -3022,7 +3022,7 @@ fn read_cr2() -> u64 {
     result
 }
 
-fn serial_print_hex64(value: u64) {
+fn serial_hex64(value: u64) {
     serial_out(48);  // '0'
     serial_out(120); // 'x'
 
@@ -3213,9 +3213,9 @@ fn syscall_kb_read() -> i64 {
         // Buffer had data
         serial_out(66);  // B
         serial_out(58);  // :
-        serial_print_hex64(head as u64);
+        serial_hex64(head as u64);
         serial_out(47);  // /
-        serial_print_hex64(tail as u64);
+        serial_hex64(tail as u64);
         serial_out(61);  // =
         if ch > 0 {
             serial_out(ch);
@@ -9262,6 +9262,13 @@ fn vbe_init(mb_info_addr: i64) -> bool {
 
 // Map framebuffer using 2MB huge pages
 fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
+    // Debug: Print framebuffer address
+    serial_out(70);  // F
+    serial_out(66);  // B
+    serial_out(58);  // :
+    serial_hex(fb_addr);
+    serial_newline();
+
     // Get PML4 address from CR3
     let mut cr3: u64 = 0;
     unsafe {
@@ -9274,6 +9281,14 @@ fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
     // Clear low 12 bits using division
     let cr3_div = cr3 / 4096;
     let pml4_addr = cr3_div * 4096;
+
+    // Debug: Print CR3
+    serial_out(67);  // C
+    serial_out(82);  // R
+    serial_out(51);  // 3
+    serial_out(58);  // :
+    serial_hex(pml4_addr);
+    serial_newline();
 
     // Calculate how many 2MB pages we need - round up
     let fb_size_plus = fb_size + 0x1FFFFF;
@@ -9301,9 +9316,13 @@ fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
 
         let pdpt_addr: u64;
         if pml4e % 2 == 0 {
-            let new_pdpt: u64 = 0x480000;
+            // Allocate PDPT from kernel page table pool
+            let new_pdpt = kptpool_alloc();
+            if new_pdpt == 0 {
+                return false;
+            }
             zero_page(new_pdpt as i64);
-            let new_pdpt_entry = new_pdpt + 7;
+            let new_pdpt_entry = new_pdpt + 7;  // P + R/W + U
             write_u64_addr(pml4e_addr as i64, new_pdpt_entry);
             pdpt_addr = new_pdpt;
         } else {
@@ -9317,9 +9336,13 @@ fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
 
         let pd_addr: u64;
         if pdpte % 2 == 0 {
-            let new_pd: u64 = 0x490000;
+            // Allocate PD from kernel page table pool
+            let new_pd = kptpool_alloc();
+            if new_pd == 0 {
+                return false;
+            }
             zero_page(new_pd as i64);
-            let new_pd_entry = new_pd + 7;
+            let new_pd_entry = new_pd + 7;  // P + R/W + U
             write_u64_addr(pdpte_addr as i64, new_pd_entry);
             pd_addr = new_pd;
         } else {
@@ -9327,10 +9350,22 @@ fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
             pd_addr = div * 4096;
         }
 
-        // Set PD entry as 2MB huge page (P + RW + U + WT + CD + HUGE = 0x9B)
+        // Set PD entry as 2MB huge page (P + RW + U + WT + CD + HUGE = 0x9F)
+        // 0x9F = Present + R/W + User + WriteThrough + CacheDisabled + PageSize(2MB)
         let pde_addr = pd_addr + pd_idx * 8;
-        let pde_val = phys + 0x9B;
+        let pde_val = phys + 0x9F;
         write_u64_addr(pde_addr as i64, pde_val);
+
+        // Debug: Print mapping info
+        serial_out(77);  // M
+        serial_out(65);  // A
+        serial_out(80);  // P
+        serial_out(58);  // :
+        serial_hex(phys);
+        serial_out(45);  // -
+        serial_out(62);  // >
+        serial_hex(pd_idx);
+        serial_newline();
 
         // Invalidate TLB
         unsafe {
@@ -9343,6 +9378,16 @@ fn map_framebuffer_pages(fb_addr: u64, fb_size: u64) -> bool {
 
         mapped = mapped + 1;
     }
+
+    serial_out(70);  // F
+    serial_out(66);  // B
+    serial_out(77);  // M
+    serial_out(65);  // A
+    serial_out(80);  // P
+    serial_out(58);  // :
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
 
     true
 }
@@ -10100,6 +10145,9 @@ fn _start() {
     // Read multiboot info address from 0x500 (stored by boot.asm)
     let mb_info_addr: i64 = read_u32_at(0x500, 0) as i64;
     let mm_ok = init_memory(mb_info_addr);
+
+    // Initialize kernel page table pool early (needed for VBE framebuffer mapping)
+    kptpool_init();
 
     // Initialize VBE framebuffer
     let vbe_ok = vbe_init(mb_info_addr);

@@ -1,0 +1,330 @@
+// Window Manager Module
+// Provides windowing, compositing, and event handling
+
+pub mod event;
+pub mod window;
+pub mod compositor;
+
+// Re-export commonly used types
+pub use event::{WmEvent, EventData, KeyEvent, MouseEvent, ResizeEvent};
+pub use window::{Window, ResizeBorder};
+pub use window::{WINDOW_VISIBLE, WINDOW_FOCUSED, WINDOW_DECORATED, WINDOW_RESIZABLE};
+pub use window::{MAX_WINDOWS, TITLE_BAR_HEIGHT, BORDER_WIDTH};
+
+// ============================================================
+// Window Manager Initialization
+// ============================================================
+
+static mut WM_INITIALIZED: bool = false;
+
+// Initialize the window manager system
+// screen_width/height: Screen dimensions
+// screen_pitch: Bytes per row
+// back_buffer: Address of back buffer
+// front_buffer: Address of front buffer (framebuffer)
+// buffer_alloc: Function to allocate window buffers
+// buffer_free: Function to free window buffers
+pub fn init(
+    screen_width: u32,
+    screen_height: u32,
+    screen_pitch: u32,
+    back_buffer: u64,
+    front_buffer: u64,
+    buffer_alloc: fn(u64) -> u64,
+    buffer_free: fn(u64),
+) {
+    // Initialize subsystems
+    window::init(buffer_alloc, buffer_free);
+    compositor::init(screen_width, screen_height, screen_pitch, back_buffer, front_buffer);
+
+    unsafe {
+        WM_INITIALIZED = true;
+    }
+}
+
+pub fn is_initialized() -> bool {
+    unsafe { WM_INITIALIZED }
+}
+
+// ============================================================
+// High-Level Window API
+// ============================================================
+
+// Create a new window
+pub fn create_window(x: i32, y: i32, width: u32, height: u32, title: &[u8], flags: u32) -> u32 {
+    let window_id = window::create_window(x, y, width, height, flags, 0);
+    if window_id != 0 && title.len() > 0 {
+        window::set_window_title(window_id, title);
+    }
+    window_id
+}
+
+// Destroy a window
+pub fn destroy_window(window_id: u32) -> bool {
+    window::destroy_window(window_id)
+}
+
+// Get window buffer for drawing
+pub fn get_window_buffer(window_id: u32) -> u64 {
+    window::get_window_buffer(window_id)
+}
+
+// Mark window as needing redraw
+pub fn invalidate_window(window_id: u32) {
+    window::invalidate_window(window_id)
+}
+
+// Move window to new position
+pub fn move_window(window_id: u32, x: i32, y: i32) -> bool {
+    window::move_window(window_id, x, y)
+}
+
+// Resize window
+pub fn resize_window(window_id: u32, width: u32, height: u32) -> bool {
+    window::resize_window(window_id, width, height)
+}
+
+// Set window title
+pub fn set_window_title(window_id: u32, title: &[u8]) -> bool {
+    window::set_window_title(window_id, title)
+}
+
+// Focus window
+pub fn focus_window(window_id: u32) -> bool {
+    window::focus_window(window_id)
+}
+
+// Get focused window
+pub fn get_focused_window() -> u32 {
+    window::get_focused_window()
+}
+
+// Show window
+pub fn show_window(window_id: u32) -> bool {
+    window::show_window(window_id)
+}
+
+// Hide window
+pub fn hide_window(window_id: u32) -> bool {
+    window::hide_window(window_id)
+}
+
+// ============================================================
+// Event API
+// ============================================================
+
+// Poll for next event
+pub fn poll_event() -> Option<WmEvent> {
+    event::pop_event()
+}
+
+// Peek at next event without removing
+pub fn peek_event() -> Option<WmEvent> {
+    event::peek_event()
+}
+
+// Check if events are available
+pub fn has_events() -> bool {
+    event::has_events()
+}
+
+// Push an event
+pub fn push_event(evt: WmEvent) -> bool {
+    event::push_event(evt)
+}
+
+// ============================================================
+// Compositor API
+// ============================================================
+
+// Composite all windows
+pub fn composite() {
+    compositor::composite()
+}
+
+// Present to screen
+pub fn present() {
+    compositor::present()
+}
+
+// Composite and present in one call
+pub fn render() {
+    compositor::composite();
+    compositor::present();
+}
+
+// Set desktop background color
+pub fn set_desktop_color(color: u32) {
+    compositor::set_desktop_color(color)
+}
+
+// Force full redraw
+pub fn invalidate_all() {
+    compositor::invalidate_all()
+}
+
+// ============================================================
+// Input Handling API
+// ============================================================
+
+// Update mouse position (called by input driver)
+pub fn handle_mouse_move(x: i32, y: i32) {
+    compositor::update_cursor_position(x, y);
+    event::update_mouse_position(x, y);
+}
+
+// Handle mouse button press
+pub fn handle_mouse_down(button: u32) {
+    event::update_mouse_buttons(event::get_mouse_buttons() | button);
+    compositor::handle_mouse_down(button);
+}
+
+// Handle mouse button release
+pub fn handle_mouse_up(button: u32) {
+    event::update_mouse_buttons(event::get_mouse_buttons() & (!button));
+    compositor::handle_mouse_up(button);
+}
+
+// Handle key press
+pub fn handle_key_press(scancode: u32, keycode: u32, character: u32) {
+    compositor::handle_key_press(scancode, keycode, character);
+}
+
+// Handle key release
+pub fn handle_key_release(scancode: u32, keycode: u32) {
+    compositor::handle_key_release(scancode, keycode);
+}
+
+// Get current cursor position
+pub fn get_cursor_position() -> (i32, i32) {
+    compositor::get_cursor_position()
+}
+
+// Set cursor visibility
+pub fn set_cursor_visible(visible: bool) {
+    compositor::set_cursor_visible(visible)
+}
+
+// Get screen dimensions
+pub fn get_screen_size() -> (u32, u32) {
+    compositor::get_screen_size()
+}
+
+// ============================================================
+// Syscall Interface (100-110)
+// ============================================================
+
+pub const SYS_WM_CREATE: u64 = 100;    // Create window
+pub const SYS_WM_DESTROY: u64 = 101;   // Destroy window
+pub const SYS_WM_DRAW: u64 = 102;      // Draw/invalidate window
+pub const SYS_WM_EVENT: u64 = 103;     // Poll event
+pub const SYS_WM_MOVE: u64 = 104;      // Move window
+pub const SYS_WM_RESIZE: u64 = 105;    // Resize window
+pub const SYS_WM_FOCUS: u64 = 106;     // Focus window
+pub const SYS_WM_TITLE: u64 = 107;     // Set window title
+pub const SYS_WM_BUFFER: u64 = 108;    // Get window buffer
+pub const SYS_WM_SHOW: u64 = 109;      // Show/hide window
+pub const SYS_WM_INFO: u64 = 110;      // Get window info
+
+// Handle syscalls
+pub fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    match num {
+        SYS_WM_CREATE => {
+            let x = arg1 as i32;
+            let y = arg2 as i32;
+            let w = arg3 as u32;
+            let h = arg4 as u32;
+            let flags = arg5 as u32;
+            window::create_window(x, y, w, h, flags, 0) as i64
+        },
+        SYS_WM_DESTROY => {
+            let id = arg1 as u32;
+            if window::destroy_window(id) { 0 } else { -1 }
+        },
+        SYS_WM_DRAW => {
+            let id = arg1 as u32;
+            window::invalidate_window(id);
+            0
+        },
+        SYS_WM_EVENT => {
+            // Return event data at arg1 address
+            if let Some(evt) = event::pop_event() {
+                unsafe {
+                    let ptr = arg1 as *mut WmEvent;
+                    *ptr = evt;
+                }
+                1
+            } else {
+                0
+            }
+        },
+        SYS_WM_MOVE => {
+            let id = arg1 as u32;
+            let x = arg2 as i32;
+            let y = arg3 as i32;
+            if window::move_window(id, x, y) { 0 } else { -1 }
+        },
+        SYS_WM_RESIZE => {
+            let id = arg1 as u32;
+            let w = arg2 as u32;
+            let h = arg3 as u32;
+            if window::resize_window(id, w, h) { 0 } else { -1 }
+        },
+        SYS_WM_FOCUS => {
+            let id = arg1 as u32;
+            if window::focus_window(id) { 0 } else { -1 }
+        },
+        SYS_WM_TITLE => {
+            let id = arg1 as u32;
+            let title_ptr = arg2 as *const u8;
+            let title_len = arg3 as usize;
+            unsafe {
+                let title = core::slice::from_raw_parts(title_ptr, title_len);
+                if window::set_window_title(id, title) { 0 } else { -1 }
+            }
+        },
+        SYS_WM_BUFFER => {
+            let id = arg1 as u32;
+            window::get_window_buffer(id) as i64
+        },
+        SYS_WM_SHOW => {
+            let id = arg1 as u32;
+            let show = arg2 != 0;
+            if show {
+                if window::show_window(id) { 0 } else { -1 }
+            } else {
+                if window::hide_window(id) { 0 } else { -1 }
+            }
+        },
+        SYS_WM_INFO => {
+            let id = arg1 as u32;
+            if let Some(win) = window::get_window(id) {
+                unsafe {
+                    let ptr = arg2 as *mut Window;
+                    *ptr = Window {
+                        id: win.id,
+                        x: win.x,
+                        y: win.y,
+                        width: win.width,
+                        height: win.height,
+                        buffer: win.buffer,
+                        buffer_size: win.buffer_size,
+                        z_order: win.z_order,
+                        flags: win.flags,
+                        title: win.title,
+                        title_len: win.title_len,
+                        process_id: win.process_id,
+                        min_width: win.min_width,
+                        min_height: win.min_height,
+                        max_width: win.max_width,
+                        max_height: win.max_height,
+                    };
+                }
+                0
+            } else {
+                -1
+            }
+        },
+        _ => -1
+    }
+}

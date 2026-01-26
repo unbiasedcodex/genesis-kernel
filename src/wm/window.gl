@@ -1,0 +1,709 @@
+// Window Management System
+// Handles window creation, destruction, and management
+
+use super::event;
+
+// ============================================================
+// Constants
+// ============================================================
+
+pub const MAX_WINDOWS: u64 = 64;
+const MAX_TITLE_LEN: usize = 128;
+
+// Window flags
+pub const WINDOW_VISIBLE: u32 = 1;
+pub const WINDOW_FOCUSED: u32 = 2;
+pub const WINDOW_DECORATED: u32 = 4;
+pub const WINDOW_RESIZABLE: u32 = 8;
+pub const WINDOW_MINIMIZED: u32 = 16;
+pub const WINDOW_MAXIMIZED: u32 = 32;
+pub const WINDOW_FULLSCREEN: u32 = 64;
+pub const WINDOW_ALWAYS_ON_TOP: u32 = 128;
+pub const WINDOW_DIRTY: u32 = 256;  // Needs redraw
+
+// Decoration sizes
+pub const TITLE_BAR_HEIGHT: u32 = 24;
+pub const BORDER_WIDTH: u32 = 2;
+
+// Window colors
+pub const COLOR_TITLE_BAR_ACTIVE: u32 = 0xFF404080;
+pub const COLOR_TITLE_BAR_INACTIVE: u32 = 0xFF606060;
+pub const COLOR_BORDER_ACTIVE: u32 = 0xFF505090;
+pub const COLOR_BORDER_INACTIVE: u32 = 0xFF707070;
+pub const COLOR_TITLE_TEXT: u32 = 0xFFFFFFFF;
+pub const COLOR_CLOSE_BUTTON: u32 = 0xFFE04040;
+pub const COLOR_CLOSE_BUTTON_HOVER: u32 = 0xFFFF6060;
+
+// ============================================================
+// Window Structure
+// ============================================================
+
+#[repr(C)]
+pub struct Window {
+    pub id: u32,                      // Unique window ID
+    pub x: i32,                       // X position on screen
+    pub y: i32,                       // Y position on screen
+    pub width: u32,                   // Client area width
+    pub height: u32,                  // Client area height
+    pub buffer: u64,                  // Window's private framebuffer address
+    pub buffer_size: u64,             // Buffer size in bytes
+    pub z_order: u32,                 // Z-order (higher = on top)
+    pub flags: u32,                   // Window flags
+    pub title: [u8; 128],             // Window title (null-terminated)
+    pub title_len: u32,               // Title length
+    pub process_id: u32,              // Owning process ID
+    pub min_width: u32,               // Minimum width
+    pub min_height: u32,              // Minimum height
+    pub max_width: u32,               // Maximum width (0 = unlimited)
+    pub max_height: u32,              // Maximum height (0 = unlimited)
+}
+
+impl Window {
+    pub fn new() -> Window {
+        Window {
+            id: 0,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            buffer: 0,
+            buffer_size: 0,
+            z_order: 0,
+            flags: 0,
+            title: [0; 128],
+            title_len: 0,
+            process_id: 0,
+            min_width: 100,
+            min_height: 50,
+            max_width: 0,
+            max_height: 0,
+        }
+    }
+
+    // Get total width including decorations
+    pub fn total_width(&self) -> u32 {
+        if self.flags & WINDOW_DECORATED != 0 {
+            self.width + BORDER_WIDTH * 2
+        } else {
+            self.width
+        }
+    }
+
+    // Get total height including decorations
+    pub fn total_height(&self) -> u32 {
+        if self.flags & WINDOW_DECORATED != 0 {
+            self.height + TITLE_BAR_HEIGHT + BORDER_WIDTH
+        } else {
+            self.height
+        }
+    }
+
+    // Get client area bounds (screen coordinates)
+    pub fn client_rect(&self) -> (i32, i32, u32, u32) {
+        if self.flags & WINDOW_DECORATED != 0 {
+            (
+                self.x + BORDER_WIDTH as i32,
+                self.y + TITLE_BAR_HEIGHT as i32,
+                self.width,
+                self.height,
+            )
+        } else {
+            (self.x, self.y, self.width, self.height)
+        }
+    }
+
+    // Check if point is in window bounds
+    pub fn contains_point(&self, px: i32, py: i32) -> bool {
+        let tw = self.total_width() as i32;
+        let th = self.total_height() as i32;
+        px >= self.x && px < self.x + tw && py >= self.y && py < self.y + th
+    }
+
+    // Check if point is in title bar
+    pub fn in_title_bar(&self, px: i32, py: i32) -> bool {
+        if self.flags & WINDOW_DECORATED == 0 {
+            return false;
+        }
+        px >= self.x && px < self.x + self.total_width() as i32
+            && py >= self.y && py < self.y + TITLE_BAR_HEIGHT as i32
+    }
+
+    // Check if point is in close button
+    pub fn in_close_button(&self, px: i32, py: i32) -> bool {
+        if self.flags & WINDOW_DECORATED == 0 {
+            return false;
+        }
+        let button_x = self.x + self.total_width() as i32 - 24;
+        let button_y = self.y + 2;
+        px >= button_x && px < button_x + 20 && py >= button_y && py < button_y + 20
+    }
+
+    // Check if point is on resize border
+    pub fn on_resize_border(&self, px: i32, py: i32) -> ResizeBorder {
+        if self.flags & WINDOW_RESIZABLE == 0 || self.flags & WINDOW_DECORATED == 0 {
+            return ResizeBorder::None;
+        }
+
+        let tw = self.total_width() as i32;
+        let th = self.total_height() as i32;
+        let border = BORDER_WIDTH as i32 + 4;  // Extend hit area
+
+        let on_left = px >= self.x - border && px < self.x + border;
+        let on_right = px >= self.x + tw - border && px < self.x + tw + border;
+        let on_top = py >= self.y - border && py < self.y + border;
+        let on_bottom = py >= self.y + th - border && py < self.y + th + border;
+
+        if on_left && on_top { return ResizeBorder::TopLeft; }
+        if on_right && on_top { return ResizeBorder::TopRight; }
+        if on_left && on_bottom { return ResizeBorder::BottomLeft; }
+        if on_right && on_bottom { return ResizeBorder::BottomRight; }
+        if on_left { return ResizeBorder::Left; }
+        if on_right { return ResizeBorder::Right; }
+        if on_top { return ResizeBorder::Top; }
+        if on_bottom { return ResizeBorder::Bottom; }
+
+        ResizeBorder::None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ResizeBorder {
+    None,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+// ============================================================
+// Window Manager State
+// ============================================================
+
+static mut WINDOWS: [Window; 64] = [Window {
+    id: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    buffer: 0,
+    buffer_size: 0,
+    z_order: 0,
+    flags: 0,
+    title: [0; 128],
+    title_len: 0,
+    process_id: 0,
+    min_width: 100,
+    min_height: 50,
+    max_width: 0,
+    max_height: 0,
+}; 64];
+
+static mut WINDOW_COUNT: u64 = 0;
+static mut NEXT_WINDOW_ID: u32 = 1;
+static mut FOCUSED_WINDOW: u32 = 0;  // Window ID of focused window
+static mut TOP_Z_ORDER: u32 = 0;
+
+// Function pointer for buffer allocation
+static mut BUFFER_ALLOC_FN: u64 = 0;  // fn(u64) -> u64
+static mut BUFFER_FREE_FN: u64 = 0;   // fn(u64)
+
+// ============================================================
+// Initialization
+// ============================================================
+
+pub fn init(buffer_alloc: fn(u64) -> u64, buffer_free: fn(u64)) {
+    unsafe {
+        BUFFER_ALLOC_FN = buffer_alloc as u64;
+        BUFFER_FREE_FN = buffer_free as u64;
+
+        // Initialize window array
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            WINDOWS[i as usize] = Window::new();
+            i = i + 1;
+        }
+
+        WINDOW_COUNT = 0;
+        NEXT_WINDOW_ID = 1;
+        FOCUSED_WINDOW = 0;
+        TOP_Z_ORDER = 0;
+    }
+}
+
+// ============================================================
+// Window Creation/Destruction
+// ============================================================
+
+// Create a new window
+pub fn create_window(x: i32, y: i32, width: u32, height: u32, flags: u32, process_id: u32) -> u32 {
+    unsafe {
+        if WINDOW_COUNT >= MAX_WINDOWS || BUFFER_ALLOC_FN == 0 {
+            return 0;
+        }
+
+        // Find free slot
+        let mut slot: i64 = -1;
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            if WINDOWS[i as usize].id == 0 {
+                slot = i as i64;
+                break;
+            }
+            i = i + 1;
+        }
+
+        if slot < 0 {
+            return 0;
+        }
+
+        // Allocate buffer for window content
+        let buffer_size = (width as u64) * (height as u64) * 4;  // 32-bit color
+        let buffer_alloc: fn(u64) -> u64 = core::mem::transmute(BUFFER_ALLOC_FN);
+        let buffer = buffer_alloc(buffer_size);
+
+        if buffer == 0 {
+            return 0;
+        }
+
+        // Initialize window
+        let window_id = NEXT_WINDOW_ID;
+        NEXT_WINDOW_ID = NEXT_WINDOW_ID + 1;
+        TOP_Z_ORDER = TOP_Z_ORDER + 1;
+
+        let win = &mut WINDOWS[slot as usize];
+        win.id = window_id;
+        win.x = x;
+        win.y = y;
+        win.width = width;
+        win.height = height;
+        win.buffer = buffer;
+        win.buffer_size = buffer_size;
+        win.z_order = TOP_Z_ORDER;
+        win.flags = flags | WINDOW_VISIBLE | WINDOW_DIRTY;
+        win.title = [0; 128];
+        win.title_len = 0;
+        win.process_id = process_id;
+        win.min_width = 100;
+        win.min_height = 50;
+        win.max_width = 0;
+        win.max_height = 0;
+
+        // Clear buffer
+        clear_window_buffer(win);
+
+        WINDOW_COUNT = WINDOW_COUNT + 1;
+
+        // Focus the new window
+        focus_window(window_id);
+
+        window_id
+    }
+}
+
+// Destroy a window
+pub fn destroy_window(window_id: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        let win = &mut WINDOWS[slot as usize];
+
+        // Free buffer
+        if win.buffer != 0 && BUFFER_FREE_FN != 0 {
+            let buffer_free: fn(u64) = core::mem::transmute(BUFFER_FREE_FN);
+            buffer_free(win.buffer);
+        }
+
+        // Clear window slot
+        *win = Window::new();
+        WINDOW_COUNT = WINDOW_COUNT - 1;
+
+        // Update focus if needed
+        if FOCUSED_WINDOW == window_id {
+            FOCUSED_WINDOW = 0;
+            // Focus next top window
+            let top_window = get_top_window();
+            if top_window != 0 {
+                focus_window(top_window);
+            }
+        }
+
+        true
+    }
+}
+
+// ============================================================
+// Window Lookup
+// ============================================================
+
+fn find_window_slot(window_id: u32) -> i64 {
+    unsafe {
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            if WINDOWS[i as usize].id == window_id {
+                return i as i64;
+            }
+            i = i + 1;
+        }
+        -1
+    }
+}
+
+pub fn get_window(window_id: u32) -> Option<&'static Window> {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot >= 0 {
+            Some(&WINDOWS[slot as usize])
+        } else {
+            None
+        }
+    }
+}
+
+pub fn get_window_mut(window_id: u32) -> Option<&'static mut Window> {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot >= 0 {
+            Some(&mut WINDOWS[slot as usize])
+        } else {
+            None
+        }
+    }
+}
+
+// Get top-most window at point
+pub fn get_window_at_point(x: i32, y: i32) -> u32 {
+    unsafe {
+        let mut best_id: u32 = 0;
+        let mut best_z: u32 = 0;
+
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            let win = &WINDOWS[i as usize];
+            if win.id != 0 && (win.flags & WINDOW_VISIBLE) != 0 {
+                if win.contains_point(x, y) && win.z_order > best_z {
+                    best_id = win.id;
+                    best_z = win.z_order;
+                }
+            }
+            i = i + 1;
+        }
+
+        best_id
+    }
+}
+
+// Get top-most visible window
+pub fn get_top_window() -> u32 {
+    unsafe {
+        let mut best_id: u32 = 0;
+        let mut best_z: u32 = 0;
+
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            let win = &WINDOWS[i as usize];
+            if win.id != 0 && (win.flags & WINDOW_VISIBLE) != 0 {
+                if win.z_order > best_z {
+                    best_id = win.id;
+                    best_z = win.z_order;
+                }
+            }
+            i = i + 1;
+        }
+
+        best_id
+    }
+}
+
+// ============================================================
+// Window Focus
+// ============================================================
+
+pub fn focus_window(window_id: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        let old_focused = FOCUSED_WINDOW;
+
+        // Unfocus old window
+        if old_focused != 0 && old_focused != window_id {
+            let old_slot = find_window_slot(old_focused);
+            if old_slot >= 0 {
+                WINDOWS[old_slot as usize].flags =
+                    WINDOWS[old_slot as usize].flags & (!WINDOW_FOCUSED) | WINDOW_DIRTY;
+                event::push_event(event::create_window_unfocus(old_focused));
+            }
+        }
+
+        // Focus new window
+        TOP_Z_ORDER = TOP_Z_ORDER + 1;
+        WINDOWS[slot as usize].z_order = TOP_Z_ORDER;
+        WINDOWS[slot as usize].flags =
+            WINDOWS[slot as usize].flags | WINDOW_FOCUSED | WINDOW_DIRTY;
+        FOCUSED_WINDOW = window_id;
+
+        event::push_event(event::create_window_focus(window_id));
+
+        true
+    }
+}
+
+pub fn get_focused_window() -> u32 {
+    unsafe { FOCUSED_WINDOW }
+}
+
+// ============================================================
+// Window Movement/Sizing
+// ============================================================
+
+pub fn move_window(window_id: u32, x: i32, y: i32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        WINDOWS[slot as usize].x = x;
+        WINDOWS[slot as usize].y = y;
+        WINDOWS[slot as usize].flags = WINDOWS[slot as usize].flags | WINDOW_DIRTY;
+        true
+    }
+}
+
+pub fn resize_window(window_id: u32, width: u32, height: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        let win = &mut WINDOWS[slot as usize];
+
+        // Clamp to min/max
+        let new_width = if width < win.min_width { win.min_width }
+            else if win.max_width > 0 && width > win.max_width { win.max_width }
+            else { width };
+        let new_height = if height < win.min_height { win.min_height }
+            else if win.max_height > 0 && height > win.max_height { win.max_height }
+            else { height };
+
+        if new_width == win.width && new_height == win.height {
+            return true;  // No change
+        }
+
+        let old_width = win.width;
+        let old_height = win.height;
+
+        // Reallocate buffer
+        let new_buffer_size = (new_width as u64) * (new_height as u64) * 4;
+        if BUFFER_ALLOC_FN != 0 {
+            let buffer_alloc: fn(u64) -> u64 = core::mem::transmute(BUFFER_ALLOC_FN);
+            let new_buffer = buffer_alloc(new_buffer_size);
+
+            if new_buffer == 0 {
+                return false;
+            }
+
+            // Free old buffer
+            if win.buffer != 0 && BUFFER_FREE_FN != 0 {
+                let buffer_free: fn(u64) = core::mem::transmute(BUFFER_FREE_FN);
+                buffer_free(win.buffer);
+            }
+
+            win.buffer = new_buffer;
+            win.buffer_size = new_buffer_size;
+        }
+
+        win.width = new_width;
+        win.height = new_height;
+        win.flags = win.flags | WINDOW_DIRTY;
+
+        // Clear new buffer
+        clear_window_buffer(win);
+
+        // Send resize event
+        event::push_event(event::create_window_resize(
+            window_id, new_width, new_height, old_width, old_height
+        ));
+
+        true
+    }
+}
+
+// ============================================================
+// Window Properties
+// ============================================================
+
+pub fn set_window_title(window_id: u32, title: &[u8]) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        let win = &mut WINDOWS[slot as usize];
+        let len = if title.len() > MAX_TITLE_LEN - 1 { MAX_TITLE_LEN - 1 } else { title.len() };
+
+        let mut i: usize = 0;
+        while i < len {
+            win.title[i] = title[i];
+            i = i + 1;
+        }
+        win.title[len] = 0;  // Null terminate
+        win.title_len = len as u32;
+        win.flags = win.flags | WINDOW_DIRTY;
+
+        true
+    }
+}
+
+pub fn set_window_flags(window_id: u32, flags: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        WINDOWS[slot as usize].flags = flags | WINDOW_DIRTY;
+        true
+    }
+}
+
+pub fn show_window(window_id: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        WINDOWS[slot as usize].flags =
+            WINDOWS[slot as usize].flags | WINDOW_VISIBLE | WINDOW_DIRTY;
+        event::push_event(event::create_window_expose(window_id));
+        true
+    }
+}
+
+pub fn hide_window(window_id: u32) -> bool {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return false;
+        }
+
+        WINDOWS[slot as usize].flags =
+            (WINDOWS[slot as usize].flags & (!WINDOW_VISIBLE)) | WINDOW_DIRTY;
+        true
+    }
+}
+
+// ============================================================
+// Window Buffer Operations
+// ============================================================
+
+fn clear_window_buffer(win: &Window) {
+    if win.buffer == 0 {
+        return;
+    }
+
+    let pixels = (win.width as u64) * (win.height as u64);
+    let mut i: u64 = 0;
+    while i < pixels {
+        unsafe {
+            let addr = (win.buffer + i * 4) as *mut u32;
+            volatile_write_u32(addr, 0xFFFFFFFF);  // White background
+        }
+        i = i + 1;
+    }
+}
+
+// Get window buffer address
+pub fn get_window_buffer(window_id: u32) -> u64 {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot < 0 {
+            return 0;
+        }
+        WINDOWS[slot as usize].buffer
+    }
+}
+
+// Mark window as needing redraw
+pub fn invalidate_window(window_id: u32) {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot >= 0 {
+            WINDOWS[slot as usize].flags = WINDOWS[slot as usize].flags | WINDOW_DIRTY;
+        }
+    }
+}
+
+// Mark window as redrawn
+pub fn validate_window(window_id: u32) {
+    unsafe {
+        let slot = find_window_slot(window_id);
+        if slot >= 0 {
+            WINDOWS[slot as usize].flags = WINDOWS[slot as usize].flags & (!WINDOW_DIRTY);
+        }
+    }
+}
+
+// ============================================================
+// Iterator
+// ============================================================
+
+// Get all windows sorted by z-order (back to front)
+pub fn iter_windows_by_z_order(callback: fn(&Window)) {
+    unsafe {
+        // Simple bubble sort - windows array is small
+        let mut sorted: [u32; 64] = [0; 64];
+        let mut count: u64 = 0;
+
+        // Collect visible window IDs
+        let mut i: u64 = 0;
+        while i < MAX_WINDOWS {
+            if WINDOWS[i as usize].id != 0 && (WINDOWS[i as usize].flags & WINDOW_VISIBLE) != 0 {
+                sorted[count as usize] = i as u32;
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+
+        // Sort by z-order
+        let mut j: u64 = 0;
+        while j < count {
+            let mut k = j + 1;
+            while k < count {
+                let z1 = WINDOWS[sorted[j as usize] as usize].z_order;
+                let z2 = WINDOWS[sorted[k as usize] as usize].z_order;
+                if z1 > z2 {
+                    let tmp = sorted[j as usize];
+                    sorted[j as usize] = sorted[k as usize];
+                    sorted[k as usize] = tmp;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+
+        // Call callback for each window
+        let mut i: u64 = 0;
+        while i < count {
+            callback(&WINDOWS[sorted[i as usize] as usize]);
+            i = i + 1;
+        }
+    }
+}
+
+// Get window count
+pub fn get_window_count() -> u64 {
+    unsafe { WINDOW_COUNT }
+}

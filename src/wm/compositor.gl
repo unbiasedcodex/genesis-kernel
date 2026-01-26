@@ -1,0 +1,621 @@
+// Window Compositor
+// Handles compositing windows to the framebuffer
+
+use super::window;
+use super::window::{Window, WINDOW_VISIBLE, WINDOW_FOCUSED, WINDOW_DECORATED, WINDOW_DIRTY};
+use super::window::{TITLE_BAR_HEIGHT, BORDER_WIDTH};
+use super::window::{COLOR_TITLE_BAR_ACTIVE, COLOR_TITLE_BAR_INACTIVE};
+use super::window::{COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE};
+use super::window::{COLOR_TITLE_TEXT, COLOR_CLOSE_BUTTON, COLOR_CLOSE_BUTTON_HOVER};
+use super::event;
+
+// ============================================================
+// Compositor State
+// ============================================================
+
+static mut SCREEN_WIDTH: u32 = 0;
+static mut SCREEN_HEIGHT: u32 = 0;
+static mut SCREEN_PITCH: u32 = 0;
+static mut BACK_BUFFER: u64 = 0;
+static mut FRONT_BUFFER: u64 = 0;
+
+static mut COMPOSITOR_INITIALIZED: bool = false;
+static mut NEEDS_FULL_REDRAW: bool = true;
+
+// Background color
+static mut DESKTOP_COLOR: u32 = 0xFF2D5A87;  // Nice blue
+
+// Mouse cursor state
+static mut CURSOR_X: i32 = 0;
+static mut CURSOR_Y: i32 = 0;
+static mut CURSOR_VISIBLE: bool = true;
+
+// Dragging state
+static mut DRAG_WINDOW: u32 = 0;
+static mut DRAG_OFFSET_X: i32 = 0;
+static mut DRAG_OFFSET_Y: i32 = 0;
+static mut RESIZE_WINDOW: u32 = 0;
+static mut RESIZE_BORDER: window::ResizeBorder = window::ResizeBorder::None;
+static mut RESIZE_START_X: i32 = 0;
+static mut RESIZE_START_Y: i32 = 0;
+static mut RESIZE_START_W: u32 = 0;
+static mut RESIZE_START_H: u32 = 0;
+static mut RESIZE_START_WIN_X: i32 = 0;
+static mut RESIZE_START_WIN_Y: i32 = 0;
+
+// ============================================================
+// Initialization
+// ============================================================
+
+pub fn init(width: u32, height: u32, pitch: u32, back_buffer: u64, front_buffer: u64) {
+    unsafe {
+        SCREEN_WIDTH = width;
+        SCREEN_HEIGHT = height;
+        SCREEN_PITCH = pitch;
+        BACK_BUFFER = back_buffer;
+        FRONT_BUFFER = front_buffer;
+        CURSOR_X = (width / 2) as i32;
+        CURSOR_Y = (height / 2) as i32;
+        COMPOSITOR_INITIALIZED = true;
+        NEEDS_FULL_REDRAW = true;
+    }
+}
+
+pub fn set_desktop_color(color: u32) {
+    unsafe {
+        DESKTOP_COLOR = color;
+        NEEDS_FULL_REDRAW = true;
+    }
+}
+
+// ============================================================
+// Compositing
+// ============================================================
+
+// Composite all windows to back buffer
+pub fn composite() {
+    unsafe {
+        if !COMPOSITOR_INITIALIZED {
+            return;
+        }
+
+        // Draw desktop background if needed
+        if NEEDS_FULL_REDRAW {
+            draw_desktop();
+            NEEDS_FULL_REDRAW = false;
+        }
+
+        // Draw windows back to front
+        window::iter_windows_by_z_order(draw_window);
+
+        // Draw mouse cursor
+        if CURSOR_VISIBLE {
+            draw_cursor(CURSOR_X, CURSOR_Y);
+        }
+    }
+}
+
+// Present back buffer to screen
+pub fn present() {
+    unsafe {
+        if !COMPOSITOR_INITIALIZED || FRONT_BUFFER == 0 || BACK_BUFFER == 0 {
+            return;
+        }
+
+        // Copy back buffer to front buffer
+        let size = (SCREEN_PITCH as u64) * (SCREEN_HEIGHT as u64);
+        let mut i: u64 = 0;
+        while i < size {
+            let src = (BACK_BUFFER + i) as *u8;
+            let dst = (FRONT_BUFFER + i) as *mut u8;
+            volatile_write_u8(dst, volatile_read_u8(src));
+            i = i + 1;
+        }
+    }
+}
+
+// Force full redraw
+pub fn invalidate_all() {
+    unsafe {
+        NEEDS_FULL_REDRAW = true;
+    }
+}
+
+// ============================================================
+// Desktop Drawing
+// ============================================================
+
+fn draw_desktop() {
+    unsafe {
+        let mut y: u32 = 0;
+        while y < SCREEN_HEIGHT {
+            let row_addr = BACK_BUFFER + (y as u64) * (SCREEN_PITCH as u64);
+            let mut x: u32 = 0;
+            while x < SCREEN_WIDTH {
+                let addr = (row_addr + (x as u64) * 4) as *mut u32;
+                volatile_write_u32(addr, DESKTOP_COLOR);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+}
+
+// ============================================================
+// Window Drawing
+// ============================================================
+
+fn draw_window(win: &Window) {
+    unsafe {
+        if win.flags & WINDOW_VISIBLE == 0 {
+            return;
+        }
+
+        let is_focused = win.flags & WINDOW_FOCUSED != 0;
+        let is_decorated = win.flags & WINDOW_DECORATED != 0;
+
+        if is_decorated {
+            // Draw window decorations
+            draw_window_decorations(win, is_focused);
+        }
+
+        // Draw window content
+        draw_window_content(win);
+
+        // Mark window as drawn
+        window::validate_window(win.id);
+    }
+}
+
+fn draw_window_decorations(win: &Window, focused: bool) {
+    unsafe {
+        let border_color = if focused { COLOR_BORDER_ACTIVE } else { COLOR_BORDER_INACTIVE };
+        let title_color = if focused { COLOR_TITLE_BAR_ACTIVE } else { COLOR_TITLE_BAR_INACTIVE };
+
+        let total_w = win.total_width();
+        let total_h = win.total_height();
+
+        // Draw border
+        // Top border
+        fill_rect(win.x, win.y, total_w, BORDER_WIDTH, border_color);
+        // Left border
+        fill_rect(win.x, win.y, BORDER_WIDTH, total_h, border_color);
+        // Right border
+        fill_rect(win.x + total_w as i32 - BORDER_WIDTH as i32, win.y, BORDER_WIDTH, total_h, border_color);
+        // Bottom border
+        fill_rect(win.x, win.y + total_h as i32 - BORDER_WIDTH as i32, total_w, BORDER_WIDTH, border_color);
+
+        // Draw title bar
+        fill_rect(
+            win.x + BORDER_WIDTH as i32,
+            win.y,
+            total_w - BORDER_WIDTH * 2,
+            TITLE_BAR_HEIGHT,
+            title_color
+        );
+
+        // Draw title text
+        if win.title_len > 0 {
+            draw_title_text(
+                win.x + BORDER_WIDTH as i32 + 8,
+                win.y + 4,
+                &win.title,
+                win.title_len,
+                COLOR_TITLE_TEXT
+            );
+        }
+
+        // Draw close button
+        let button_x = win.x + total_w as i32 - 24;
+        let button_y = win.y + 2;
+        fill_rect(button_x, button_y, 20, 20, COLOR_CLOSE_BUTTON);
+        // Draw X
+        draw_close_x(button_x + 5, button_y + 5, 0xFFFFFFFF);
+    }
+}
+
+fn draw_window_content(win: &Window) {
+    unsafe {
+        if win.buffer == 0 {
+            return;
+        }
+
+        let (client_x, client_y, client_w, client_h) = win.client_rect();
+
+        // Clip to screen bounds
+        let start_x = if client_x < 0 { 0 } else { client_x };
+        let start_y = if client_y < 0 { 0 } else { client_y };
+        let end_x = if client_x + client_w as i32 > SCREEN_WIDTH as i32 {
+            SCREEN_WIDTH as i32
+        } else {
+            client_x + client_w as i32
+        };
+        let end_y = if client_y + client_h as i32 > SCREEN_HEIGHT as i32 {
+            SCREEN_HEIGHT as i32
+        } else {
+            client_y + client_h as i32
+        };
+
+        // Blit window buffer to back buffer
+        let mut y = start_y;
+        while y < end_y {
+            let src_y = (y - client_y) as u64;
+            let dst_row = BACK_BUFFER + (y as u64) * (SCREEN_PITCH as u64);
+            let src_row = win.buffer + src_y * (client_w as u64) * 4;
+
+            let mut x = start_x;
+            while x < end_x {
+                let src_x = (x - client_x) as u64;
+                let src_addr = (src_row + src_x * 4) as *u32;
+                let dst_addr = (dst_row + (x as u64) * 4) as *mut u32;
+
+                let pixel = volatile_read_u32(src_addr);
+                volatile_write_u32(dst_addr, pixel);
+
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+}
+
+// ============================================================
+// Primitive Drawing
+// ============================================================
+
+fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
+    unsafe {
+        // Clip to screen
+        let start_x = if x < 0 { 0 } else { x as u32 };
+        let start_y = if y < 0 { 0 } else { y as u32 };
+        let end_x = if x + w as i32 > SCREEN_WIDTH as i32 { SCREEN_WIDTH } else { (x as u32) + w };
+        let end_y = if y + h as i32 > SCREEN_HEIGHT as i32 { SCREEN_HEIGHT } else { (y as u32) + h };
+
+        let mut py = start_y;
+        while py < end_y {
+            let row_addr = BACK_BUFFER + (py as u64) * (SCREEN_PITCH as u64);
+            let mut px = start_x;
+            while px < end_x {
+                let addr = (row_addr + (px as u64) * 4) as *mut u32;
+                volatile_write_u32(addr, color);
+                px = px + 1;
+            }
+            py = py + 1;
+        }
+    }
+}
+
+fn draw_pixel(x: i32, y: i32, color: u32) {
+    unsafe {
+        if x < 0 || x >= SCREEN_WIDTH as i32 || y < 0 || y >= SCREEN_HEIGHT as i32 {
+            return;
+        }
+        let addr = (BACK_BUFFER + (y as u64) * (SCREEN_PITCH as u64) + (x as u64) * 4) as *mut u32;
+        volatile_write_u32(addr, color);
+    }
+}
+
+fn draw_title_text(x: i32, y: i32, title: &[u8; 128], len: u32, color: u32) {
+    // Simple 8x16 font rendering
+    let mut cx = x;
+    let mut i: u32 = 0;
+    while i < len && i < 64 {
+        let ch = title[i as usize];
+        if ch == 0 {
+            break;
+        }
+        // Draw character (simplified - just draw placeholder rect for now)
+        // In real implementation, use font data
+        // For now, we'll skip actual character rendering
+        cx = cx + 8;
+        i = i + 1;
+    }
+}
+
+fn draw_close_x(x: i32, y: i32, color: u32) {
+    // Draw X shape for close button
+    let mut i: i32 = 0;
+    while i < 10 {
+        draw_pixel(x + i, y + i, color);
+        draw_pixel(x + 9 - i, y + i, color);
+        draw_pixel(x + i + 1, y + i, color);
+        draw_pixel(x + 9 - i - 1, y + i, color);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Mouse Cursor
+// ============================================================
+
+fn draw_cursor(x: i32, y: i32) {
+    // Simple arrow cursor
+    let cursor: [u16; 16] = [
+        0b1000000000000000,
+        0b1100000000000000,
+        0b1110000000000000,
+        0b1111000000000000,
+        0b1111100000000000,
+        0b1111110000000000,
+        0b1111111000000000,
+        0b1111111100000000,
+        0b1111111110000000,
+        0b1111111111000000,
+        0b1111110000000000,
+        0b1101111000000000,
+        0b1000111100000000,
+        0b0000111100000000,
+        0b0000011110000000,
+        0b0000011110000000,
+    ];
+
+    let mut row: i32 = 0;
+    while row < 16 {
+        let bits = cursor[row as usize];
+        let mut col: i32 = 0;
+        while col < 16 {
+            let mask = 0x8000 >> col;
+            if (bits & mask) != 0 {
+                draw_pixel(x + col, y + row, 0xFFFFFFFF);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+
+    // Draw cursor outline
+    let outline: [u16; 16] = [
+        0b0100000000000000,
+        0b0010000000000000,
+        0b0001000000000000,
+        0b0000100000000000,
+        0b0000010000000000,
+        0b0000001000000000,
+        0b0000000100000000,
+        0b0000000010000000,
+        0b0000000001000000,
+        0b0000000000100000,
+        0b0000001000000000,
+        0b0010000100000000,
+        0b0100000010000000,
+        0b0000000010000000,
+        0b0000000001000000,
+        0b0000000001000000,
+    ];
+
+    let mut row: i32 = 0;
+    while row < 16 {
+        let bits = outline[row as usize];
+        let mut col: i32 = 0;
+        while col < 16 {
+            let mask = 0x8000 >> col;
+            if (bits & mask) != 0 {
+                draw_pixel(x + col, y + row, 0xFF000000);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// ============================================================
+// Input Handling
+// ============================================================
+
+pub fn update_cursor_position(x: i32, y: i32) {
+    unsafe {
+        let old_x = CURSOR_X;
+        let old_y = CURSOR_Y;
+
+        CURSOR_X = if x < 0 { 0 }
+            else if x >= SCREEN_WIDTH as i32 { SCREEN_WIDTH as i32 - 1 }
+            else { x };
+        CURSOR_Y = if y < 0 { 0 }
+            else if y >= SCREEN_HEIGHT as i32 { SCREEN_HEIGHT as i32 - 1 }
+            else { y };
+
+        // Handle window dragging
+        if DRAG_WINDOW != 0 {
+            let new_x = CURSOR_X - DRAG_OFFSET_X;
+            let new_y = CURSOR_Y - DRAG_OFFSET_Y;
+            window::move_window(DRAG_WINDOW, new_x, new_y);
+            NEEDS_FULL_REDRAW = true;
+        }
+
+        // Handle window resizing
+        if RESIZE_WINDOW != 0 {
+            handle_resize_drag();
+            NEEDS_FULL_REDRAW = true;
+        }
+    }
+}
+
+pub fn get_cursor_position() -> (i32, i32) {
+    unsafe { (CURSOR_X, CURSOR_Y) }
+}
+
+pub fn set_cursor_visible(visible: bool) {
+    unsafe { CURSOR_VISIBLE = visible; }
+}
+
+// Handle mouse button down
+pub fn handle_mouse_down(button: u32) {
+    unsafe {
+        let (x, y) = (CURSOR_X, CURSOR_Y);
+
+        // Find window under cursor
+        let window_id = window::get_window_at_point(x, y);
+        if window_id == 0 {
+            return;
+        }
+
+        // Focus window
+        window::focus_window(window_id);
+
+        if let Some(win) = window::get_window(window_id) {
+            // Check for close button click
+            if win.in_close_button(x, y) {
+                event::push_event(event::create_window_close(window_id));
+                return;
+            }
+
+            // Check for title bar drag
+            if win.in_title_bar(x, y) && !win.in_close_button(x, y) {
+                DRAG_WINDOW = window_id;
+                DRAG_OFFSET_X = x - win.x;
+                DRAG_OFFSET_Y = y - win.y;
+                return;
+            }
+
+            // Check for resize border
+            let resize = win.on_resize_border(x, y);
+            if resize != window::ResizeBorder::None {
+                RESIZE_WINDOW = window_id;
+                RESIZE_BORDER = resize;
+                RESIZE_START_X = x;
+                RESIZE_START_Y = y;
+                RESIZE_START_W = win.width;
+                RESIZE_START_H = win.height;
+                RESIZE_START_WIN_X = win.x;
+                RESIZE_START_WIN_Y = win.y;
+                return;
+            }
+
+            // Otherwise, send click event to window
+            let (client_x, client_y, _, _) = win.client_rect();
+            let rel_x = x - client_x;
+            let rel_y = y - client_y;
+            event::push_event(event::create_mouse_button_down(
+                window_id, rel_x, rel_y, button, button
+            ));
+        }
+
+        NEEDS_FULL_REDRAW = true;
+    }
+}
+
+// Handle mouse button up
+pub fn handle_mouse_up(button: u32) {
+    unsafe {
+        // End drag/resize
+        DRAG_WINDOW = 0;
+        RESIZE_WINDOW = 0;
+        RESIZE_BORDER = window::ResizeBorder::None;
+
+        let (x, y) = (CURSOR_X, CURSOR_Y);
+        let window_id = window::get_window_at_point(x, y);
+        if window_id != 0 {
+            if let Some(win) = window::get_window(window_id) {
+                let (client_x, client_y, _, _) = win.client_rect();
+                let rel_x = x - client_x;
+                let rel_y = y - client_y;
+                event::push_event(event::create_mouse_button_up(
+                    window_id, rel_x, rel_y, button, 0
+                ));
+            }
+        }
+    }
+}
+
+fn handle_resize_drag() {
+    unsafe {
+        let window_id = RESIZE_WINDOW;
+        if window_id == 0 {
+            return;
+        }
+
+        let dx = CURSOR_X - RESIZE_START_X;
+        let dy = CURSOR_Y - RESIZE_START_Y;
+
+        let mut new_w = RESIZE_START_W;
+        let mut new_h = RESIZE_START_H;
+        let mut new_x = RESIZE_START_WIN_X;
+        let mut new_y = RESIZE_START_WIN_Y;
+
+        match RESIZE_BORDER {
+            window::ResizeBorder::Right => {
+                new_w = ((RESIZE_START_W as i32) + dx) as u32;
+            },
+            window::ResizeBorder::Bottom => {
+                new_h = ((RESIZE_START_H as i32) + dy) as u32;
+            },
+            window::ResizeBorder::BottomRight => {
+                new_w = ((RESIZE_START_W as i32) + dx) as u32;
+                new_h = ((RESIZE_START_H as i32) + dy) as u32;
+            },
+            window::ResizeBorder::Left => {
+                new_w = ((RESIZE_START_W as i32) - dx) as u32;
+                new_x = RESIZE_START_WIN_X + dx;
+            },
+            window::ResizeBorder::Top => {
+                new_h = ((RESIZE_START_H as i32) - dy) as u32;
+                new_y = RESIZE_START_WIN_Y + dy;
+            },
+            window::ResizeBorder::TopLeft => {
+                new_w = ((RESIZE_START_W as i32) - dx) as u32;
+                new_h = ((RESIZE_START_H as i32) - dy) as u32;
+                new_x = RESIZE_START_WIN_X + dx;
+                new_y = RESIZE_START_WIN_Y + dy;
+            },
+            window::ResizeBorder::TopRight => {
+                new_w = ((RESIZE_START_W as i32) + dx) as u32;
+                new_h = ((RESIZE_START_H as i32) - dy) as u32;
+                new_y = RESIZE_START_WIN_Y + dy;
+            },
+            window::ResizeBorder::BottomLeft => {
+                new_w = ((RESIZE_START_W as i32) - dx) as u32;
+                new_h = ((RESIZE_START_H as i32) + dy) as u32;
+                new_x = RESIZE_START_WIN_X + dx;
+            },
+            _ => {}
+        }
+
+        // Clamp to minimum size
+        if new_w < 100 { new_w = 100; }
+        if new_h < 50 { new_h = 50; }
+
+        window::move_window(window_id, new_x, new_y);
+        window::resize_window(window_id, new_w, new_h);
+    }
+}
+
+// Handle keyboard input
+pub fn handle_key_press(scancode: u32, keycode: u32, character: u32) {
+    unsafe {
+        let modifiers = event::get_modifiers();
+        event::set_key_state(keycode, true);
+
+        let focused = window::get_focused_window();
+        if focused != 0 {
+            event::push_event(event::create_key_press(
+                focused, keycode, scancode, modifiers, character
+            ));
+        }
+    }
+}
+
+pub fn handle_key_release(scancode: u32, keycode: u32) {
+    unsafe {
+        let modifiers = event::get_modifiers();
+        event::set_key_state(keycode, false);
+
+        let focused = window::get_focused_window();
+        if focused != 0 {
+            event::push_event(event::create_key_release(
+                focused, keycode, scancode, modifiers
+            ));
+        }
+    }
+}
+
+// ============================================================
+// Screen Info
+// ============================================================
+
+pub fn get_screen_size() -> (u32, u32) {
+    unsafe { (SCREEN_WIDTH, SCREEN_HEIGHT) }
+}
+
+pub fn is_initialized() -> bool {
+    unsafe { COMPOSITOR_INITIALIZED }
+}

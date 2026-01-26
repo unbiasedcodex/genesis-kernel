@@ -1,0 +1,526 @@
+// Slab Allocator for Small Objects
+// Provides O(1) allocation/deallocation for fixed-size objects
+// Reduces fragmentation for frequent small allocations (DOM nodes, style objects)
+
+// ============================================================
+// Constants
+// ============================================================
+
+const PAGE_SIZE: u64 = 4096;
+
+// Slab sizes for different object classes
+const SLAB_SIZE_32: u64 = 32;
+const SLAB_SIZE_64: u64 = 64;
+const SLAB_SIZE_128: u64 = 128;
+const SLAB_SIZE_256: u64 = 256;
+const SLAB_SIZE_512: u64 = 512;
+
+const NUM_SLAB_CLASSES: u64 = 5;
+
+// Objects per slab (one page per slab)
+const OBJECTS_PER_SLAB_32: u64 = 127;   // 4096 / 32 - 1 for header
+const OBJECTS_PER_SLAB_64: u64 = 63;    // 4096 / 64 - 1 for header
+const OBJECTS_PER_SLAB_128: u64 = 31;   // 4096 / 128 - 1 for header
+const OBJECTS_PER_SLAB_256: u64 = 15;   // 4096 / 256 - 1 for header
+const OBJECTS_PER_SLAB_512: u64 = 7;    // 4096 / 512 - 1 for header
+
+// ============================================================
+// Slab Header (stored at start of each slab page)
+// ============================================================
+
+#[repr(C)]
+struct SlabHeader {
+    next_slab: u64,      // Pointer to next slab in list
+    free_list: u64,      // Head of free object list in this slab
+    free_count: u64,     // Number of free objects
+    object_size: u64,    // Size of objects in this slab
+    total_objects: u64,  // Total number of objects in slab
+    class_index: u64,    // Index of slab class (0-4)
+    magic: u64,          // Magic number for validation
+    _pad: u64,           // Padding to 64 bytes
+}
+
+const SLAB_MAGIC: u64 = 0xSLAB0000_CAFEBABE;
+const SLAB_HEADER_SIZE: u64 = 64;
+
+// ============================================================
+// Free Object Entry (embedded in free objects)
+// ============================================================
+
+#[repr(C)]
+struct FreeObject {
+    next: u64,           // Pointer to next free object
+}
+
+// ============================================================
+// Slab Class (manages all slabs of one size)
+// ============================================================
+
+#[repr(C)]
+struct SlabClass {
+    object_size: u64,    // Size of objects
+    objects_per_slab: u64,  // Objects per slab page
+    partial_list: u64,   // List of partially free slabs
+    full_list: u64,      // List of completely full slabs
+    empty_list: u64,     // List of completely empty slabs
+    total_allocated: u64, // Total objects allocated
+    total_slabs: u64,    // Total slab pages
+}
+
+// ============================================================
+// State
+// ============================================================
+
+// Slab classes indexed by size class (0=32, 1=64, 2=128, 3=256, 4=512)
+static mut SLAB_CLASSES: [SlabClass; 5] = [
+    SlabClass { object_size: 32, objects_per_slab: 127, partial_list: 0, full_list: 0, empty_list: 0, total_allocated: 0, total_slabs: 0 },
+    SlabClass { object_size: 64, objects_per_slab: 63, partial_list: 0, full_list: 0, empty_list: 0, total_allocated: 0, total_slabs: 0 },
+    SlabClass { object_size: 128, objects_per_slab: 31, partial_list: 0, full_list: 0, empty_list: 0, total_allocated: 0, total_slabs: 0 },
+    SlabClass { object_size: 256, objects_per_slab: 15, partial_list: 0, full_list: 0, empty_list: 0, total_allocated: 0, total_slabs: 0 },
+    SlabClass { object_size: 512, objects_per_slab: 7, partial_list: 0, full_list: 0, empty_list: 0, total_allocated: 0, total_slabs: 0 },
+];
+
+static mut SLAB_INITIALIZED: bool = false;
+
+// Function pointer for page allocation
+static mut PAGE_ALLOC_FN: u64 = 0;
+static mut PAGE_FREE_FN: u64 = 0;
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Initialize slab allocator
+// page_alloc: function to allocate physical pages
+// page_free: function to free physical pages
+pub fn init(page_alloc: fn() -> u64, page_free: fn(u64)) {
+    unsafe {
+        PAGE_ALLOC_FN = page_alloc as u64;
+        PAGE_FREE_FN = page_free as u64;
+
+        // Initialize slab classes
+        SLAB_CLASSES[0] = SlabClass {
+            object_size: SLAB_SIZE_32,
+            objects_per_slab: OBJECTS_PER_SLAB_32,
+            partial_list: 0,
+            full_list: 0,
+            empty_list: 0,
+            total_allocated: 0,
+            total_slabs: 0,
+        };
+        SLAB_CLASSES[1] = SlabClass {
+            object_size: SLAB_SIZE_64,
+            objects_per_slab: OBJECTS_PER_SLAB_64,
+            partial_list: 0,
+            full_list: 0,
+            empty_list: 0,
+            total_allocated: 0,
+            total_slabs: 0,
+        };
+        SLAB_CLASSES[2] = SlabClass {
+            object_size: SLAB_SIZE_128,
+            objects_per_slab: OBJECTS_PER_SLAB_128,
+            partial_list: 0,
+            full_list: 0,
+            empty_list: 0,
+            total_allocated: 0,
+            total_slabs: 0,
+        };
+        SLAB_CLASSES[3] = SlabClass {
+            object_size: SLAB_SIZE_256,
+            objects_per_slab: OBJECTS_PER_SLAB_256,
+            partial_list: 0,
+            full_list: 0,
+            empty_list: 0,
+            total_allocated: 0,
+            total_slabs: 0,
+        };
+        SLAB_CLASSES[4] = SlabClass {
+            object_size: SLAB_SIZE_512,
+            objects_per_slab: OBJECTS_PER_SLAB_512,
+            partial_list: 0,
+            full_list: 0,
+            empty_list: 0,
+            total_allocated: 0,
+            total_slabs: 0,
+        };
+
+        SLAB_INITIALIZED = true;
+    }
+}
+
+// ============================================================
+// Size Class Selection
+// ============================================================
+
+// Get size class index for given size (returns -1 if too large)
+fn get_size_class(size: u64) -> i64 {
+    if size <= SLAB_SIZE_32 {
+        return 0;
+    }
+    if size <= SLAB_SIZE_64 {
+        return 1;
+    }
+    if size <= SLAB_SIZE_128 {
+        return 2;
+    }
+    if size <= SLAB_SIZE_256 {
+        return 3;
+    }
+    if size <= SLAB_SIZE_512 {
+        return 4;
+    }
+    -1  // Too large for slab allocator
+}
+
+// ============================================================
+// Slab Creation
+// ============================================================
+
+// Create a new slab for the given class
+fn create_slab(class_index: u64) -> u64 {
+    unsafe {
+        if PAGE_ALLOC_FN == 0 {
+            return 0;
+        }
+
+        let page_alloc: fn() -> u64 = core::mem::transmute(PAGE_ALLOC_FN);
+        let page = page_alloc();
+        if page == 0 {
+            return 0;
+        }
+
+        let class = &SLAB_CLASSES[class_index as usize];
+        let object_size = class.object_size;
+        let objects_per_slab = class.objects_per_slab;
+
+        // Initialize slab header
+        let header = page as *mut SlabHeader;
+        volatile_write_u64(&mut (*header).next_slab as *mut u64, 0);
+        volatile_write_u64(&mut (*header).free_count as *mut u64, objects_per_slab);
+        volatile_write_u64(&mut (*header).object_size as *mut u64, object_size);
+        volatile_write_u64(&mut (*header).total_objects as *mut u64, objects_per_slab);
+        volatile_write_u64(&mut (*header).class_index as *mut u64, class_index);
+        volatile_write_u64(&mut (*header).magic as *mut u64, SLAB_MAGIC);
+
+        // Initialize free list - chain all objects together
+        let first_object = page + SLAB_HEADER_SIZE;
+        volatile_write_u64(&mut (*header).free_list as *mut u64, first_object);
+
+        let mut i: u64 = 0;
+        while i < objects_per_slab {
+            let obj_addr = first_object + (i * object_size);
+            let next_addr = if i + 1 < objects_per_slab {
+                first_object + ((i + 1) * object_size)
+            } else {
+                0  // Last object
+            };
+
+            let obj = obj_addr as *mut FreeObject;
+            volatile_write_u64(&mut (*obj).next as *mut u64, next_addr);
+
+            i = i + 1;
+        }
+
+        // Update class stats
+        SLAB_CLASSES[class_index as usize].total_slabs =
+            SLAB_CLASSES[class_index as usize].total_slabs + 1;
+
+        page
+    }
+}
+
+// ============================================================
+// Allocation
+// ============================================================
+
+// Allocate object from slab allocator
+// Returns null if size > 512 (use heap allocator instead)
+pub fn alloc(size: u64) -> *mut u8 {
+    unsafe {
+        if !SLAB_INITIALIZED {
+            return 0 as *mut u8;
+        }
+
+        let class_idx = get_size_class(size);
+        if class_idx < 0 {
+            return 0 as *mut u8;  // Too large for slab
+        }
+
+        let class_index = class_idx as u64;
+        let class = &mut SLAB_CLASSES[class_index as usize];
+
+        // Try to get from partial list first
+        let mut slab = class.partial_list;
+
+        // If no partial slabs, try empty list
+        if slab == 0 {
+            slab = class.empty_list;
+            if slab != 0 {
+                // Move from empty to partial
+                let header = slab as *mut SlabHeader;
+                let next = volatile_read_u64(&(*header).next_slab as *const u64);
+                class.empty_list = next;
+                volatile_write_u64(&mut (*header).next_slab as *mut u64, class.partial_list);
+                class.partial_list = slab;
+            }
+        }
+
+        // If still no slab, create new one
+        if slab == 0 {
+            slab = create_slab(class_index);
+            if slab == 0 {
+                return 0 as *mut u8;  // Out of memory
+            }
+            // Add to partial list
+            let header = slab as *mut SlabHeader;
+            volatile_write_u64(&mut (*header).next_slab as *mut u64, class.partial_list);
+            class.partial_list = slab;
+        }
+
+        // Allocate from slab's free list
+        let header = slab as *mut SlabHeader;
+        let free_list = volatile_read_u64(&(*header).free_list as *const u64);
+
+        if free_list == 0 {
+            return 0 as *mut u8;  // Should not happen
+        }
+
+        // Get object from free list
+        let obj = free_list as *mut FreeObject;
+        let next_free = volatile_read_u64(&(*obj).next as *const u64);
+        volatile_write_u64(&mut (*header).free_list as *mut u64, next_free);
+
+        // Update free count
+        let free_count = volatile_read_u64(&(*header).free_count as *const u64);
+        volatile_write_u64(&mut (*header).free_count as *mut u64, free_count - 1);
+
+        // If slab is now full, move to full list
+        if free_count - 1 == 0 {
+            // Remove from partial list
+            class.partial_list = volatile_read_u64(&(*header).next_slab as *const u64);
+            // Add to full list
+            volatile_write_u64(&mut (*header).next_slab as *mut u64, class.full_list);
+            class.full_list = slab;
+        }
+
+        class.total_allocated = class.total_allocated + 1;
+
+        free_list as *mut u8
+    }
+}
+
+// Allocate zeroed memory from slab
+pub fn alloc_zeroed(size: u64) -> *mut u8 {
+    let ptr = alloc(size);
+    if ptr as u64 != 0 {
+        // Zero the memory
+        let actual_size = get_actual_size(size);
+        let mut i: u64 = 0;
+        while i < actual_size {
+            unsafe {
+                let byte_ptr = (ptr as u64 + i) as *mut u8;
+                volatile_write_u8(byte_ptr, 0);
+            }
+            i = i + 1;
+        }
+    }
+    ptr
+}
+
+// Get actual allocation size for a requested size
+fn get_actual_size(size: u64) -> u64 {
+    if size <= SLAB_SIZE_32 { return SLAB_SIZE_32; }
+    if size <= SLAB_SIZE_64 { return SLAB_SIZE_64; }
+    if size <= SLAB_SIZE_128 { return SLAB_SIZE_128; }
+    if size <= SLAB_SIZE_256 { return SLAB_SIZE_256; }
+    if size <= SLAB_SIZE_512 { return SLAB_SIZE_512; }
+    0
+}
+
+// ============================================================
+// Deallocation
+// ============================================================
+
+// Free object back to slab
+// ptr must have been allocated by slab_alloc
+pub fn free(ptr: *mut u8) {
+    if ptr as u64 == 0 {
+        return;
+    }
+
+    unsafe {
+        // Find slab header (at page boundary)
+        let ptr_addr = ptr as u64;
+        let slab = ptr_addr & 0xFFFFFFFFFFFFF000;  // Page-align down
+
+        let header = slab as *mut SlabHeader;
+
+        // Validate magic
+        let magic = volatile_read_u64(&(*header).magic as *const u64);
+        if magic != SLAB_MAGIC {
+            return;  // Invalid pointer
+        }
+
+        let class_index = volatile_read_u64(&(*header).class_index as *const u64);
+        if class_index >= NUM_SLAB_CLASSES {
+            return;  // Invalid class
+        }
+
+        let class = &mut SLAB_CLASSES[class_index as usize];
+
+        // Get current state
+        let free_count = volatile_read_u64(&(*header).free_count as *const u64);
+        let total_objects = volatile_read_u64(&(*header).total_objects as *const u64);
+        let was_full = free_count == 0;
+
+        // Add object to slab's free list
+        let obj = ptr_addr as *mut FreeObject;
+        let old_free_list = volatile_read_u64(&(*header).free_list as *const u64);
+        volatile_write_u64(&mut (*obj).next as *mut u64, old_free_list);
+        volatile_write_u64(&mut (*header).free_list as *mut u64, ptr_addr);
+        volatile_write_u64(&mut (*header).free_count as *mut u64, free_count + 1);
+
+        // Update lists if state changed
+        if was_full {
+            // Move from full to partial list
+            // Find and remove from full list
+            let mut prev: u64 = 0;
+            let mut curr = class.full_list;
+            while curr != 0 && curr != slab {
+                let curr_header = curr as *mut SlabHeader;
+                prev = curr;
+                curr = volatile_read_u64(&(*curr_header).next_slab as *const u64);
+            }
+
+            if curr == slab {
+                let next = volatile_read_u64(&(*header).next_slab as *const u64);
+                if prev == 0 {
+                    class.full_list = next;
+                } else {
+                    let prev_header = prev as *mut SlabHeader;
+                    volatile_write_u64(&mut (*prev_header).next_slab as *mut u64, next);
+                }
+
+                // Add to partial list
+                volatile_write_u64(&mut (*header).next_slab as *mut u64, class.partial_list);
+                class.partial_list = slab;
+            }
+        } else if free_count + 1 == total_objects {
+            // Slab is now empty, move to empty list
+            // Find and remove from partial list
+            let mut prev: u64 = 0;
+            let mut curr = class.partial_list;
+            while curr != 0 && curr != slab {
+                let curr_header = curr as *mut SlabHeader;
+                prev = curr;
+                curr = volatile_read_u64(&(*curr_header).next_slab as *const u64);
+            }
+
+            if curr == slab {
+                let next = volatile_read_u64(&(*header).next_slab as *const u64);
+                if prev == 0 {
+                    class.partial_list = next;
+                } else {
+                    let prev_header = prev as *mut SlabHeader;
+                    volatile_write_u64(&mut (*prev_header).next_slab as *mut u64, next);
+                }
+
+                // Add to empty list
+                volatile_write_u64(&mut (*header).next_slab as *mut u64, class.empty_list);
+                class.empty_list = slab;
+            }
+        }
+
+        if class.total_allocated > 0 {
+            class.total_allocated = class.total_allocated - 1;
+        }
+    }
+}
+
+// ============================================================
+// Statistics
+// ============================================================
+
+pub fn get_total_allocated(class_index: u64) -> u64 {
+    unsafe {
+        if class_index >= NUM_SLAB_CLASSES {
+            return 0;
+        }
+        SLAB_CLASSES[class_index as usize].total_allocated
+    }
+}
+
+pub fn get_total_slabs(class_index: u64) -> u64 {
+    unsafe {
+        if class_index >= NUM_SLAB_CLASSES {
+            return 0;
+        }
+        SLAB_CLASSES[class_index as usize].total_slabs
+    }
+}
+
+pub fn get_object_size(class_index: u64) -> u64 {
+    unsafe {
+        if class_index >= NUM_SLAB_CLASSES {
+            return 0;
+        }
+        SLAB_CLASSES[class_index as usize].object_size
+    }
+}
+
+// Check if a size can be handled by slab allocator
+pub fn can_handle(size: u64) -> bool {
+    get_size_class(size) >= 0
+}
+
+// Get total memory used by slab allocator
+pub fn get_total_memory() -> u64 {
+    unsafe {
+        let mut total: u64 = 0;
+        let mut i: u64 = 0;
+        while i < NUM_SLAB_CLASSES {
+            total = total + (SLAB_CLASSES[i as usize].total_slabs * PAGE_SIZE);
+            i = i + 1;
+        }
+        total
+    }
+}
+
+// ============================================================
+// Shrink (return empty slabs to system)
+// ============================================================
+
+// Release empty slabs back to page allocator
+pub fn shrink() {
+    unsafe {
+        if PAGE_FREE_FN == 0 {
+            return;
+        }
+
+        let page_free: fn(u64) = core::mem::transmute(PAGE_FREE_FN);
+
+        let mut i: u64 = 0;
+        while i < NUM_SLAB_CLASSES {
+            let class = &mut SLAB_CLASSES[i as usize];
+
+            // Free all empty slabs
+            let mut slab = class.empty_list;
+            while slab != 0 {
+                let header = slab as *mut SlabHeader;
+                let next = volatile_read_u64(&(*header).next_slab as *const u64);
+
+                // Clear magic before freeing
+                volatile_write_u64(&mut (*header).magic as *mut u64, 0);
+
+                page_free(slab);
+                class.total_slabs = class.total_slabs - 1;
+
+                slab = next;
+            }
+            class.empty_list = 0;
+
+            i = i + 1;
+        }
+    }
+}

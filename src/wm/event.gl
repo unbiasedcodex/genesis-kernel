@@ -1,0 +1,404 @@
+// Window Manager Event System
+// Handles input events and event delivery to windows
+
+// ============================================================
+// Event Types
+// ============================================================
+
+pub const EVENT_NONE: u32 = 0;
+pub const EVENT_KEY_PRESS: u32 = 1;
+pub const EVENT_KEY_RELEASE: u32 = 2;
+pub const EVENT_MOUSE_MOVE: u32 = 3;
+pub const EVENT_MOUSE_BUTTON_DOWN: u32 = 4;
+pub const EVENT_MOUSE_BUTTON_UP: u32 = 5;
+pub const EVENT_MOUSE_SCROLL: u32 = 6;
+pub const EVENT_WINDOW_CLOSE: u32 = 7;
+pub const EVENT_WINDOW_RESIZE: u32 = 8;
+pub const EVENT_WINDOW_FOCUS: u32 = 9;
+pub const EVENT_WINDOW_UNFOCUS: u32 = 10;
+pub const EVENT_WINDOW_EXPOSE: u32 = 11;
+
+// Mouse buttons
+pub const MOUSE_BUTTON_LEFT: u32 = 1;
+pub const MOUSE_BUTTON_RIGHT: u32 = 2;
+pub const MOUSE_BUTTON_MIDDLE: u32 = 4;
+
+// Key modifiers
+pub const KEY_MOD_SHIFT: u32 = 1;
+pub const KEY_MOD_CTRL: u32 = 2;
+pub const KEY_MOD_ALT: u32 = 4;
+pub const KEY_MOD_SUPER: u32 = 8;
+
+// ============================================================
+// Event Structure
+// ============================================================
+
+#[repr(C)]
+pub struct WmEvent {
+    pub event_type: u32,     // Type of event
+    pub window_id: u32,      // Target window ID (0 for global)
+    pub timestamp: u64,      // Event timestamp (ms since boot)
+    pub data: EventData,     // Event-specific data
+}
+
+#[repr(C)]
+pub union EventData {
+    pub key: KeyEvent,
+    pub mouse: MouseEvent,
+    pub resize: ResizeEvent,
+    pub raw: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct KeyEvent {
+    pub keycode: u32,        // Hardware keycode
+    pub scancode: u32,       // Raw scancode
+    pub modifiers: u32,      // Active modifiers
+    pub character: u32,      // Unicode character (0 if none)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MouseEvent {
+    pub x: i32,              // X position (screen or window relative)
+    pub y: i32,              // Y position
+    pub dx: i32,             // Delta X for move events
+    pub dy: i32,             // Delta Y for move events
+    pub button: u32,         // Button for click events
+    pub buttons: u32,        // Currently held buttons mask
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ResizeEvent {
+    pub width: u32,
+    pub height: u32,
+    pub old_width: u32,
+    pub old_height: u32,
+}
+
+// ============================================================
+// Event Queue
+// ============================================================
+
+const EVENT_QUEUE_SIZE: u64 = 256;
+
+#[repr(C)]
+struct EventQueue {
+    events: [WmEvent; 256],
+    head: u64,               // Next event to read
+    tail: u64,               // Next slot to write
+    count: u64,              // Number of events in queue
+}
+
+static mut GLOBAL_EVENT_QUEUE: EventQueue = EventQueue {
+    events: [WmEvent {
+        event_type: 0,
+        window_id: 0,
+        timestamp: 0,
+        data: EventData { raw: [0; 4] },
+    }; 256],
+    head: 0,
+    tail: 0,
+    count: 0,
+};
+
+// Per-window event queues (stored in window structure)
+
+// ============================================================
+// Event Queue Operations
+// ============================================================
+
+// Push event to global queue
+pub fn push_event(event: WmEvent) -> bool {
+    unsafe {
+        if GLOBAL_EVENT_QUEUE.count >= EVENT_QUEUE_SIZE {
+            return false;  // Queue full
+        }
+
+        let tail = GLOBAL_EVENT_QUEUE.tail;
+        GLOBAL_EVENT_QUEUE.events[tail as usize] = event;
+        GLOBAL_EVENT_QUEUE.tail = (tail + 1) % EVENT_QUEUE_SIZE;
+        GLOBAL_EVENT_QUEUE.count = GLOBAL_EVENT_QUEUE.count + 1;
+        true
+    }
+}
+
+// Pop event from global queue
+pub fn pop_event() -> Option<WmEvent> {
+    unsafe {
+        if GLOBAL_EVENT_QUEUE.count == 0 {
+            return None;
+        }
+
+        let head = GLOBAL_EVENT_QUEUE.head;
+        let event = GLOBAL_EVENT_QUEUE.events[head as usize];
+        GLOBAL_EVENT_QUEUE.head = (head + 1) % EVENT_QUEUE_SIZE;
+        GLOBAL_EVENT_QUEUE.count = GLOBAL_EVENT_QUEUE.count - 1;
+        Some(event)
+    }
+}
+
+// Peek at next event without removing
+pub fn peek_event() -> Option<WmEvent> {
+    unsafe {
+        if GLOBAL_EVENT_QUEUE.count == 0 {
+            return None;
+        }
+
+        let head = GLOBAL_EVENT_QUEUE.head;
+        Some(GLOBAL_EVENT_QUEUE.events[head as usize])
+    }
+}
+
+// Check if queue has events
+pub fn has_events() -> bool {
+    unsafe { GLOBAL_EVENT_QUEUE.count > 0 }
+}
+
+// Get number of events in queue
+pub fn event_count() -> u64 {
+    unsafe { GLOBAL_EVENT_QUEUE.count }
+}
+
+// Clear all events
+pub fn clear_events() {
+    unsafe {
+        GLOBAL_EVENT_QUEUE.head = 0;
+        GLOBAL_EVENT_QUEUE.tail = 0;
+        GLOBAL_EVENT_QUEUE.count = 0;
+    }
+}
+
+// ============================================================
+// Event Creation Helpers
+// ============================================================
+
+// Get current timestamp (ticks since boot)
+fn get_timestamp() -> u64 {
+    // TODO: Get actual time from system timer
+    0
+}
+
+pub fn create_key_press(window_id: u32, keycode: u32, scancode: u32, modifiers: u32, character: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_KEY_PRESS,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            key: KeyEvent {
+                keycode: keycode,
+                scancode: scancode,
+                modifiers: modifiers,
+                character: character,
+            },
+        },
+    }
+}
+
+pub fn create_key_release(window_id: u32, keycode: u32, scancode: u32, modifiers: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_KEY_RELEASE,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            key: KeyEvent {
+                keycode: keycode,
+                scancode: scancode,
+                modifiers: modifiers,
+                character: 0,
+            },
+        },
+    }
+}
+
+pub fn create_mouse_move(window_id: u32, x: i32, y: i32, dx: i32, dy: i32, buttons: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_MOUSE_MOVE,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            mouse: MouseEvent {
+                x: x,
+                y: y,
+                dx: dx,
+                dy: dy,
+                button: 0,
+                buttons: buttons,
+            },
+        },
+    }
+}
+
+pub fn create_mouse_button_down(window_id: u32, x: i32, y: i32, button: u32, buttons: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_MOUSE_BUTTON_DOWN,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            mouse: MouseEvent {
+                x: x,
+                y: y,
+                dx: 0,
+                dy: 0,
+                button: button,
+                buttons: buttons,
+            },
+        },
+    }
+}
+
+pub fn create_mouse_button_up(window_id: u32, x: i32, y: i32, button: u32, buttons: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_MOUSE_BUTTON_UP,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            mouse: MouseEvent {
+                x: x,
+                y: y,
+                dx: 0,
+                dy: 0,
+                button: button,
+                buttons: buttons,
+            },
+        },
+    }
+}
+
+pub fn create_window_close(window_id: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_WINDOW_CLOSE,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData { raw: [0; 4] },
+    }
+}
+
+pub fn create_window_resize(window_id: u32, width: u32, height: u32, old_width: u32, old_height: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_WINDOW_RESIZE,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData {
+            resize: ResizeEvent {
+                width: width,
+                height: height,
+                old_width: old_width,
+                old_height: old_height,
+            },
+        },
+    }
+}
+
+pub fn create_window_focus(window_id: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_WINDOW_FOCUS,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData { raw: [0; 4] },
+    }
+}
+
+pub fn create_window_unfocus(window_id: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_WINDOW_UNFOCUS,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData { raw: [0; 4] },
+    }
+}
+
+pub fn create_window_expose(window_id: u32) -> WmEvent {
+    WmEvent {
+        event_type: EVENT_WINDOW_EXPOSE,
+        window_id: window_id,
+        timestamp: get_timestamp(),
+        data: EventData { raw: [0; 4] },
+    }
+}
+
+// ============================================================
+// Keyboard State Tracking
+// ============================================================
+
+static mut KEY_STATES: [u8; 256] = [0; 256];  // 1 = pressed, 0 = released
+static mut KEY_MODIFIERS: u32 = 0;
+
+pub fn set_key_state(keycode: u32, pressed: bool) {
+    unsafe {
+        if keycode < 256 {
+            KEY_STATES[keycode as usize] = if pressed { 1 } else { 0 };
+        }
+
+        // Update modifiers
+        match keycode {
+            42 | 54 => {  // Left/Right Shift
+                if pressed {
+                    KEY_MODIFIERS = KEY_MODIFIERS | KEY_MOD_SHIFT;
+                } else {
+                    KEY_MODIFIERS = KEY_MODIFIERS & (!KEY_MOD_SHIFT);
+                }
+            },
+            29 | 97 => {  // Left/Right Ctrl
+                if pressed {
+                    KEY_MODIFIERS = KEY_MODIFIERS | KEY_MOD_CTRL;
+                } else {
+                    KEY_MODIFIERS = KEY_MODIFIERS & (!KEY_MOD_CTRL);
+                }
+            },
+            56 | 100 => {  // Left/Right Alt
+                if pressed {
+                    KEY_MODIFIERS = KEY_MODIFIERS | KEY_MOD_ALT;
+                } else {
+                    KEY_MODIFIERS = KEY_MODIFIERS & (!KEY_MOD_ALT);
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+pub fn is_key_pressed(keycode: u32) -> bool {
+    unsafe {
+        if keycode < 256 {
+            KEY_STATES[keycode as usize] == 1
+        } else {
+            false
+        }
+    }
+}
+
+pub fn get_modifiers() -> u32 {
+    unsafe { KEY_MODIFIERS }
+}
+
+// ============================================================
+// Mouse State Tracking
+// ============================================================
+
+static mut MOUSE_X: i32 = 0;
+static mut MOUSE_Y: i32 = 0;
+static mut MOUSE_BUTTONS: u32 = 0;
+
+pub fn update_mouse_position(x: i32, y: i32) {
+    unsafe {
+        MOUSE_X = x;
+        MOUSE_Y = y;
+    }
+}
+
+pub fn update_mouse_buttons(buttons: u32) {
+    unsafe {
+        MOUSE_BUTTONS = buttons;
+    }
+}
+
+pub fn get_mouse_position() -> (i32, i32) {
+    unsafe { (MOUSE_X, MOUSE_Y) }
+}
+
+pub fn get_mouse_buttons() -> u32 {
+    unsafe { MOUSE_BUTTONS }
+}

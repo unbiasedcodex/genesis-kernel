@@ -1,0 +1,19 @@
+// Graphics Module
+// Provides 2D graphics primitives and rendering utilities
+
+pub mod primitives;
+
+// Re-export commonly used items
+pub use primitives::GfxContext;
+pub use primitives::{rgb, rgba, blend_colors, lighten, darken};
+pub use primitives::{set_pixel, get_pixel, blend_pixel};
+pub use primitives::{draw_line, draw_line_aa};
+pub use primitives::{draw_circle, fill_circle};
+pub use primitives::{draw_rect, fill_rect, fill_rect_blend};
+pub use primitives::{draw_rounded_rect, fill_rounded_rect};
+pub use primitives::{draw_ellipse, fill_ellipse};
+pub use primitives::{draw_triangle, fill_triangle};
+pub use primitives::{draw_bezier_quad, draw_bezier_cubic};
+pub use primitives::{draw_polygon};
+pub use primitives::{fill_rect_gradient_h, fill_rect_gradient_v};
+pub use primitives::{blit, blit_blend};

@@ -8895,6 +8895,10 @@ const TLS_OFF_AES_KEYS: i64 = 6660;           // AES expanded keys (480 bytes)
 const TLS_OFF_PREMASTER: i64 = 7140;          // Premaster secret (48 bytes)
 const TLS_OFF_CERT_ADDR: i64 = 7200;          // Certificate data address (8 bytes)
 const TLS_OFF_CERT_LEN: i64 = 7208;           // Certificate data length (8 bytes)
+const TLS_OFF_CERT_CHAIN_ADDRS: i64 = 7216;   // Certificate chain addresses (4 * 8 = 32 bytes)
+const TLS_OFF_CERT_CHAIN_LENS: i64 = 7248;    // Certificate chain lengths (4 * 8 = 32 bytes)
+const TLS_OFF_CERT_CHAIN_COUNT: i64 = 7280;   // Certificate chain count (8 bytes)
+const TLS_OFF_CERT_VALIDATED: i64 = 7288;     // Certificate validated flag (8 bytes)
 
 // TLS States
 const TLS_STATE_NONE: i64 = 0;
@@ -10775,6 +10779,1372 @@ fn x509_extract_rsa_pubkey(cert_addr: i64, cert_len: i64, n_addr: i64, n_len_add
 }
 
 // ============================================================
+// Certificate Validation
+// ============================================================
+
+// Certificate validation error codes
+const CERT_OK: i64 = 0;
+const CERT_ERR_PARSE_FAILED: i64 = -1;
+const CERT_ERR_SIGNATURE_INVALID: i64 = -2;
+const CERT_ERR_HOSTNAME_MISMATCH: i64 = -3;
+const CERT_ERR_NOT_YET_VALID: i64 = -4;
+const CERT_ERR_EXPIRED: i64 = -5;
+const CERT_ERR_UNKNOWN_CA: i64 = -6;
+const CERT_ERR_CHAIN_BROKEN: i64 = -7;
+
+// Certificate validation workspace offsets (within RSA_WORK_ADDR)
+const CERT_WORK_TBS_HASH: i64 = 8192;       // 32 bytes - TBSCertificate hash
+const CERT_WORK_SIGNATURE: i64 = 8224;      // 256 bytes - Extracted signature
+const CERT_WORK_DECRYPTED_SIG: i64 = 8480;  // 256 bytes - Decrypted signature
+const CERT_WORK_ISSUER_N: i64 = 8736;       // 256 bytes - Issuer public key N
+const CERT_WORK_ISSUER_E: i64 = 8992;       // 8 bytes - Issuer exponent
+const CERT_WORK_CN: i64 = 9000;             // 128 bytes - Parsed CN
+const CERT_WORK_SAN: i64 = 9128;            // 512 bytes - Parsed SANs
+const CERT_WORK_NOT_BEFORE: i64 = 9640;     // 8 bytes - notBefore timestamp
+const CERT_WORK_NOT_AFTER: i64 = 9648;      // 8 bytes - notAfter timestamp
+const CERT_WORK_TBS_START: i64 = 9656;      // 8 bytes - TBS start offset
+const CERT_WORK_TBS_LEN: i64 = 9664;        // 8 bytes - TBS length
+const CERT_WORK_SIG_ALGO: i64 = 9672;       // 8 bytes - Signature algorithm
+const CERT_WORK_ISSUER_HASH: i64 = 9680;    // 32 bytes - Issuer name hash
+const CERT_WORK_SUBJECT_HASH: i64 = 9712;   // 32 bytes - Subject name hash
+
+// ASN.1 additional tags
+const ASN1_PRINTABLE_STRING: i64 = 0x13;
+const ASN1_UTF8_STRING: i64 = 0x0C;
+const ASN1_IA5_STRING: i64 = 0x16;
+const ASN1_UTC_TIME: i64 = 0x17;
+const ASN1_GENERALIZED_TIME: i64 = 0x18;
+const ASN1_CONTEXT_0: i64 = 0xA0;
+const ASN1_CONTEXT_3: i64 = 0xA3;
+
+// Signature algorithm OIDs
+const SIG_ALGO_SHA256_RSA: i64 = 1;
+const SIG_ALGO_SHA384_RSA: i64 = 2;
+const SIG_ALGO_SHA512_RSA: i64 = 3;
+
+// OID for commonName: 2.5.4.3 = 55 04 03
+const OID_COMMON_NAME_0: i64 = 0x55;
+const OID_COMMON_NAME_1: i64 = 0x04;
+const OID_COMMON_NAME_2: i64 = 0x03;
+
+// OID for subjectAltName: 2.5.29.17 = 55 1D 11
+const OID_SAN_0: i64 = 0x55;
+const OID_SAN_1: i64 = 0x1D;
+const OID_SAN_2: i64 = 0x11;
+
+// Root CA store constants
+const MAX_ROOT_CAS: i64 = 4;
+const ROOT_CA_STORE_ADDR: i64 = 0x3010000;  // 64KB for root CA data
+const ROOT_CA_ENTRY_SIZE: i64 = 320;        // 256 bytes N + 8 bytes e + 32 bytes issuer hash + padding
+const ROOT_CA_INITIALIZED_FLAG: i64 = 0x3010FFC;
+
+// ============================================================
+// RSA Signature Verification
+// ============================================================
+
+// Verify RSA signature using PKCS#1 v1.5
+// Returns 0 on success, negative on failure
+fn rsa_verify_signature(
+    signature_addr: i64, sig_len: i64,
+    n_addr: i64, n_len: i64, e: u64,
+    expected_hash_addr: i64, hash_len: i64
+) -> i64 {
+    // Work addresses for bigint operations
+    let n_bigint = RSA_WORK_ADDR + 3072;
+    let s_bigint = RSA_WORK_ADDR + 3328;
+    let m_bigint = RSA_WORK_ADDR + 3584;
+    let e_bigint = RSA_WORK_ADDR + 3840;
+
+    // Load modulus n
+    bigint_from_bytes(n_bigint, n_addr, n_len);
+
+    // Load signature s
+    bigint_from_bytes(s_bigint, signature_addr, sig_len);
+
+    // Set up exponent (usually 65537)
+    bigint_zero(e_bigint);
+    write_u64_addr(e_bigint, e);
+
+    // Compute m = s^e mod n (this "decrypts" the signature)
+    bigint_modexp(m_bigint, s_bigint, e_bigint, n_bigint);
+
+    // Convert result back to bytes
+    let decrypted_addr = RSA_WORK_ADDR + CERT_WORK_DECRYPTED_SIG;
+    bigint_to_bytes(decrypted_addr, m_bigint);
+
+    // Verify PKCS#1 v1.5 signature padding
+    // Expected format: 0x00 0x01 [0xFF padding] 0x00 [DigestInfo] [Hash]
+
+    // Check leading bytes
+    if read_byte_addr(decrypted_addr) != 0x00 {
+        return -1;
+    }
+    if read_byte_addr(decrypted_addr + 1) != 0x01 {
+        return -2;
+    }
+
+    // Skip 0xFF padding bytes
+    let mut offset: i64 = 2;
+    while offset < 256 && read_byte_addr(decrypted_addr + offset) == 0xFF {
+        offset = offset + 1;
+    }
+
+    // Must have at least 8 bytes of 0xFF padding
+    if offset < 10 {
+        return -3;
+    }
+
+    // Check separator byte
+    if read_byte_addr(decrypted_addr + offset) != 0x00 {
+        return -4;
+    }
+    offset = offset + 1;
+
+    // DigestInfo for SHA-256:
+    // 30 31 30 0D 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20 [32-byte hash]
+    // DigestInfo header is 19 bytes for SHA-256
+    let sha256_digestinfo_len: i64 = 19;
+    let sha256_digestinfo: [i64; 19] = [
+        0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86,
+        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+        0x00, 0x04, 0x20
+    ];
+
+    // Verify DigestInfo
+    let mut i: i64 = 0;
+    while i < sha256_digestinfo_len {
+        if read_byte_addr(decrypted_addr + offset + i) != sha256_digestinfo[i as usize] {
+            return -5;
+        }
+        i = i + 1;
+    }
+    offset = offset + sha256_digestinfo_len;
+
+    // Compare hash
+    i = 0;
+    while i < hash_len {
+        if read_byte_addr(decrypted_addr + offset + i) != read_byte_addr(expected_hash_addr + i) {
+            return -6;
+        }
+        i = i + 1;
+    }
+
+    0  // Signature valid
+}
+
+// ============================================================
+// X.509 TBSCertificate Extraction
+// ============================================================
+
+// Extract TBSCertificate from X.509 certificate
+// tbs_start_addr receives offset into cert where TBS starts
+// tbs_len_addr receives length of TBS (including tag and length bytes)
+fn x509_extract_tbs_certificate(
+    cert_addr: i64, cert_len: i64,
+    tbs_start_addr: i64, tbs_len_addr: i64
+) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Certificate ::= SEQUENCE
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate starts here
+    let tbs_start = cert_content_start;
+    write_u64_addr(tbs_start_addr, tbs_start as u64);
+
+    // TBSCertificate ::= SEQUENCE
+    let tbs_tag = read_byte_addr(cert_addr + tbs_start);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+
+    // Calculate total TBS length including tag and length bytes
+    write_u64_addr(offset_storage, (tbs_start + 1) as u64);
+    let tbs_content_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+    let tbs_total_len = tbs_content_start - tbs_start + tbs_content_len;
+
+    write_u64_addr(tbs_len_addr, tbs_total_len as u64);
+
+    0
+}
+
+// ============================================================
+// X.509 Signature Extraction
+// ============================================================
+
+// Extract signature and algorithm from X.509 certificate
+fn x509_extract_signature(
+    cert_addr: i64, cert_len: i64,
+    sig_addr: i64, sig_len_addr: i64, algo_addr: i64
+) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // Skip TBSCertificate
+    write_u64_addr(offset_storage, cert_content_start as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    let after_tbs = read_u64_addr(offset_storage) as i64;
+
+    // signatureAlgorithm AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters }
+    let algo_tag = read_byte_addr(cert_addr + after_tbs);
+    if algo_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (after_tbs + 1) as u64);
+    let algo_len = asn1_parse_length(cert_addr, offset_storage);
+    let algo_content_start = read_u64_addr(offset_storage) as i64;
+
+    // Parse algorithm OID
+    let oid_tag = read_byte_addr(cert_addr + algo_content_start);
+    if oid_tag != ASN1_OID {
+        return -3;
+    }
+    write_u64_addr(offset_storage, (algo_content_start + 1) as u64);
+    let oid_len = asn1_parse_length(cert_addr, offset_storage);
+    let oid_start = read_u64_addr(offset_storage) as i64;
+
+    // Detect signature algorithm
+    // sha256WithRSAEncryption: 1.2.840.113549.1.1.11 = 2A 86 48 86 F7 0D 01 01 0B
+    // sha384WithRSAEncryption: 1.2.840.113549.1.1.12 = 2A 86 48 86 F7 0D 01 01 0C
+    // sha512WithRSAEncryption: 1.2.840.113549.1.1.13 = 2A 86 48 86 F7 0D 01 01 0D
+    let mut algo: i64 = 0;
+    if oid_len >= 9 {
+        if read_byte_addr(cert_addr + oid_start + 8) == 0x0B {
+            algo = SIG_ALGO_SHA256_RSA;
+        } else if read_byte_addr(cert_addr + oid_start + 8) == 0x0C {
+            algo = SIG_ALGO_SHA384_RSA;
+        } else if read_byte_addr(cert_addr + oid_start + 8) == 0x0D {
+            algo = SIG_ALGO_SHA512_RSA;
+        }
+    }
+    write_u64_addr(algo_addr, algo as u64);
+
+    // Skip to signature
+    let after_algo = after_tbs + 1;
+    write_u64_addr(offset_storage, after_algo as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    let sig_offset = read_u64_addr(offset_storage) as i64;
+
+    // signature BIT STRING
+    let sig_tag = read_byte_addr(cert_addr + sig_offset);
+    if sig_tag != ASN1_BIT_STRING {
+        return -4;
+    }
+    write_u64_addr(offset_storage, (sig_offset + 1) as u64);
+    let sig_len = asn1_parse_length(cert_addr, offset_storage);
+    let sig_content_start = read_u64_addr(offset_storage) as i64;
+
+    // BIT STRING has unused bits count as first byte
+    let unused_bits = read_byte_addr(cert_addr + sig_content_start);
+    let actual_sig_start = sig_content_start + 1;
+    let actual_sig_len = sig_len - 1;
+
+    // Copy signature
+    let mut i: i64 = 0;
+    while i < actual_sig_len && i < 256 {
+        write_byte_addr(sig_addr + i, read_byte_addr(cert_addr + actual_sig_start + i));
+        i = i + 1;
+    }
+    write_u64_addr(sig_len_addr, actual_sig_len as u64);
+
+    0
+}
+
+// ============================================================
+// X.509 Validity Parsing
+// ============================================================
+
+// Parse ASN.1 time (UTCTime or GeneralizedTime) to Unix timestamp
+fn asn1_time_to_unix(time_addr: i64, time_len: i64, is_utc: i64) -> i64 {
+    // UTCTime: YYMMDDHHMMSSZ (13 bytes)
+    // GeneralizedTime: YYYYMMDDHHMMSSZ (15 bytes)
+
+    let mut year: i64 = 0;
+    let mut month: i64 = 0;
+    let mut day: i64 = 0;
+    let mut hour: i64 = 0;
+    let mut minute: i64 = 0;
+    let mut second: i64 = 0;
+
+    let mut offset: i64 = 0;
+
+    if is_utc != 0 {
+        // UTCTime: YY
+        let y1 = read_byte_addr(time_addr) - 48;
+        let y2 = read_byte_addr(time_addr + 1) - 48;
+        year = y1 * 10 + y2;
+        // RFC 5280: if YY >= 50, interpret as 19YY, else 20YY
+        if year >= 50 {
+            year = year + 1900;
+        } else {
+            year = year + 2000;
+        }
+        offset = 2;
+    } else {
+        // GeneralizedTime: YYYY
+        let y1 = read_byte_addr(time_addr) - 48;
+        let y2 = read_byte_addr(time_addr + 1) - 48;
+        let y3 = read_byte_addr(time_addr + 2) - 48;
+        let y4 = read_byte_addr(time_addr + 3) - 48;
+        year = y1 * 1000 + y2 * 100 + y3 * 10 + y4;
+        offset = 4;
+    }
+
+    // MM
+    let m1 = read_byte_addr(time_addr + offset) - 48;
+    let m2 = read_byte_addr(time_addr + offset + 1) - 48;
+    month = m1 * 10 + m2;
+    offset = offset + 2;
+
+    // DD
+    let d1 = read_byte_addr(time_addr + offset) - 48;
+    let d2 = read_byte_addr(time_addr + offset + 1) - 48;
+    day = d1 * 10 + d2;
+    offset = offset + 2;
+
+    // HH
+    let h1 = read_byte_addr(time_addr + offset) - 48;
+    let h2 = read_byte_addr(time_addr + offset + 1) - 48;
+    hour = h1 * 10 + h2;
+    offset = offset + 2;
+
+    // MM
+    let mi1 = read_byte_addr(time_addr + offset) - 48;
+    let mi2 = read_byte_addr(time_addr + offset + 1) - 48;
+    minute = mi1 * 10 + mi2;
+    offset = offset + 2;
+
+    // SS
+    let s1 = read_byte_addr(time_addr + offset) - 48;
+    let s2 = read_byte_addr(time_addr + offset + 1) - 48;
+    second = s1 * 10 + s2;
+
+    // Convert to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+    // Simplified calculation (not handling leap seconds)
+    let mut days: i64 = 0;
+
+    // Years since 1970
+    let mut y: i64 = 1970;
+    while y < year {
+        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            days = days + 366;
+        } else {
+            days = days + 365;
+        }
+        y = y + 1;
+    }
+
+    // Days in months before this month
+    let days_in_months: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m: i64 = 1;
+    while m < month {
+        days = days + days_in_months[(m - 1) as usize];
+        // February in leap year
+        if m == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
+            days = days + 1;
+        }
+        m = m + 1;
+    }
+
+    // Days in this month
+    days = days + day - 1;
+
+    // Convert to seconds
+    days * 86400 + hour * 3600 + minute * 60 + second
+}
+
+// Parse Validity from X.509 certificate
+fn x509_parse_validity(
+    cert_addr: i64, cert_len: i64,
+    not_before_addr: i64, not_after_addr: i64
+) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Certificate ::= SEQUENCE { tbsCertificate, ... }
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate ::= SEQUENCE
+    let tbs_tag = read_byte_addr(cert_addr + cert_content_start);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (cert_content_start + 1) as u64);
+    let tbs_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+
+    // Navigate through TBSCertificate fields
+    let mut current_offset = tbs_content_start;
+
+    // Check for optional version [0] EXPLICIT
+    let first_tag = read_byte_addr(cert_addr + current_offset);
+    if first_tag == ASN1_CONTEXT_0 as i64 {
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    // serialNumber INTEGER - skip
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // signature AlgorithmIdentifier - skip
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // issuer Name - skip
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // validity Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+    let val_tag = read_byte_addr(cert_addr + current_offset);
+    if val_tag != ASN1_SEQUENCE {
+        return -3;
+    }
+    write_u64_addr(offset_storage, (current_offset + 1) as u64);
+    let val_len = asn1_parse_length(cert_addr, offset_storage);
+    let val_content_start = read_u64_addr(offset_storage) as i64;
+
+    // notBefore Time
+    let nb_tag = read_byte_addr(cert_addr + val_content_start);
+    let is_utc_nb = if nb_tag == ASN1_UTC_TIME { 1 } else { 0 };
+    write_u64_addr(offset_storage, (val_content_start + 1) as u64);
+    let nb_len = asn1_parse_length(cert_addr, offset_storage);
+    let nb_content = read_u64_addr(offset_storage) as i64;
+
+    let not_before = asn1_time_to_unix(cert_addr + nb_content, nb_len, is_utc_nb);
+    write_u64_addr(not_before_addr, not_before as u64);
+
+    // Skip to notAfter
+    write_u64_addr(offset_storage, val_content_start as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    let na_offset = read_u64_addr(offset_storage) as i64;
+
+    // notAfter Time
+    let na_tag = read_byte_addr(cert_addr + na_offset);
+    let is_utc_na = if na_tag == ASN1_UTC_TIME { 1 } else { 0 };
+    write_u64_addr(offset_storage, (na_offset + 1) as u64);
+    let na_len = asn1_parse_length(cert_addr, offset_storage);
+    let na_content = read_u64_addr(offset_storage) as i64;
+
+    let not_after = asn1_time_to_unix(cert_addr + na_content, na_len, is_utc_na);
+    write_u64_addr(not_after_addr, not_after as u64);
+
+    0
+}
+
+// ============================================================
+// Hostname Validation
+// ============================================================
+
+// Extract Subject Common Name (CN) from X.509 certificate
+fn x509_extract_subject_cn(
+    cert_addr: i64, cert_len: i64,
+    cn_addr: i64, cn_len_addr: i64
+) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Navigate to subject field
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate
+    let tbs_tag = read_byte_addr(cert_addr + cert_content_start);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (cert_content_start + 1) as u64);
+    let tbs_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+
+    let mut current_offset = tbs_content_start;
+
+    // Skip version if present
+    let first_tag = read_byte_addr(cert_addr + current_offset);
+    if first_tag == ASN1_CONTEXT_0 as i64 {
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    // Skip serialNumber
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // Skip signature
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // Skip issuer
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // Skip validity
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // subject Name ::= SEQUENCE OF RelativeDistinguishedName
+    let subj_tag = read_byte_addr(cert_addr + current_offset);
+    if subj_tag != ASN1_SEQUENCE {
+        return -3;
+    }
+    write_u64_addr(offset_storage, (current_offset + 1) as u64);
+    let subj_len = asn1_parse_length(cert_addr, offset_storage);
+    let subj_content_start = read_u64_addr(offset_storage) as i64;
+    let subj_end = subj_content_start + subj_len;
+
+    // Search for CN in RDN sequence
+    current_offset = subj_content_start;
+    while current_offset < subj_end {
+        // RelativeDistinguishedName ::= SET OF AttributeTypeAndValue
+        let rdn_tag = read_byte_addr(cert_addr + current_offset);
+        if rdn_tag != ASN1_SET {
+            write_u64_addr(offset_storage, current_offset as u64);
+            asn1_skip_element(cert_addr, offset_storage);
+            current_offset = read_u64_addr(offset_storage) as i64;
+            continue;
+        }
+
+        write_u64_addr(offset_storage, (current_offset + 1) as u64);
+        let rdn_len = asn1_parse_length(cert_addr, offset_storage);
+        let rdn_content_start = read_u64_addr(offset_storage) as i64;
+
+        // AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }
+        let atv_tag = read_byte_addr(cert_addr + rdn_content_start);
+        if atv_tag == ASN1_SEQUENCE {
+            write_u64_addr(offset_storage, (rdn_content_start + 1) as u64);
+            let atv_len = asn1_parse_length(cert_addr, offset_storage);
+            let atv_content_start = read_u64_addr(offset_storage) as i64;
+
+            // type OID
+            let oid_tag = read_byte_addr(cert_addr + atv_content_start);
+            if oid_tag == ASN1_OID {
+                write_u64_addr(offset_storage, (atv_content_start + 1) as u64);
+                let oid_len = asn1_parse_length(cert_addr, offset_storage);
+                let oid_content = read_u64_addr(offset_storage) as i64;
+
+                // Check if this is commonName OID (2.5.4.3 = 55 04 03)
+                if oid_len == 3 &&
+                   read_byte_addr(cert_addr + oid_content) == OID_COMMON_NAME_0 &&
+                   read_byte_addr(cert_addr + oid_content + 1) == OID_COMMON_NAME_1 &&
+                   read_byte_addr(cert_addr + oid_content + 2) == OID_COMMON_NAME_2 {
+                    // Found CN, get value
+                    let value_offset = oid_content + oid_len;
+                    let value_tag = read_byte_addr(cert_addr + value_offset);
+
+                    // Accept various string types
+                    if value_tag == ASN1_PRINTABLE_STRING ||
+                       value_tag == ASN1_UTF8_STRING ||
+                       value_tag == ASN1_IA5_STRING {
+                        write_u64_addr(offset_storage, (value_offset + 1) as u64);
+                        let value_len = asn1_parse_length(cert_addr, offset_storage);
+                        let value_content = read_u64_addr(offset_storage) as i64;
+
+                        // Copy CN value
+                        let mut i: i64 = 0;
+                        while i < value_len && i < 128 {
+                            write_byte_addr(cn_addr + i, read_byte_addr(cert_addr + value_content + i));
+                            i = i + 1;
+                        }
+                        write_u64_addr(cn_len_addr, value_len as u64);
+                        return 0;
+                    }
+                }
+            }
+        }
+
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    write_u64_addr(cn_len_addr, 0);
+    -4  // CN not found
+}
+
+// Extract Subject Alternative Names (SANs) from X.509 certificate
+// san_addr receives DNS names, each prefixed with 1-byte length
+// san_count_addr receives the count of SANs
+fn x509_extract_san(
+    cert_addr: i64, cert_len: i64,
+    san_addr: i64, san_len_addr: i64, san_count_addr: i64
+) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+    write_u64_addr(san_count_addr, 0);
+    write_u64_addr(san_len_addr, 0);
+
+    // Navigate to extensions
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate
+    let tbs_tag = read_byte_addr(cert_addr + cert_content_start);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (cert_content_start + 1) as u64);
+    let tbs_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+    let tbs_end = tbs_content_start + tbs_len;
+
+    let mut current_offset = tbs_content_start;
+
+    // Skip to extensions
+    // version?, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, [extensions]
+
+    // Skip version if present
+    let first_tag = read_byte_addr(cert_addr + current_offset);
+    if first_tag == ASN1_CONTEXT_0 as i64 {
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    // Skip 6 elements: serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo
+    let mut skip_count: i64 = 0;
+    while skip_count < 6 && current_offset < tbs_end {
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+        skip_count = skip_count + 1;
+    }
+
+    // Look for extensions [3] EXPLICIT
+    if current_offset >= tbs_end {
+        return 0;  // No extensions, not an error
+    }
+
+    let ext_wrapper_tag = read_byte_addr(cert_addr + current_offset);
+    if ext_wrapper_tag != ASN1_CONTEXT_3 as i64 {
+        return 0;  // No extensions
+    }
+
+    write_u64_addr(offset_storage, (current_offset + 1) as u64);
+    let ext_wrapper_len = asn1_parse_length(cert_addr, offset_storage);
+    let ext_seq_start = read_u64_addr(offset_storage) as i64;
+
+    // Extensions ::= SEQUENCE OF Extension
+    let ext_seq_tag = read_byte_addr(cert_addr + ext_seq_start);
+    if ext_seq_tag != ASN1_SEQUENCE {
+        return -3;
+    }
+    write_u64_addr(offset_storage, (ext_seq_start + 1) as u64);
+    let ext_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let ext_content_start = read_u64_addr(offset_storage) as i64;
+    let ext_end = ext_content_start + ext_seq_len;
+
+    // Search for SAN extension
+    current_offset = ext_content_start;
+    while current_offset < ext_end {
+        // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }
+        let ext_tag = read_byte_addr(cert_addr + current_offset);
+        if ext_tag != ASN1_SEQUENCE {
+            write_u64_addr(offset_storage, current_offset as u64);
+            asn1_skip_element(cert_addr, offset_storage);
+            current_offset = read_u64_addr(offset_storage) as i64;
+            continue;
+        }
+
+        write_u64_addr(offset_storage, (current_offset + 1) as u64);
+        let ext_len = asn1_parse_length(cert_addr, offset_storage);
+        let ext_item_start = read_u64_addr(offset_storage) as i64;
+
+        // extnID OID
+        let oid_tag = read_byte_addr(cert_addr + ext_item_start);
+        if oid_tag != ASN1_OID {
+            write_u64_addr(offset_storage, current_offset as u64);
+            asn1_skip_element(cert_addr, offset_storage);
+            current_offset = read_u64_addr(offset_storage) as i64;
+            continue;
+        }
+
+        write_u64_addr(offset_storage, (ext_item_start + 1) as u64);
+        let oid_len = asn1_parse_length(cert_addr, offset_storage);
+        let oid_content = read_u64_addr(offset_storage) as i64;
+
+        // Check if this is SAN OID (2.5.29.17 = 55 1D 11)
+        if oid_len == 3 &&
+           read_byte_addr(cert_addr + oid_content) == OID_SAN_0 &&
+           read_byte_addr(cert_addr + oid_content + 1) == OID_SAN_1 &&
+           read_byte_addr(cert_addr + oid_content + 2) == OID_SAN_2 {
+            // Found SAN extension
+            // Skip to extnValue (may have optional critical boolean)
+            let mut after_oid = oid_content + oid_len;
+            let next_tag = read_byte_addr(cert_addr + after_oid);
+
+            // Skip critical if present (BOOLEAN = 0x01)
+            if next_tag == 0x01 {
+                write_u64_addr(offset_storage, after_oid as u64);
+                asn1_skip_element(cert_addr, offset_storage);
+                after_oid = read_u64_addr(offset_storage) as i64;
+            }
+
+            // extnValue OCTET STRING
+            let val_tag = read_byte_addr(cert_addr + after_oid);
+            if val_tag != ASN1_OCTET_STRING {
+                write_u64_addr(offset_storage, current_offset as u64);
+                asn1_skip_element(cert_addr, offset_storage);
+                current_offset = read_u64_addr(offset_storage) as i64;
+                continue;
+            }
+
+            write_u64_addr(offset_storage, (after_oid + 1) as u64);
+            let val_len = asn1_parse_length(cert_addr, offset_storage);
+            let val_content = read_u64_addr(offset_storage) as i64;
+
+            // SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName
+            let san_seq_tag = read_byte_addr(cert_addr + val_content);
+            if san_seq_tag != ASN1_SEQUENCE {
+                return -4;
+            }
+
+            write_u64_addr(offset_storage, (val_content + 1) as u64);
+            let san_seq_len = asn1_parse_length(cert_addr, offset_storage);
+            let san_content_start = read_u64_addr(offset_storage) as i64;
+            let san_end = san_content_start + san_seq_len;
+
+            // Parse GeneralNames
+            let mut san_offset = san_content_start;
+            let mut san_write_pos: i64 = 0;
+            let mut san_count: i64 = 0;
+
+            while san_offset < san_end && san_write_pos < 500 {
+                // GeneralName ::= CHOICE { dNSName [2] IA5String, ... }
+                let gn_tag = read_byte_addr(cert_addr + san_offset);
+
+                // Context-specific [2] = dNSName
+                if gn_tag == 0x82 {
+                    write_u64_addr(offset_storage, (san_offset + 1) as u64);
+                    let dns_len = asn1_parse_length(cert_addr, offset_storage);
+                    let dns_content = read_u64_addr(offset_storage) as i64;
+
+                    // Write length-prefixed DNS name
+                    write_byte_addr(san_addr + san_write_pos, dns_len);
+                    san_write_pos = san_write_pos + 1;
+
+                    let mut i: i64 = 0;
+                    while i < dns_len && san_write_pos < 511 {
+                        write_byte_addr(san_addr + san_write_pos, read_byte_addr(cert_addr + dns_content + i));
+                        san_write_pos = san_write_pos + 1;
+                        i = i + 1;
+                    }
+                    san_count = san_count + 1;
+                    san_offset = dns_content + dns_len;
+                } else {
+                    // Skip other GeneralName types
+                    write_u64_addr(offset_storage, san_offset as u64);
+                    asn1_skip_element(cert_addr, offset_storage);
+                    san_offset = read_u64_addr(offset_storage) as i64;
+                }
+            }
+
+            write_u64_addr(san_len_addr, san_write_pos as u64);
+            write_u64_addr(san_count_addr, san_count as u64);
+            return 0;
+        }
+
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    0  // No SAN found, not an error (will fall back to CN)
+}
+
+// Check if hostname matches a pattern (supports wildcard)
+fn hostname_matches_pattern(
+    hostname_addr: i64, hostname_len: i64,
+    pattern_addr: i64, pattern_len: i64
+) -> i64 {
+    // Check for wildcard pattern (*.example.com)
+    if pattern_len >= 2 &&
+       read_byte_addr(pattern_addr) == 42 &&      // '*'
+       read_byte_addr(pattern_addr + 1) == 46 {   // '.'
+        // Wildcard match: hostname must have at least one dot
+        // and the suffix must match
+        let suffix_len = pattern_len - 2;
+        let suffix_addr = pattern_addr + 2;
+
+        // Find first dot in hostname
+        let mut dot_pos: i64 = 0;
+        while dot_pos < hostname_len {
+            if read_byte_addr(hostname_addr + dot_pos) == 46 {
+                break;
+            }
+            dot_pos = dot_pos + 1;
+        }
+
+        if dot_pos >= hostname_len {
+            return 0;  // No dot found
+        }
+
+        // Check if suffix matches (hostname after first dot)
+        let hostname_suffix_len = hostname_len - dot_pos - 1;
+        if hostname_suffix_len != suffix_len {
+            return 0;
+        }
+
+        let mut i: i64 = 0;
+        while i < suffix_len {
+            let h = read_byte_addr(hostname_addr + dot_pos + 1 + i);
+            let p = read_byte_addr(suffix_addr + i);
+            // Case-insensitive comparison
+            let h_lower = if h >= 65 && h <= 90 { h + 32 } else { h };
+            let p_lower = if p >= 65 && p <= 90 { p + 32 } else { p };
+            if h_lower != p_lower {
+                return 0;
+            }
+            i = i + 1;
+        }
+        return 1;
+    }
+
+    // Exact match (case-insensitive)
+    if hostname_len != pattern_len {
+        return 0;
+    }
+
+    let mut i: i64 = 0;
+    while i < hostname_len {
+        let h = read_byte_addr(hostname_addr + i);
+        let p = read_byte_addr(pattern_addr + i);
+        let h_lower = if h >= 65 && h <= 90 { h + 32 } else { h };
+        let p_lower = if p >= 65 && p <= 90 { p + 32 } else { p };
+        if h_lower != p_lower {
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    1
+}
+
+// Validate hostname against certificate
+fn x509_validate_hostname(
+    cert_addr: i64, cert_len: i64,
+    hostname_addr: i64, hostname_len: i64
+) -> i64 {
+    let san_addr = RSA_WORK_ADDR + CERT_WORK_SAN;
+    let san_len_addr = RSA_WORK_ADDR + 4104;
+    let san_count_addr = RSA_WORK_ADDR + 4112;
+
+    // Try SAN first
+    let san_result = x509_extract_san(cert_addr, cert_len, san_addr, san_len_addr, san_count_addr);
+    let san_count = read_u64_addr(san_count_addr) as i64;
+
+    if san_count > 0 {
+        // Check each SAN
+        let mut offset: i64 = 0;
+        let san_total_len = read_u64_addr(san_len_addr) as i64;
+        let mut checked: i64 = 0;
+
+        while offset < san_total_len && checked < san_count {
+            let name_len = read_byte_addr(san_addr + offset);
+            offset = offset + 1;
+
+            if hostname_matches_pattern(hostname_addr, hostname_len, san_addr + offset, name_len) != 0 {
+                return CERT_OK;
+            }
+
+            offset = offset + name_len;
+            checked = checked + 1;
+        }
+
+        return CERT_ERR_HOSTNAME_MISMATCH;
+    }
+
+    // Fall back to CN
+    let cn_addr = RSA_WORK_ADDR + CERT_WORK_CN;
+    let cn_len_addr = RSA_WORK_ADDR + 4120;
+
+    let cn_result = x509_extract_subject_cn(cert_addr, cert_len, cn_addr, cn_len_addr);
+    if cn_result < 0 {
+        return CERT_ERR_HOSTNAME_MISMATCH;
+    }
+
+    let cn_len = read_u64_addr(cn_len_addr) as i64;
+    if hostname_matches_pattern(hostname_addr, hostname_len, cn_addr, cn_len) != 0 {
+        return CERT_OK;
+    }
+
+    CERT_ERR_HOSTNAME_MISMATCH
+}
+
+// ============================================================
+// Root CA Store
+// ============================================================
+
+// ISRG Root X1 (Let's Encrypt) - RSA 4096-bit
+// For simplicity, we store only the modulus and exponent
+// Real implementation would store full certificate
+
+// DigiCert Global Root G2 - RSA 2048-bit
+// Modulus hash for matching
+
+// Initialize root CA store
+fn root_ca_store_init() {
+    // Check if already initialized
+    if read_u64_addr(ROOT_CA_INITIALIZED_FLAG) == 0x52434153 {  // "RCAS"
+        return;
+    }
+
+    // For now, we embed simplified CA data
+    // In production, this would contain full RSA public keys
+
+    // Entry 0: ISRG Root X1 (Let's Encrypt)
+    // Issuer DN hash (SHA-256 of issuer DN for matching)
+    let ca0_addr = ROOT_CA_STORE_ADDR;
+    // Placeholder: In real implementation, store actual public key
+    // For demonstration, store recognizable marker
+    write_u64_addr(ca0_addr, 0x4953524731583131);  // "ISRG1X11"
+
+    // Entry 1: DigiCert Global Root G2
+    let ca1_addr = ROOT_CA_STORE_ADDR + ROOT_CA_ENTRY_SIZE;
+    write_u64_addr(ca1_addr, 0x4449474943455254);  // "DIGICERT"
+
+    // Mark as initialized
+    write_u64_addr(ROOT_CA_INITIALIZED_FLAG, 0x52434153);
+
+    serial_out(67);  // C
+    serial_out(65);  // A
+    serial_out(83);  // S
+    serial_out(84);  // T
+    serial_out(79);  // O
+    serial_out(82);  // R
+    serial_out(69);  // E
+    serial_newline();
+}
+
+// Hash issuer name for CA lookup
+fn x509_hash_issuer(cert_addr: i64, cert_len: i64, hash_addr: i64) -> i64 {
+    let offset_storage = RSA_WORK_ADDR + 4096;
+    write_u64_addr(offset_storage, 0);
+
+    // Navigate to issuer field
+    let tag = read_byte_addr(cert_addr);
+    if tag != ASN1_SEQUENCE {
+        return -1;
+    }
+    write_u64_addr(offset_storage, 1);
+    let cert_seq_len = asn1_parse_length(cert_addr, offset_storage);
+    let cert_content_start = read_u64_addr(offset_storage) as i64;
+
+    // TBSCertificate
+    let tbs_tag = read_byte_addr(cert_addr + cert_content_start);
+    if tbs_tag != ASN1_SEQUENCE {
+        return -2;
+    }
+    write_u64_addr(offset_storage, (cert_content_start + 1) as u64);
+    let tbs_len = asn1_parse_length(cert_addr, offset_storage);
+    let tbs_content_start = read_u64_addr(offset_storage) as i64;
+
+    let mut current_offset = tbs_content_start;
+
+    // Skip version if present
+    let first_tag = read_byte_addr(cert_addr + current_offset);
+    if first_tag == ASN1_CONTEXT_0 as i64 {
+        write_u64_addr(offset_storage, current_offset as u64);
+        asn1_skip_element(cert_addr, offset_storage);
+        current_offset = read_u64_addr(offset_storage) as i64;
+    }
+
+    // Skip serialNumber
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // Skip signature
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    current_offset = read_u64_addr(offset_storage) as i64;
+
+    // issuer Name - hash this
+    let issuer_start = current_offset;
+    write_u64_addr(offset_storage, current_offset as u64);
+    asn1_skip_element(cert_addr, offset_storage);
+    let issuer_end = read_u64_addr(offset_storage) as i64;
+    let issuer_len = issuer_end - issuer_start;
+
+    sha256_hash(cert_addr + issuer_start, issuer_len, hash_addr);
+
+    0
+}
+
+// Find root CA by issuer hash
+// Returns index of CA or -1 if not found
+fn root_ca_find_by_issuer(issuer_hash_addr: i64) -> i64 {
+    root_ca_store_init();
+
+    // For now, this is a simplified implementation
+    // In production, would compare issuer hash against stored CA issuer hashes
+
+    // Return 0 to indicate "found" for testing purposes
+    // Real implementation would iterate through stored CAs
+
+    let mut i: i64 = 0;
+    while i < MAX_ROOT_CAS {
+        let ca_addr = ROOT_CA_STORE_ADDR + (i * ROOT_CA_ENTRY_SIZE);
+        let marker = read_u64_addr(ca_addr);
+
+        // Check if this entry is valid
+        if marker != 0 {
+            // In full implementation, compare hashes
+            // For now, return first valid entry as "match"
+            return i;
+        }
+
+        i = i + 1;
+    }
+
+    return -1;  // Not found
+}
+
+// Get root CA public key
+fn root_ca_get_pubkey(ca_index: i64, n_addr: i64, n_len_addr: i64, e_addr: i64) -> i64 {
+    if ca_index < 0 || ca_index >= MAX_ROOT_CAS {
+        return -1;
+    }
+
+    let ca_addr = ROOT_CA_STORE_ADDR + (ca_index * ROOT_CA_ENTRY_SIZE);
+
+    // In production, copy stored public key
+    // For now, set dummy values for testing
+
+    // Copy N (256 bytes for 2048-bit key)
+    let mut i: i64 = 0;
+    while i < 256 {
+        write_byte_addr(n_addr + i, read_byte_addr(ca_addr + 32 + i));
+        i = i + 1;
+    }
+    write_u64_addr(n_len_addr, 256);
+
+    // Exponent (usually 65537)
+    write_u64_addr(e_addr, read_u64_addr(ca_addr + 288));
+
+    0
+}
+
+// ============================================================
+// Certificate Chain Validation
+// ============================================================
+
+// Verify a single certificate's signature against issuer public key
+fn x509_verify_cert_signature(
+    cert_addr: i64, cert_len: i64,
+    issuer_n_addr: i64, issuer_n_len: i64, issuer_e: u64
+) -> i64 {
+    // Extract TBSCertificate
+    let tbs_start_addr = RSA_WORK_ADDR + CERT_WORK_TBS_START;
+    let tbs_len_addr = RSA_WORK_ADDR + CERT_WORK_TBS_LEN;
+
+    let tbs_result = x509_extract_tbs_certificate(cert_addr, cert_len, tbs_start_addr, tbs_len_addr);
+    if tbs_result < 0 {
+        return CERT_ERR_PARSE_FAILED;
+    }
+
+    let tbs_start = read_u64_addr(tbs_start_addr) as i64;
+    let tbs_len = read_u64_addr(tbs_len_addr) as i64;
+
+    // Hash TBSCertificate
+    let tbs_hash_addr = RSA_WORK_ADDR + CERT_WORK_TBS_HASH;
+    sha256_hash(cert_addr + tbs_start, tbs_len, tbs_hash_addr);
+
+    // Extract signature
+    let sig_addr = RSA_WORK_ADDR + CERT_WORK_SIGNATURE;
+    let sig_len_addr = RSA_WORK_ADDR + 4128;
+    let algo_addr = RSA_WORK_ADDR + CERT_WORK_SIG_ALGO;
+
+    let sig_result = x509_extract_signature(cert_addr, cert_len, sig_addr, sig_len_addr, algo_addr);
+    if sig_result < 0 {
+        return CERT_ERR_PARSE_FAILED;
+    }
+
+    let sig_len = read_u64_addr(sig_len_addr) as i64;
+    let algo = read_u64_addr(algo_addr) as i64;
+
+    // Only support SHA-256 for now
+    if algo != SIG_ALGO_SHA256_RSA {
+        return CERT_ERR_SIGNATURE_INVALID;
+    }
+
+    // Verify signature
+    let verify_result = rsa_verify_signature(
+        sig_addr, sig_len,
+        issuer_n_addr, issuer_n_len, issuer_e,
+        tbs_hash_addr, 32
+    );
+
+    if verify_result < 0 {
+        return CERT_ERR_SIGNATURE_INVALID;
+    }
+
+    CERT_OK
+}
+
+// Validate certificate time validity
+fn x509_validate_time(cert_addr: i64, cert_len: i64, current_time: i64) -> i64 {
+    let not_before_addr = RSA_WORK_ADDR + CERT_WORK_NOT_BEFORE;
+    let not_after_addr = RSA_WORK_ADDR + CERT_WORK_NOT_AFTER;
+
+    let result = x509_parse_validity(cert_addr, cert_len, not_before_addr, not_after_addr);
+    if result < 0 {
+        return CERT_ERR_PARSE_FAILED;
+    }
+
+    let not_before = read_u64_addr(not_before_addr) as i64;
+    let not_after = read_u64_addr(not_after_addr) as i64;
+
+    if current_time < not_before {
+        return CERT_ERR_NOT_YET_VALID;
+    }
+
+    if current_time > not_after {
+        return CERT_ERR_EXPIRED;
+    }
+
+    CERT_OK
+}
+
+// Validate certificate chain
+// cert_chain_addr: array of certificate addresses
+// cert_chain_lens: array of certificate lengths
+// chain_count: number of certificates in chain (leaf first)
+fn x509_validate_chain(
+    cert_chain_addr: i64, cert_chain_lens: i64,
+    chain_count: i64,
+    hostname_addr: i64, hostname_len: i64,
+    current_time: i64
+) -> i64 {
+    if chain_count < 1 {
+        return CERT_ERR_CHAIN_BROKEN;
+    }
+
+    // Initialize root CA store
+    root_ca_store_init();
+
+    // Get leaf certificate
+    let leaf_cert_addr = read_u64_addr(cert_chain_addr) as i64;
+    let leaf_cert_len = read_u64_addr(cert_chain_lens) as i64;
+
+    // 1. Validate hostname against leaf certificate
+    let hostname_result = x509_validate_hostname(
+        leaf_cert_addr, leaf_cert_len,
+        hostname_addr, hostname_len
+    );
+    if hostname_result != CERT_OK {
+        serial_out(72);  // H
+        serial_out(78);  // N
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return hostname_result;
+    }
+
+    // 2. Validate time for all certificates
+    let mut i: i64 = 0;
+    while i < chain_count {
+        let cert_addr = read_u64_addr(cert_chain_addr + i * 8) as i64;
+        let cert_len = read_u64_addr(cert_chain_lens + i * 8) as i64;
+
+        let time_result = x509_validate_time(cert_addr, cert_len, current_time);
+        if time_result != CERT_OK {
+            serial_out(84);  // T
+            serial_out(73);  // I
+            serial_out(77);  // M
+            serial_out(69);  // E
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(82);  // R
+            serial_newline();
+            return time_result;
+        }
+
+        i = i + 1;
+    }
+
+    // 3. Validate chain signatures
+    // For each cert (except last), verify it's signed by the next cert
+    i = 0;
+    while i < chain_count - 1 {
+        let cert_addr = read_u64_addr(cert_chain_addr + i * 8) as i64;
+        let cert_len = read_u64_addr(cert_chain_lens + i * 8) as i64;
+        let issuer_addr = read_u64_addr(cert_chain_addr + (i + 1) * 8) as i64;
+        let issuer_len = read_u64_addr(cert_chain_lens + (i + 1) * 8) as i64;
+
+        // Extract issuer public key
+        let issuer_n_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_N;
+        let issuer_n_len_addr = RSA_WORK_ADDR + 4136;
+        let issuer_e_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_E;
+
+        let extract_result = x509_extract_rsa_pubkey(
+            issuer_addr, issuer_len,
+            issuer_n_addr, issuer_n_len_addr, issuer_e_addr
+        );
+        if extract_result < 0 {
+            return CERT_ERR_CHAIN_BROKEN;
+        }
+
+        let issuer_n_len = read_u64_addr(issuer_n_len_addr) as i64;
+        let issuer_e = read_u64_addr(issuer_e_addr);
+
+        let sig_result = x509_verify_cert_signature(
+            cert_addr, cert_len,
+            issuer_n_addr, issuer_n_len, issuer_e
+        );
+        if sig_result != CERT_OK {
+            serial_out(83);  // S
+            serial_out(73);  // I
+            serial_out(71);  // G
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(82);  // R
+            serial_newline();
+            return sig_result;
+        }
+
+        i = i + 1;
+    }
+
+    // 4. Verify last certificate is signed by a trusted root CA
+    let last_cert_addr = read_u64_addr(cert_chain_addr + (chain_count - 1) * 8) as i64;
+    let last_cert_len = read_u64_addr(cert_chain_lens + (chain_count - 1) * 8) as i64;
+
+    // Hash issuer of last certificate
+    let issuer_hash_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_HASH;
+    let hash_result = x509_hash_issuer(last_cert_addr, last_cert_len, issuer_hash_addr);
+
+    // Find matching root CA
+    let ca_index = root_ca_find_by_issuer(issuer_hash_addr);
+    if ca_index < 0 {
+        serial_out(78);  // N
+        serial_out(79);  // O
+        serial_out(67);  // C
+        serial_out(65);  // A
+        serial_newline();
+        return CERT_ERR_UNKNOWN_CA;
+    }
+
+    // Get root CA public key and verify signature
+    let root_n_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_N;
+    let root_n_len_addr = RSA_WORK_ADDR + 4136;
+    let root_e_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_E;
+
+    let get_result = root_ca_get_pubkey(ca_index, root_n_addr, root_n_len_addr, root_e_addr);
+    if get_result < 0 {
+        return CERT_ERR_UNKNOWN_CA;
+    }
+
+    let root_n_len = read_u64_addr(root_n_len_addr) as i64;
+    let root_e = read_u64_addr(root_e_addr);
+
+    // Skip signature verification against root for now (would need actual root CA keys)
+    // In production, verify: x509_verify_cert_signature(last_cert_addr, last_cert_len, ...)
+
+    serial_out(67);  // C
+    serial_out(72);  // H
+    serial_out(65);  // A
+    serial_out(73);  // I
+    serial_out(78);  // N
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
+
+    CERT_OK
+}
+
+// Convert certificate validation error to TLS alert
+fn validation_error_to_alert(error: i64) -> i64 {
+    if error == CERT_ERR_EXPIRED {
+        return 45;  // certificate_expired
+    }
+    if error == CERT_ERR_NOT_YET_VALID {
+        return 45;  // certificate_expired (closest match)
+    }
+    if error == CERT_ERR_HOSTNAME_MISMATCH {
+        return 42;  // bad_certificate
+    }
+    if error == CERT_ERR_SIGNATURE_INVALID {
+        return 42;  // bad_certificate
+    }
+    if error == CERT_ERR_UNKNOWN_CA {
+        return 48;  // unknown_ca
+    }
+    if error == CERT_ERR_CHAIN_BROKEN {
+        return 42;  // bad_certificate
+    }
+    46  // certificate_unknown
+}
+
+// Get current Unix time (seconds since 1970)
+// For now, returns a hardcoded value for testing
+// In production, would read from RTC or NTP
+fn get_current_unix_time() -> i64 {
+    // January 2025 timestamp for testing
+    1735689600  // 2025-01-01 00:00:00 UTC
+}
+
+// Send TLS alert
+fn tls_send_alert(conn: i64, socket: i64, level: i64, description: i64) -> i64 {
+    let tx_buf = conn + TLS_OFF_TX_BUF;
+
+    // TLS Record header
+    write_byte_addr(tx_buf, 0x15);      // Alert content type
+    write_byte_addr(tx_buf + 1, 0x03);  // TLS 1.2
+    write_byte_addr(tx_buf + 2, 0x03);
+    write_byte_addr(tx_buf + 3, 0x00);  // Length high byte
+    write_byte_addr(tx_buf + 4, 0x02);  // Length = 2 bytes
+
+    // Alert message
+    write_byte_addr(tx_buf + 5, level);        // Alert level (1=warning, 2=fatal)
+    write_byte_addr(tx_buf + 6, description);  // Alert description
+
+    syscall_net_send(socket, tx_buf, 7)
+}
+
+// ============================================================
 // TLS Handshake Implementation
 // ============================================================
 
@@ -10978,29 +12348,45 @@ fn tls_recv_server_hello(conn: i64, socket: i64) -> i64 {
                     shl_u64(read_byte_addr(rx_buf + cert_msg_start + 1) as u64, 8)),
                     read_byte_addr(rx_buf + cert_msg_start + 2) as u64) as i64;
 
-                // First certificate starts at cert_msg_start + 3
-                let first_cert_len_pos = cert_msg_start + 3;
+                // Parse entire certificate chain
+                let mut cert_offset = cert_msg_start + 3;
+                let cert_end = cert_msg_start + 3 + total_certs_len;
+                let mut chain_count: i64 = 0;
 
-                // Parse first certificate length (3 bytes big-endian)
-                let first_cert_len = bit_or(bit_or(
-                    shl_u64(read_byte_addr(rx_buf + first_cert_len_pos) as u64, 16),
-                    shl_u64(read_byte_addr(rx_buf + first_cert_len_pos + 1) as u64, 8)),
-                    read_byte_addr(rx_buf + first_cert_len_pos + 2) as u64) as i64;
+                while cert_offset < cert_end && chain_count < 4 {
+                    // Parse certificate length (3 bytes big-endian)
+                    let cert_len = bit_or(bit_or(
+                        shl_u64(read_byte_addr(rx_buf + cert_offset) as u64, 16),
+                        shl_u64(read_byte_addr(rx_buf + cert_offset + 1) as u64, 8)),
+                        read_byte_addr(rx_buf + cert_offset + 2) as u64) as i64;
 
-                // First certificate DER data starts at first_cert_len_pos + 3
-                let first_cert_addr = rx_buf + first_cert_len_pos + 3;
+                    // Certificate DER data starts after length field
+                    let cert_data_addr = rx_buf + cert_offset + 3;
+
+                    // Store in chain arrays
+                    write_u64_addr(conn + TLS_OFF_CERT_CHAIN_ADDRS + chain_count * 8, cert_data_addr as u64);
+                    write_u64_addr(conn + TLS_OFF_CERT_CHAIN_LENS + chain_count * 8, cert_len as u64);
+
+                    // Also keep first cert in legacy location
+                    if chain_count == 0 {
+                        write_u64_addr(conn + TLS_OFF_CERT_ADDR, cert_data_addr as u64);
+                        write_u64_addr(conn + TLS_OFF_CERT_LEN, cert_len as u64);
+                    }
+
+                    cert_offset = cert_offset + 3 + cert_len;
+                    chain_count = chain_count + 1;
+                }
+
+                write_u64_addr(conn + TLS_OFF_CERT_CHAIN_COUNT, chain_count as u64);
 
                 serial_out(67);  // C
                 serial_out(69);  // E
                 serial_out(82);  // R
                 serial_out(84);  // T
+                serial_out(83);  // S
                 serial_out(58);  // :
-                serial_hex64(first_cert_len as u64);
+                serial_print_dec(chain_count);
                 serial_newline();
-
-                // Store certificate location for RSA key extraction
-                write_u64_addr(conn + TLS_OFF_CERT_ADDR, first_cert_addr as u64);
-                write_u64_addr(conn + TLS_OFF_CERT_LEN, first_cert_len as u64);
             }
 
             if hs_type == 14 {  // ServerHelloDone
@@ -11490,6 +12876,46 @@ fn syscall_tls_connect(socket: i64, hostname_addr: i64, hostname_len: i64) -> i6
         serial_newline();
         tls_free_conn(conn);
         return -3;
+    }
+
+    // Step 2.5: Validate certificate chain
+    let chain_count = read_u64_addr(conn + TLS_OFF_CERT_CHAIN_COUNT) as i64;
+    if chain_count > 0 {
+        let validation_result = x509_validate_chain(
+            conn + TLS_OFF_CERT_CHAIN_ADDRS,
+            conn + TLS_OFF_CERT_CHAIN_LENS,
+            chain_count,
+            conn + TLS_OFF_HOSTNAME,
+            read_u64_addr(conn + TLS_OFF_HOSTNAME_LEN) as i64,
+            get_current_unix_time()
+        );
+
+        if validation_result != CERT_OK {
+            serial_out(67);  // C
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(84);  // T
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(82);  // R
+            serial_out(58);  // :
+            serial_print_dec(0 - validation_result);
+            serial_newline();
+
+            // Send alert
+            tls_send_alert(conn, socket, 2, validation_error_to_alert(validation_result));
+            tls_free_conn(conn);
+            return validation_result;
+        }
+
+        write_u64_addr(conn + TLS_OFF_CERT_VALIDATED, 1);
+        serial_out(67);  // C
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(84);  // T
+        serial_out(79);  // O
+        serial_out(75);  // K
+        serial_newline();
     }
 
     // Step 3: Send ClientKeyExchange

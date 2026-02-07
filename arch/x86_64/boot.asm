@@ -185,9 +185,9 @@ _start_asm:
     or eax, PAGE_PRESENT | PAGE_WRITE | PAGE_USER
     mov [ecx], eax
 
-    ; PD[0..31] -> 32x 2MB pages (first 64MB identity mapped)
+    ; PD[0..63] -> 64x 2MB pages (first 128MB identity mapped)
     ; All pages marked PAGE_USER to allow ring 3 access (Phase 6 PoC)
-    ; Extended to 64MB for Pre-Runtime (K1.4)
+    ; Extended to 128MB for TLS state area at 0x4000000
     mov dword [edx +   0], 0x0000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx +   8], 0x0200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx +  16], 0x0400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
@@ -220,6 +220,39 @@ _start_asm:
     mov dword [edx + 232], 0x3A00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx + 240], 0x3C00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
     mov dword [edx + 248], 0x3E00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    ; Extended: 64MB - 128MB
+    mov dword [edx + 256], 0x4000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 264], 0x4200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 272], 0x4400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 280], 0x4600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 288], 0x4800000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 296], 0x4A00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 304], 0x4C00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 312], 0x4E00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 320], 0x5000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 328], 0x5200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 336], 0x5400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 344], 0x5600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 352], 0x5800000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 360], 0x5A00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 368], 0x5C00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 376], 0x5E00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 384], 0x6000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 392], 0x6200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 400], 0x6400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 408], 0x6600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 416], 0x6800000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 424], 0x6A00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 432], 0x6C00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 440], 0x6E00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 448], 0x7000000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 456], 0x7200000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 464], 0x7400000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 472], 0x7600000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 480], 0x7800000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 488], 0x7A00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 496], 0x7C00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
+    mov dword [edx + 504], 0x7E00000 | PAGE_PRESENT | PAGE_WRITE | PAGE_HUGE | PAGE_USER
 
     ; Load CR3 with PML4 address
     mov eax, ebx

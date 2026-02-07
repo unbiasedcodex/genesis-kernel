@@ -108,6 +108,14 @@ run-net-vga: iso
 		-device e1000,netdev=net0 \
 		-m 128M
 
+# Run with network + TLS proxy (socat on gateway, guest connects to 10.0.2.2:4443)
+# Start: socat TCP-LISTEN:4443,reuseaddr,fork TCP:amazon.com:443 &
+run-tls-test: iso
+	qemu-system-x86_64 -cdrom $(ISO) \
+		-netdev user,id=net0,hostfwd=tcp::8080-:80 \
+		-device e1000,netdev=net0 \
+		-serial stdio -display none -m 128M
+
 # Clean build artifacts
 clean:
 	rm -f $(KERNEL) kernel64.elf $(OBJS) $(ISO) test.img

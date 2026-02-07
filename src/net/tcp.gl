@@ -3237,3 +3237,16 @@ fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i6
     // Send via E1000
     tcp_e1000_send(frame, TCP_ETH_HEADER_SIZE + total_ip_len)
 }
+
+// Public function to poll and process all pending E1000 packets
+// Called from syscall_net_poll() to drive packet reception after tcp_socket_connect()
+pub fn tcp_poll_pending_packets() -> i64 {
+    let mut processed: i64 = 0;
+    let mut pkt_len = tcp_e1000_recv_check();
+    while pkt_len > 0 && processed < 32 {
+        tcp_poll_incoming_with_len(pkt_len);
+        processed = processed + 1;
+        pkt_len = tcp_e1000_recv_check();
+    }
+    processed
+}

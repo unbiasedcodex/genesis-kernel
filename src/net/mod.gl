@@ -548,6 +548,7 @@ pub fn net_tcp_connect(id: i64, ip: i64, port: i64) -> i64 { tcp::tcp_socket_con
 pub fn net_tcp_send(id: i64, data: i64, len: i64) -> i64 { tcp::tcp_socket_send(id, data, len) }
 pub fn net_tcp_recv(id: i64, buf: i64, len: i64) -> i64 { tcp::tcp_socket_recv(id, buf, len) }
 pub fn net_tcp_close(id: i64) -> i64 { tcp::tcp_socket_close(id) }
+pub fn net_tcp_poll_packets() -> i64 { tcp::tcp_poll_pending_packets() }
 pub fn net_tcp_configure_qemu() { tcp::tcp_net_configure_qemu() }
 
 pub fn net_udp_create() -> i64 { udp::udp_socket_create() }

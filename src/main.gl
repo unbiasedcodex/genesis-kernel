@@ -703,35 +703,58 @@ fn i64_to_proc_state(n: i64) -> ProcState {
 // ============================================================
 
 fn shl_u64(value: u64, shift: u64) -> u64 {
-    // Use multiplication instead of broken <<= operator
-    // value << n = value * 2^n
+    // Use inline assembly to bypass Genesis compiler's buggy arithmetic
     if shift >= 64 {
         return 0;
     }
-    let mut result = value;
-    let mut count = shift;
-    while count > 0 {
-        result = result * 2;
-        count = count - 1;
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             shlq %cl, %rax",
+            in("rdi") value,
+            in("rcx") shift,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Right shift using inline assembly
+fn shr_u64_safe(value: u64, shift: u64) -> u64 {
+    if shift >= 64 {
+        return 0;
+    }
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             shrq %cl, %rax",
+            in("rdi") value,
+            in("rcx") shift,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
     }
     result
 }
 
 fn shr_u64(value: u64, shift: u64) -> u64 {
-    // Use a simpler approach - manual shift loop for small shifts
-    // This avoids compiler issues with inline assembly
+    // Use inline assembly to perform right shift correctly
     if shift >= 64 {
         return 0;
     }
-    let mut result = value;
-    let mut count = shift;
-    while count > 0 {
-        // Shift right by 1: divide by 2 using bit operations
-        // result = (result >> 1) implemented as: result / 2 for unsigned
-        let hi_bit = bit_and(result, 0x8000000000000000);
-        result = result / 2;
-        // The division by 2 is equivalent to unsigned right shift by 1
-        count = count - 1;
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq %rdi, %rax
+             shrq %cl, %rax",
+            in("rdi") value,
+            in("rcx") shift,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
     }
     result
 }
@@ -793,6 +816,75 @@ fn bit_xor(a: u64, b: u64) -> u64 {
         );
     }
     result
+}
+
+// Unsigned comparison helpers (bypass signed comparison bug in Genesis compiler)
+// Returns 1 if a < b (unsigned), 0 otherwise
+fn u64_lt(a: u64, b: u64) -> i64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "xorq %rax, %rax
+             cmpq %rsi, %rdi
+             setb %al",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result as i64
+}
+
+// Returns 1 if a > b (unsigned), 0 otherwise
+fn u64_gt(a: u64, b: u64) -> i64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "xorq %rax, %rax
+             cmpq %rsi, %rdi
+             seta %al",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result as i64
+}
+
+// Returns 1 if a >= b (unsigned), 0 otherwise
+fn u64_gte(a: u64, b: u64) -> i64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "xorq %rax, %rax
+             cmpq %rsi, %rdi
+             setae %al",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result as i64
+}
+
+// Returns 1 if a <= b (unsigned), 0 otherwise
+fn u64_lte(a: u64, b: u64) -> i64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "xorq %rax, %rax
+             cmpq %rsi, %rdi
+             setbe %al",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result as i64
 }
 
 // ============================================================
@@ -3076,6 +3168,21 @@ fn serial_hex64(value: u64) {
         let ch: i64 = if nibble < 10 { 48 + nibble } else { 55 + nibble };
         serial_out(ch);
         i = i - 4;
+    }
+}
+
+fn serial_hex_byte(b: i64) {
+    let hi = shr_u64(bit_and(b as u64, 0xF0), 4) as i64;
+    let lo = bit_and(b as u64, 0x0F) as i64;
+    if hi < 10 { serial_out(48 + hi); } else { serial_out(87 + hi); }
+    if lo < 10 { serial_out(48 + lo); } else { serial_out(87 + lo); }
+}
+
+fn serial_hex_dump(addr: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        serial_hex_byte(read_byte_addr(addr + i));
+        i = i + 1;
     }
 }
 
@@ -8858,9 +8965,7 @@ fn syscall_net_poll() -> i64 {
     if net_is_ready() == 0 {
         return 0;
     }
-    // Would call net_stack_poll()
-    // Returns number of packets processed
-    return 0;
+    net::net_tcp_poll_packets()
 }
 
 // ============================================================
@@ -10161,6 +10266,7 @@ fn bigint_copy(dst: i64, src: i64) {
 // Load big integer from big-endian bytes
 fn bigint_from_bytes(dst: i64, src: i64, len: i64) {
     bigint_zero(dst);
+
     let mut i: i64 = 0;
     while i < len && i < RSA_BYTES {
         // Big-endian: first byte is most significant
@@ -10169,7 +10275,9 @@ fn bigint_from_bytes(dst: i64, src: i64, len: i64) {
         let byte_idx = (RSA_BYTES - 1 - i) % 8;
         let shift = (byte_idx * 8) as u64;
         let current = read_u64_addr(dst + word_idx * 8);
-        write_u64_addr(dst + word_idx * 8, bit_or(current, shl_u64(byte_val as u64, shift)));
+        let shifted = shl_u64(byte_val as u64, shift);
+        let result = bit_or(current, shifted);
+        write_u64_addr(dst + word_idx * 8, result);
         i = i + 1;
     }
 }
@@ -10194,10 +10302,10 @@ fn bigint_cmp(a: i64, b: i64) -> i64 {
     while i >= 0 {
         let av = read_u64_addr(a + i * 8);
         let bv = read_u64_addr(b + i * 8);
-        if av > bv {
+        if u64_gt(av, bv) == 1 {
             return 1;
         }
-        if av < bv {
+        if u64_lt(av, bv) == 1 {
             return -1;
         }
         i = i - 1;
@@ -10215,9 +10323,9 @@ fn bigint_add(result: i64, a: i64, b: i64) -> i64 {
 
         // Add with carry using two separate additions to detect overflow
         let sum1 = av + bv;
-        let carry1: u64 = if sum1 < av { 1 } else { 0 };
+        let carry1: u64 = u64_lt(sum1, av) as u64;
         let sum2 = sum1 + carry;
-        let carry2: u64 = if sum2 < sum1 { 1 } else { 0 };
+        let carry2: u64 = u64_lt(sum2, sum1) as u64;
 
         write_u64_addr(result + i * 8, sum2);
         carry = carry1 + carry2;
@@ -10236,9 +10344,9 @@ fn bigint_sub(result: i64, a: i64, b: i64) -> i64 {
 
         // Subtract with borrow
         let diff1 = av - bv;
-        let borrow1: u64 = if diff1 > av { 1 } else { 0 };
+        let borrow1: u64 = u64_gt(diff1, av) as u64;
         let diff2 = diff1 - borrow;
-        let borrow2: u64 = if diff2 > diff1 { 1 } else { 0 };
+        let borrow2: u64 = u64_gt(diff2, diff1) as u64;
 
         write_u64_addr(result + i * 8, diff2);
         borrow = borrow1 + borrow2;
@@ -10248,33 +10356,47 @@ fn bigint_sub(result: i64, a: i64, b: i64) -> i64 {
 }
 
 // Multiply 64-bit * 64-bit -> 128-bit (returns high 64 bits, stores low 64 bits)
+// Use the x86 mulq instruction directly to avoid Genesis arithmetic bugs
 fn mul64_128(a: u64, b: u64, lo_addr: i64) -> u64 {
-    // Split into 32-bit halves to avoid overflow
-    let a_lo = bit_and(a, 0xFFFFFFFF);
-    let a_hi = shr_u64(a, 32);
-    let b_lo = bit_and(b, 0xFFFFFFFF);
-    let b_hi = shr_u64(b, 32);
+    let hi_addr: i64 = 0x3000000 + 16000;
+    let mut clobber_rax: u64 = 0;
+    unsafe {
+        asm!(
+            "pushq %rdx
+             movq %rdi, %rax
+             mulq %rsi
+             movq %rax, (%rcx)
+             movq %rdx, (%r8)
+             popq %rdx",
+            in("rdi") a,
+            in("rsi") b,
+            in("rcx") lo_addr,
+            in("r8") hi_addr,
+            lateout("rax") clobber_rax,
+            options(att_syntax)
+        );
+    }
+    read_u64_addr(hi_addr)
+}
 
-    // Partial products
-    let p0 = a_lo * b_lo;                    // Low * Low
-    let p1 = a_lo * b_hi;                    // Low * High
-    let p2 = a_hi * b_lo;                    // High * Low
-    let p3 = a_hi * b_hi;                    // High * High
-
-    // Combine: result = p3:p0 + (p1 + p2) << 32
-    let mid = p1 + p2;
-    let mid_carry: u64 = if mid < p1 { 1 } else { 0 };
-
-    let mid_lo = shl_u64(bit_and(mid, 0xFFFFFFFF), 32);
-    let mid_hi = shr_u64(mid, 32);
-
-    let lo = p0 + mid_lo;
-    let lo_carry: u64 = if lo < p0 { 1 } else { 0 };
-
-    let hi = p3 + mid_hi + lo_carry + shl_u64(mid_carry, 32);
-
-    write_u64_addr(lo_addr, lo);
-    hi
+// 32-bit x 32-bit -> 64-bit multiplication using asm
+fn mul32_64(a: u64, b: u64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "pushq %rdx
+             movl %edi, %eax
+             mull %esi
+             shlq $$32, %rdx
+             orq %rdx, %rax
+             popq %rdx",
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(att_syntax)
+        );
+    }
+    result
 }
 
 // Multiply big integer by single word: result = a * w
@@ -10289,7 +10411,7 @@ fn bigint_mul_word(result: i64, a: i64, w: u64) {
         let lo = read_u64_addr(lo_temp);
 
         let sum = lo + carry;
-        let sum_carry: u64 = if sum < lo { 1 } else { 0 };
+        let sum_carry: u64 = u64_lt(sum, lo) as u64;
 
         write_u64_addr(result + i * 8, sum);
         carry = hi + sum_carry;
@@ -10377,7 +10499,6 @@ fn bigint_bit_length(a: i64) -> i64 {
 // Modular reduction: result = a mod n (using subtraction method for simplicity)
 // This is slow but correct - can be optimized with Montgomery later
 fn bigint_mod(result: i64, a: i64, n: i64) {
-    let temp = RSA_WORK_ADDR + 512;
     let shifted_n = RSA_WORK_ADDR + 768;
 
     bigint_copy(result, a);
@@ -10413,14 +10534,171 @@ fn bigint_mod(result: i64, a: i64, n: i64) {
     }
 }
 
-// Modular multiplication: result = (a * b) mod n
-fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
-    let product = RSA_WORK_ADDR + 1024;  // 64 words for product
-    let product_hi = product + RSA_WORDS * 8;
+// Extended modular reduction for 64-word (4096-bit) products
+// result (32 words) = a (64 words) mod n (32 words)
+fn bigint_mod_large(result: i64, a: i64, n: i64) {
+    // Work with 64-word temps
+    let temp_result = RSA_WORK_ADDR + 4096;  // 64 words
+    let shifted_n = RSA_WORK_ADDR + 4608;    // 64 words
 
-    // Zero product (need 64 words for full product)
+    // Copy a (64 words) to temp_result
     let mut i: i64 = 0;
-    while i < RSA_WORDS * 2 {
+    while i < 64 {
+        write_u64_addr(temp_result + i * 8, read_u64_addr(a + i * 8));
+        i = i + 1;
+    }
+
+    // Copy n to shifted_n (zero-extend to 64 words)
+    i = 0;
+    while i < 64 {
+        if i < RSA_WORDS {
+            write_u64_addr(shifted_n + i * 8, read_u64_addr(n + i * 8));
+        } else {
+            write_u64_addr(shifted_n + i * 8, 0);
+        }
+        i = i + 1;
+    }
+
+    // Find bit lengths (for 64 words)
+    let a_bits = bigint64_bit_length(temp_result);
+    let n_bits = bigint64_bit_length(shifted_n);
+
+    // Handle edge cases: if a is zero or a < n, we're done
+    if a_bits < 0 {
+        // a is zero, result is zero
+        i = 0;
+        while i < RSA_WORDS {
+            write_u64_addr(result + i * 8, 0);
+            i = i + 1;
+        }
+        return;
+    }
+
+    if a_bits < n_bits {
+        // Already reduced, copy low 32 words to result
+        i = 0;
+        while i < RSA_WORDS {
+            write_u64_addr(result + i * 8, read_u64_addr(temp_result + i * 8));
+            i = i + 1;
+        }
+        return;
+    }
+
+    let shift_amount = a_bits - n_bits;
+
+    // Shift n left
+    let mut s: i64 = 0;
+    while s < shift_amount {
+        bigint64_shl1(shifted_n);
+        s = s + 1;
+    }
+
+    // Subtract shifted_n from temp_result while temp_result >= shifted_n
+    let mut current_shift = shift_amount;
+    while current_shift >= 0 {
+        // Only subtract while temp_result >= shifted_n AND shifted_n is not zero
+        let shifted_n_bits = bigint64_bit_length(shifted_n);
+        while shifted_n_bits >= 0 && bigint64_cmp(temp_result, shifted_n) >= 0 {
+            bigint64_sub(temp_result, temp_result, shifted_n);
+        }
+        if current_shift > 0 {
+            bigint64_shr1(shifted_n);
+        }
+        current_shift = current_shift - 1;
+    }
+
+    // Copy low 32 words to result
+    i = 0;
+    while i < RSA_WORDS {
+        write_u64_addr(result + i * 8, read_u64_addr(temp_result + i * 8));
+        i = i + 1;
+    }
+}
+
+// 64-word helpers
+fn bigint64_bit_length(a: i64) -> i64 {
+    let mut i: i64 = 63;
+    while i >= 0 {
+        let word = read_u64_addr(a + i * 8);
+        if word != 0 {
+            let mut bit: i64 = 63;
+            while bit >= 0 {
+                if bit_and(shr_u64(word, bit as u64), 1) != 0 {
+                    return i * 64 + bit;
+                }
+                bit = bit - 1;
+            }
+        }
+        i = i - 1;
+    }
+    -1
+}
+
+fn bigint64_shl1(a: i64) {
+    let mut carry: u64 = 0;
+    let mut i: i64 = 0;
+    while i < 64 {
+        let v = read_u64_addr(a + i * 8);
+        let new_carry = shr_u64(v, 63);
+        write_u64_addr(a + i * 8, bit_or(shl_u64(v, 1), carry));
+        carry = new_carry;
+        i = i + 1;
+    }
+}
+
+fn bigint64_shr1(a: i64) {
+    let mut carry: u64 = 0;
+    let mut i: i64 = 63;
+    while i >= 0 {
+        let v = read_u64_addr(a + i * 8);
+        let new_carry = shl_u64(bit_and(v, 1), 63);
+        write_u64_addr(a + i * 8, bit_or(shr_u64(v, 1), carry));
+        carry = new_carry;
+        i = i - 1;
+    }
+}
+
+fn bigint64_cmp(a: i64, b: i64) -> i64 {
+    let mut i: i64 = 63;
+    while i >= 0 {
+        let av = read_u64_addr(a + i * 8);
+        let bv = read_u64_addr(b + i * 8);
+        if u64_gt(av, bv) == 1 {
+            return 1;
+        }
+        if u64_lt(av, bv) == 1 {
+            return -1;
+        }
+        i = i - 1;
+    }
+    0
+}
+
+fn bigint64_sub(result: i64, a: i64, b: i64) {
+    let mut borrow: u64 = 0;
+    let mut i: i64 = 0;
+    while i < 64 {
+        let av = read_u64_addr(a + i * 8);
+        let bv = read_u64_addr(b + i * 8);
+        let diff1 = av - bv;
+        let borrow1: u64 = u64_gt(diff1, av) as u64;
+        let diff2 = diff1 - borrow;
+        let borrow2: u64 = u64_gt(diff2, diff1) as u64;
+        write_u64_addr(result + i * 8, diff2);
+        borrow = borrow1 + borrow2;
+        i = i + 1;
+    }
+}
+
+// Modular multiplication: result = (a * b) mod n
+// Uses schoolbook multiplication + modular reduction
+fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
+    let product = RSA_WORK_ADDR + 5120;  // 64 words for product
+    let lo_temp = RSA_WORK_ADDR + 5632;
+
+    // Zero product (64 words)
+    let mut i: i64 = 0;
+    while i < 64 {
         write_u64_addr(product + i * 8, 0);
         i = i + 1;
     }
@@ -10432,7 +10710,6 @@ fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
         if bv != 0 {
             let mut carry: u64 = 0;
             let mut j: i64 = 0;
-            let lo_temp = RSA_WORK_ADDR + 8200;
 
             while j < RSA_WORDS {
                 let av = read_u64_addr(a + j * 8);
@@ -10442,9 +10719,9 @@ fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
                 let lo = read_u64_addr(lo_temp);
 
                 let sum1 = lo + pv;
-                let carry1: u64 = if sum1 < lo { 1 } else { 0 };
+                let carry1: u64 = u64_lt(sum1, lo) as u64;
                 let sum2 = sum1 + carry;
-                let carry2: u64 = if sum2 < sum1 { 1 } else { 0 };
+                let carry2: u64 = u64_lt(sum2, sum1) as u64;
 
                 write_u64_addr(product + (i + j) * 8, sum2);
                 carry = hi + carry1 + carry2;
@@ -10453,10 +10730,10 @@ fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
 
             // Propagate final carry
             let mut k = i + RSA_WORDS;
-            while carry != 0 && k < RSA_WORDS * 2 {
+            while carry != 0 && k < 64 {
                 let pv = read_u64_addr(product + k * 8);
                 let sum = pv + carry;
-                let new_carry: u64 = if sum < pv { 1 } else { 0 };
+                let new_carry: u64 = u64_lt(sum, pv) as u64;
                 write_u64_addr(product + k * 8, sum);
                 carry = new_carry;
                 k = k + 1;
@@ -10465,9 +10742,8 @@ fn bigint_mulmod(result: i64, a: i64, b: i64, n: i64) {
         i = i + 1;
     }
 
-    // Now reduce product mod n
-    // For simplicity, use repeated subtraction (slow but works)
-    bigint_mod(result, product, n);
+    // Reduce 64-word product mod n
+    bigint_mod_large(result, product, n);
 }
 
 // Modular exponentiation: result = base^exp mod n
@@ -10485,11 +10761,12 @@ fn bigint_modexp(result: i64, base: i64, exp: i64, n: i64) {
 
     // Find exponent bit length
     let exp_bits = bigint_bit_length(exp);
+
     if exp_bits < 0 {
         return;  // exp = 0, result = 1
     }
 
-    // Square-and-multiply
+    // Square-and-multiply (right-to-left binary method)
     let mut i: i64 = 0;
     while i <= exp_bits {
         if bigint_get_bit(exp, i) == 1 {
@@ -11036,9 +11313,8 @@ fn x509_extract_signature(
     }
     write_u64_addr(algo_addr, algo as u64);
 
-    // Skip to signature
-    let after_algo = after_tbs + 1;
-    write_u64_addr(offset_storage, after_algo as u64);
+    // Skip to signature - skip the signatureAlgorithm element entirely
+    write_u64_addr(offset_storage, after_tbs as u64);
     asn1_skip_element(cert_addr, offset_storage);
     let sig_offset = read_u64_addr(offset_storage) as i64;
 
@@ -11730,19 +12006,607 @@ fn root_ca_store_init() {
         return;
     }
 
-    // For now, we embed simplified CA data
-    // In production, this would contain full RSA public keys
+    // Entry layout (320 bytes per CA):
+    //   Bytes 0-31:   SHA-256 of Subject DN (for issuer matching)
+    //   Bytes 32-287: RSA modulus N (256 bytes, big-endian)
+    //   Bytes 288-295: RSA exponent e (u64)
+    //   Bytes 296-319: padding (zeros)
 
-    // Entry 0: ISRG Root X1 (Let's Encrypt)
-    // Issuer DN hash (SHA-256 of issuer DN for matching)
+    // ---- Entry 0: DigiCert Global Root G2 (2048-bit RSA) ----
     let ca0_addr = ROOT_CA_STORE_ADDR;
-    // Placeholder: In real implementation, store actual public key
-    // For demonstration, store recognizable marker
-    write_u64_addr(ca0_addr, 0x4953524731583131);  // "ISRG1X11"
 
-    // Entry 1: DigiCert Global Root G2
+    // Subject DN SHA-256: ce6a172b6d7dfe6d530d6ea7cc603e42f89e836bed6f19e70f12854a4e5c2db1
+    write_byte_addr(ca0_addr + 0, 0xCE);
+    write_byte_addr(ca0_addr + 1, 0x6A);
+    write_byte_addr(ca0_addr + 2, 0x17);
+    write_byte_addr(ca0_addr + 3, 0x2B);
+    write_byte_addr(ca0_addr + 4, 0x6D);
+    write_byte_addr(ca0_addr + 5, 0x7D);
+    write_byte_addr(ca0_addr + 6, 0xFE);
+    write_byte_addr(ca0_addr + 7, 0x6D);
+    write_byte_addr(ca0_addr + 8, 0x53);
+    write_byte_addr(ca0_addr + 9, 0x0D);
+    write_byte_addr(ca0_addr + 10, 0x6E);
+    write_byte_addr(ca0_addr + 11, 0xA7);
+    write_byte_addr(ca0_addr + 12, 0xCC);
+    write_byte_addr(ca0_addr + 13, 0x60);
+    write_byte_addr(ca0_addr + 14, 0x3E);
+    write_byte_addr(ca0_addr + 15, 0x42);
+    write_byte_addr(ca0_addr + 16, 0xF8);
+    write_byte_addr(ca0_addr + 17, 0x9E);
+    write_byte_addr(ca0_addr + 18, 0x83);
+    write_byte_addr(ca0_addr + 19, 0x6B);
+    write_byte_addr(ca0_addr + 20, 0xED);
+    write_byte_addr(ca0_addr + 21, 0x6F);
+    write_byte_addr(ca0_addr + 22, 0x19);
+    write_byte_addr(ca0_addr + 23, 0xE7);
+    write_byte_addr(ca0_addr + 24, 0x0F);
+    write_byte_addr(ca0_addr + 25, 0x12);
+    write_byte_addr(ca0_addr + 26, 0x85);
+    write_byte_addr(ca0_addr + 27, 0x4A);
+    write_byte_addr(ca0_addr + 28, 0x4E);
+    write_byte_addr(ca0_addr + 29, 0x5C);
+    write_byte_addr(ca0_addr + 30, 0x2D);
+    write_byte_addr(ca0_addr + 31, 0xB1);
+
+    // DigiCert G2 RSA modulus (256 bytes at offset 32)
+    write_byte_addr(ca0_addr + 32, 0xBB);
+    write_byte_addr(ca0_addr + 33, 0x37);
+    write_byte_addr(ca0_addr + 34, 0xCD);
+    write_byte_addr(ca0_addr + 35, 0x34);
+    write_byte_addr(ca0_addr + 36, 0xDC);
+    write_byte_addr(ca0_addr + 37, 0x7B);
+    write_byte_addr(ca0_addr + 38, 0x6B);
+    write_byte_addr(ca0_addr + 39, 0xC9);
+    write_byte_addr(ca0_addr + 40, 0xB2);
+    write_byte_addr(ca0_addr + 41, 0x68);
+    write_byte_addr(ca0_addr + 42, 0x90);
+    write_byte_addr(ca0_addr + 43, 0xAD);
+    write_byte_addr(ca0_addr + 44, 0x4A);
+    write_byte_addr(ca0_addr + 45, 0x75);
+    write_byte_addr(ca0_addr + 46, 0xFF);
+    write_byte_addr(ca0_addr + 47, 0x46);
+    write_byte_addr(ca0_addr + 48, 0xBA);
+    write_byte_addr(ca0_addr + 49, 0x21);
+    write_byte_addr(ca0_addr + 50, 0x0A);
+    write_byte_addr(ca0_addr + 51, 0x08);
+    write_byte_addr(ca0_addr + 52, 0x8D);
+    write_byte_addr(ca0_addr + 53, 0xF5);
+    write_byte_addr(ca0_addr + 54, 0x19);
+    write_byte_addr(ca0_addr + 55, 0x54);
+    write_byte_addr(ca0_addr + 56, 0xC9);
+    write_byte_addr(ca0_addr + 57, 0xFB);
+    write_byte_addr(ca0_addr + 58, 0x88);
+    write_byte_addr(ca0_addr + 59, 0xDB);
+    write_byte_addr(ca0_addr + 60, 0xF3);
+    write_byte_addr(ca0_addr + 61, 0xAE);
+    write_byte_addr(ca0_addr + 62, 0xF2);
+    write_byte_addr(ca0_addr + 63, 0x3A);
+    write_byte_addr(ca0_addr + 64, 0x89);
+    write_byte_addr(ca0_addr + 65, 0x91);
+    write_byte_addr(ca0_addr + 66, 0x3C);
+    write_byte_addr(ca0_addr + 67, 0x7A);
+    write_byte_addr(ca0_addr + 68, 0xE6);
+    write_byte_addr(ca0_addr + 69, 0xAB);
+    write_byte_addr(ca0_addr + 70, 0x06);
+    write_byte_addr(ca0_addr + 71, 0x1A);
+    write_byte_addr(ca0_addr + 72, 0x6B);
+    write_byte_addr(ca0_addr + 73, 0xCF);
+    write_byte_addr(ca0_addr + 74, 0xAC);
+    write_byte_addr(ca0_addr + 75, 0x2D);
+    write_byte_addr(ca0_addr + 76, 0xE8);
+    write_byte_addr(ca0_addr + 77, 0x5E);
+    write_byte_addr(ca0_addr + 78, 0x09);
+    write_byte_addr(ca0_addr + 79, 0x24);
+    write_byte_addr(ca0_addr + 80, 0x44);
+    write_byte_addr(ca0_addr + 81, 0xBA);
+    write_byte_addr(ca0_addr + 82, 0x62);
+    write_byte_addr(ca0_addr + 83, 0x9A);
+    write_byte_addr(ca0_addr + 84, 0x7E);
+    write_byte_addr(ca0_addr + 85, 0xD6);
+    write_byte_addr(ca0_addr + 86, 0xA3);
+    write_byte_addr(ca0_addr + 87, 0xA8);
+    write_byte_addr(ca0_addr + 88, 0x7E);
+    write_byte_addr(ca0_addr + 89, 0xE0);
+    write_byte_addr(ca0_addr + 90, 0x54);
+    write_byte_addr(ca0_addr + 91, 0x75);
+    write_byte_addr(ca0_addr + 92, 0x20);
+    write_byte_addr(ca0_addr + 93, 0x05);
+    write_byte_addr(ca0_addr + 94, 0xAC);
+    write_byte_addr(ca0_addr + 95, 0x50);
+    write_byte_addr(ca0_addr + 96, 0xB7);
+    write_byte_addr(ca0_addr + 97, 0x9C);
+    write_byte_addr(ca0_addr + 98, 0x63);
+    write_byte_addr(ca0_addr + 99, 0x1A);
+    write_byte_addr(ca0_addr + 100, 0x6C);
+    write_byte_addr(ca0_addr + 101, 0x30);
+    write_byte_addr(ca0_addr + 102, 0xDC);
+    write_byte_addr(ca0_addr + 103, 0xDA);
+    write_byte_addr(ca0_addr + 104, 0x1F);
+    write_byte_addr(ca0_addr + 105, 0x19);
+    write_byte_addr(ca0_addr + 106, 0xB1);
+    write_byte_addr(ca0_addr + 107, 0xD7);
+    write_byte_addr(ca0_addr + 108, 0x1E);
+    write_byte_addr(ca0_addr + 109, 0xDE);
+    write_byte_addr(ca0_addr + 110, 0xFD);
+    write_byte_addr(ca0_addr + 111, 0xD7);
+    write_byte_addr(ca0_addr + 112, 0xE0);
+    write_byte_addr(ca0_addr + 113, 0xCB);
+    write_byte_addr(ca0_addr + 114, 0x94);
+    write_byte_addr(ca0_addr + 115, 0x83);
+    write_byte_addr(ca0_addr + 116, 0x37);
+    write_byte_addr(ca0_addr + 117, 0xAE);
+    write_byte_addr(ca0_addr + 118, 0xEC);
+    write_byte_addr(ca0_addr + 119, 0x1F);
+    write_byte_addr(ca0_addr + 120, 0x43);
+    write_byte_addr(ca0_addr + 121, 0x4E);
+    write_byte_addr(ca0_addr + 122, 0xDD);
+    write_byte_addr(ca0_addr + 123, 0x7B);
+    write_byte_addr(ca0_addr + 124, 0x2C);
+    write_byte_addr(ca0_addr + 125, 0xD2);
+    write_byte_addr(ca0_addr + 126, 0xBD);
+    write_byte_addr(ca0_addr + 127, 0x2E);
+    write_byte_addr(ca0_addr + 128, 0xA5);
+    write_byte_addr(ca0_addr + 129, 0x2F);
+    write_byte_addr(ca0_addr + 130, 0xE4);
+    write_byte_addr(ca0_addr + 131, 0xA9);
+    write_byte_addr(ca0_addr + 132, 0xB8);
+    write_byte_addr(ca0_addr + 133, 0xAD);
+    write_byte_addr(ca0_addr + 134, 0x3A);
+    write_byte_addr(ca0_addr + 135, 0xD4);
+    write_byte_addr(ca0_addr + 136, 0x99);
+    write_byte_addr(ca0_addr + 137, 0xA4);
+    write_byte_addr(ca0_addr + 138, 0xB6);
+    write_byte_addr(ca0_addr + 139, 0x25);
+    write_byte_addr(ca0_addr + 140, 0xE9);
+    write_byte_addr(ca0_addr + 141, 0x9B);
+    write_byte_addr(ca0_addr + 142, 0x6B);
+    write_byte_addr(ca0_addr + 143, 0x00);
+    write_byte_addr(ca0_addr + 144, 0x60);
+    write_byte_addr(ca0_addr + 145, 0x92);
+    write_byte_addr(ca0_addr + 146, 0x60);
+    write_byte_addr(ca0_addr + 147, 0xFF);
+    write_byte_addr(ca0_addr + 148, 0x4F);
+    write_byte_addr(ca0_addr + 149, 0x21);
+    write_byte_addr(ca0_addr + 150, 0x49);
+    write_byte_addr(ca0_addr + 151, 0x18);
+    write_byte_addr(ca0_addr + 152, 0xF7);
+    write_byte_addr(ca0_addr + 153, 0x67);
+    write_byte_addr(ca0_addr + 154, 0x90);
+    write_byte_addr(ca0_addr + 155, 0xAB);
+    write_byte_addr(ca0_addr + 156, 0x61);
+    write_byte_addr(ca0_addr + 157, 0x06);
+    write_byte_addr(ca0_addr + 158, 0x9C);
+    write_byte_addr(ca0_addr + 159, 0x8F);
+    write_byte_addr(ca0_addr + 160, 0xF2);
+    write_byte_addr(ca0_addr + 161, 0xBA);
+    write_byte_addr(ca0_addr + 162, 0xE9);
+    write_byte_addr(ca0_addr + 163, 0xB4);
+    write_byte_addr(ca0_addr + 164, 0xE9);
+    write_byte_addr(ca0_addr + 165, 0x92);
+    write_byte_addr(ca0_addr + 166, 0x32);
+    write_byte_addr(ca0_addr + 167, 0x6B);
+    write_byte_addr(ca0_addr + 168, 0xB5);
+    write_byte_addr(ca0_addr + 169, 0xF3);
+    write_byte_addr(ca0_addr + 170, 0x57);
+    write_byte_addr(ca0_addr + 171, 0xE8);
+    write_byte_addr(ca0_addr + 172, 0x5D);
+    write_byte_addr(ca0_addr + 173, 0x1B);
+    write_byte_addr(ca0_addr + 174, 0xCD);
+    write_byte_addr(ca0_addr + 175, 0x8C);
+    write_byte_addr(ca0_addr + 176, 0x1D);
+    write_byte_addr(ca0_addr + 177, 0xAB);
+    write_byte_addr(ca0_addr + 178, 0x95);
+    write_byte_addr(ca0_addr + 179, 0x04);
+    write_byte_addr(ca0_addr + 180, 0x95);
+    write_byte_addr(ca0_addr + 181, 0x49);
+    write_byte_addr(ca0_addr + 182, 0xF3);
+    write_byte_addr(ca0_addr + 183, 0x35);
+    write_byte_addr(ca0_addr + 184, 0x2D);
+    write_byte_addr(ca0_addr + 185, 0x96);
+    write_byte_addr(ca0_addr + 186, 0xE3);
+    write_byte_addr(ca0_addr + 187, 0x49);
+    write_byte_addr(ca0_addr + 188, 0x6D);
+    write_byte_addr(ca0_addr + 189, 0xDD);
+    write_byte_addr(ca0_addr + 190, 0x77);
+    write_byte_addr(ca0_addr + 191, 0xE3);
+    write_byte_addr(ca0_addr + 192, 0xFB);
+    write_byte_addr(ca0_addr + 193, 0x49);
+    write_byte_addr(ca0_addr + 194, 0x4B);
+    write_byte_addr(ca0_addr + 195, 0xB4);
+    write_byte_addr(ca0_addr + 196, 0xAC);
+    write_byte_addr(ca0_addr + 197, 0x55);
+    write_byte_addr(ca0_addr + 198, 0x07);
+    write_byte_addr(ca0_addr + 199, 0xA9);
+    write_byte_addr(ca0_addr + 200, 0x8F);
+    write_byte_addr(ca0_addr + 201, 0x95);
+    write_byte_addr(ca0_addr + 202, 0xB3);
+    write_byte_addr(ca0_addr + 203, 0xB4);
+    write_byte_addr(ca0_addr + 204, 0x23);
+    write_byte_addr(ca0_addr + 205, 0xBB);
+    write_byte_addr(ca0_addr + 206, 0x4C);
+    write_byte_addr(ca0_addr + 207, 0x6D);
+    write_byte_addr(ca0_addr + 208, 0x45);
+    write_byte_addr(ca0_addr + 209, 0xF0);
+    write_byte_addr(ca0_addr + 210, 0xF6);
+    write_byte_addr(ca0_addr + 211, 0xA9);
+    write_byte_addr(ca0_addr + 212, 0xB2);
+    write_byte_addr(ca0_addr + 213, 0x95);
+    write_byte_addr(ca0_addr + 214, 0x30);
+    write_byte_addr(ca0_addr + 215, 0xB4);
+    write_byte_addr(ca0_addr + 216, 0xFD);
+    write_byte_addr(ca0_addr + 217, 0x4C);
+    write_byte_addr(ca0_addr + 218, 0x55);
+    write_byte_addr(ca0_addr + 219, 0x8C);
+    write_byte_addr(ca0_addr + 220, 0x27);
+    write_byte_addr(ca0_addr + 221, 0x4A);
+    write_byte_addr(ca0_addr + 222, 0x57);
+    write_byte_addr(ca0_addr + 223, 0x14);
+    write_byte_addr(ca0_addr + 224, 0x7C);
+    write_byte_addr(ca0_addr + 225, 0x82);
+    write_byte_addr(ca0_addr + 226, 0x9D);
+    write_byte_addr(ca0_addr + 227, 0xCD);
+    write_byte_addr(ca0_addr + 228, 0x73);
+    write_byte_addr(ca0_addr + 229, 0x92);
+    write_byte_addr(ca0_addr + 230, 0xD3);
+    write_byte_addr(ca0_addr + 231, 0x16);
+    write_byte_addr(ca0_addr + 232, 0x4A);
+    write_byte_addr(ca0_addr + 233, 0x06);
+    write_byte_addr(ca0_addr + 234, 0x0C);
+    write_byte_addr(ca0_addr + 235, 0x8C);
+    write_byte_addr(ca0_addr + 236, 0x50);
+    write_byte_addr(ca0_addr + 237, 0xD1);
+    write_byte_addr(ca0_addr + 238, 0x8F);
+    write_byte_addr(ca0_addr + 239, 0x1E);
+    write_byte_addr(ca0_addr + 240, 0x09);
+    write_byte_addr(ca0_addr + 241, 0xBE);
+    write_byte_addr(ca0_addr + 242, 0x17);
+    write_byte_addr(ca0_addr + 243, 0xA1);
+    write_byte_addr(ca0_addr + 244, 0xE6);
+    write_byte_addr(ca0_addr + 245, 0x21);
+    write_byte_addr(ca0_addr + 246, 0xCA);
+    write_byte_addr(ca0_addr + 247, 0xFD);
+    write_byte_addr(ca0_addr + 248, 0x83);
+    write_byte_addr(ca0_addr + 249, 0xE5);
+    write_byte_addr(ca0_addr + 250, 0x10);
+    write_byte_addr(ca0_addr + 251, 0xBC);
+    write_byte_addr(ca0_addr + 252, 0x83);
+    write_byte_addr(ca0_addr + 253, 0xA5);
+    write_byte_addr(ca0_addr + 254, 0x0A);
+    write_byte_addr(ca0_addr + 255, 0xC4);
+    write_byte_addr(ca0_addr + 256, 0x67);
+    write_byte_addr(ca0_addr + 257, 0x28);
+    write_byte_addr(ca0_addr + 258, 0xF6);
+    write_byte_addr(ca0_addr + 259, 0x73);
+    write_byte_addr(ca0_addr + 260, 0x14);
+    write_byte_addr(ca0_addr + 261, 0x14);
+    write_byte_addr(ca0_addr + 262, 0x3D);
+    write_byte_addr(ca0_addr + 263, 0x46);
+    write_byte_addr(ca0_addr + 264, 0x76);
+    write_byte_addr(ca0_addr + 265, 0xC3);
+    write_byte_addr(ca0_addr + 266, 0x87);
+    write_byte_addr(ca0_addr + 267, 0x14);
+    write_byte_addr(ca0_addr + 268, 0x89);
+    write_byte_addr(ca0_addr + 269, 0x21);
+    write_byte_addr(ca0_addr + 270, 0x34);
+    write_byte_addr(ca0_addr + 271, 0x4D);
+    write_byte_addr(ca0_addr + 272, 0xAF);
+    write_byte_addr(ca0_addr + 273, 0x0F);
+    write_byte_addr(ca0_addr + 274, 0x45);
+    write_byte_addr(ca0_addr + 275, 0x0C);
+    write_byte_addr(ca0_addr + 276, 0xA6);
+    write_byte_addr(ca0_addr + 277, 0x49);
+    write_byte_addr(ca0_addr + 278, 0xA1);
+    write_byte_addr(ca0_addr + 279, 0xBA);
+    write_byte_addr(ca0_addr + 280, 0xBB);
+    write_byte_addr(ca0_addr + 281, 0x9C);
+    write_byte_addr(ca0_addr + 282, 0xC5);
+    write_byte_addr(ca0_addr + 283, 0xB1);
+    write_byte_addr(ca0_addr + 284, 0x33);
+    write_byte_addr(ca0_addr + 285, 0x83);
+    write_byte_addr(ca0_addr + 286, 0x29);
+    write_byte_addr(ca0_addr + 287, 0x85);
+
+    // DigiCert G2 exponent: 65537 (at offset 288, stored as u64 little-endian)
+    write_u64_addr(ca0_addr + 288, 65537);
+
+    // ---- Entry 1: Amazon Root CA 1 (2048-bit RSA) ----
     let ca1_addr = ROOT_CA_STORE_ADDR + ROOT_CA_ENTRY_SIZE;
-    write_u64_addr(ca1_addr, 0x4449474943455254);  // "DIGICERT"
+
+    // Subject DN SHA-256: 7afc265b7b428e05c95b83d1619ca61c6ef8dbacbf8f0c229ff773b18bca4cff
+    write_byte_addr(ca1_addr + 0, 0x7A);
+    write_byte_addr(ca1_addr + 1, 0xFC);
+    write_byte_addr(ca1_addr + 2, 0x26);
+    write_byte_addr(ca1_addr + 3, 0x5B);
+    write_byte_addr(ca1_addr + 4, 0x7B);
+    write_byte_addr(ca1_addr + 5, 0x42);
+    write_byte_addr(ca1_addr + 6, 0x8E);
+    write_byte_addr(ca1_addr + 7, 0x05);
+    write_byte_addr(ca1_addr + 8, 0xC9);
+    write_byte_addr(ca1_addr + 9, 0x5B);
+    write_byte_addr(ca1_addr + 10, 0x83);
+    write_byte_addr(ca1_addr + 11, 0xD1);
+    write_byte_addr(ca1_addr + 12, 0x61);
+    write_byte_addr(ca1_addr + 13, 0x9C);
+    write_byte_addr(ca1_addr + 14, 0xA6);
+    write_byte_addr(ca1_addr + 15, 0x1C);
+    write_byte_addr(ca1_addr + 16, 0x6E);
+    write_byte_addr(ca1_addr + 17, 0xF8);
+    write_byte_addr(ca1_addr + 18, 0xDB);
+    write_byte_addr(ca1_addr + 19, 0xAC);
+    write_byte_addr(ca1_addr + 20, 0xBF);
+    write_byte_addr(ca1_addr + 21, 0x8F);
+    write_byte_addr(ca1_addr + 22, 0x0C);
+    write_byte_addr(ca1_addr + 23, 0x22);
+    write_byte_addr(ca1_addr + 24, 0x9F);
+    write_byte_addr(ca1_addr + 25, 0xF7);
+    write_byte_addr(ca1_addr + 26, 0x73);
+    write_byte_addr(ca1_addr + 27, 0xB1);
+    write_byte_addr(ca1_addr + 28, 0x8B);
+    write_byte_addr(ca1_addr + 29, 0xCA);
+    write_byte_addr(ca1_addr + 30, 0x4C);
+    write_byte_addr(ca1_addr + 31, 0xFF);
+
+    // Amazon Root CA 1 RSA modulus (256 bytes at offset 32)
+    write_byte_addr(ca1_addr + 32, 0xB2);
+    write_byte_addr(ca1_addr + 33, 0x78);
+    write_byte_addr(ca1_addr + 34, 0x80);
+    write_byte_addr(ca1_addr + 35, 0x71);
+    write_byte_addr(ca1_addr + 36, 0xCA);
+    write_byte_addr(ca1_addr + 37, 0x78);
+    write_byte_addr(ca1_addr + 38, 0xD5);
+    write_byte_addr(ca1_addr + 39, 0xE3);
+    write_byte_addr(ca1_addr + 40, 0x71);
+    write_byte_addr(ca1_addr + 41, 0xAF);
+    write_byte_addr(ca1_addr + 42, 0x47);
+    write_byte_addr(ca1_addr + 43, 0x80);
+    write_byte_addr(ca1_addr + 44, 0x50);
+    write_byte_addr(ca1_addr + 45, 0x74);
+    write_byte_addr(ca1_addr + 46, 0x7D);
+    write_byte_addr(ca1_addr + 47, 0x6E);
+    write_byte_addr(ca1_addr + 48, 0xD8);
+    write_byte_addr(ca1_addr + 49, 0xD7);
+    write_byte_addr(ca1_addr + 50, 0x88);
+    write_byte_addr(ca1_addr + 51, 0x76);
+    write_byte_addr(ca1_addr + 52, 0xF4);
+    write_byte_addr(ca1_addr + 53, 0x99);
+    write_byte_addr(ca1_addr + 54, 0x68);
+    write_byte_addr(ca1_addr + 55, 0xF7);
+    write_byte_addr(ca1_addr + 56, 0x58);
+    write_byte_addr(ca1_addr + 57, 0x21);
+    write_byte_addr(ca1_addr + 58, 0x60);
+    write_byte_addr(ca1_addr + 59, 0xF9);
+    write_byte_addr(ca1_addr + 60, 0x74);
+    write_byte_addr(ca1_addr + 61, 0x84);
+    write_byte_addr(ca1_addr + 62, 0x01);
+    write_byte_addr(ca1_addr + 63, 0x2F);
+    write_byte_addr(ca1_addr + 64, 0xAC);
+    write_byte_addr(ca1_addr + 65, 0x02);
+    write_byte_addr(ca1_addr + 66, 0x2D);
+    write_byte_addr(ca1_addr + 67, 0x86);
+    write_byte_addr(ca1_addr + 68, 0xD3);
+    write_byte_addr(ca1_addr + 69, 0xA0);
+    write_byte_addr(ca1_addr + 70, 0x43);
+    write_byte_addr(ca1_addr + 71, 0x7A);
+    write_byte_addr(ca1_addr + 72, 0x4E);
+    write_byte_addr(ca1_addr + 73, 0xB2);
+    write_byte_addr(ca1_addr + 74, 0xA4);
+    write_byte_addr(ca1_addr + 75, 0xD0);
+    write_byte_addr(ca1_addr + 76, 0x36);
+    write_byte_addr(ca1_addr + 77, 0xBA);
+    write_byte_addr(ca1_addr + 78, 0x01);
+    write_byte_addr(ca1_addr + 79, 0xBE);
+    write_byte_addr(ca1_addr + 80, 0x8D);
+    write_byte_addr(ca1_addr + 81, 0xDB);
+    write_byte_addr(ca1_addr + 82, 0x48);
+    write_byte_addr(ca1_addr + 83, 0xC8);
+    write_byte_addr(ca1_addr + 84, 0x07);
+    write_byte_addr(ca1_addr + 85, 0x17);
+    write_byte_addr(ca1_addr + 86, 0x36);
+    write_byte_addr(ca1_addr + 87, 0x4C);
+    write_byte_addr(ca1_addr + 88, 0xF4);
+    write_byte_addr(ca1_addr + 89, 0xEE);
+    write_byte_addr(ca1_addr + 90, 0x88);
+    write_byte_addr(ca1_addr + 91, 0x23);
+    write_byte_addr(ca1_addr + 92, 0xC7);
+    write_byte_addr(ca1_addr + 93, 0x3E);
+    write_byte_addr(ca1_addr + 94, 0xEB);
+    write_byte_addr(ca1_addr + 95, 0x37);
+    write_byte_addr(ca1_addr + 96, 0xF5);
+    write_byte_addr(ca1_addr + 97, 0xB5);
+    write_byte_addr(ca1_addr + 98, 0x19);
+    write_byte_addr(ca1_addr + 99, 0xF8);
+    write_byte_addr(ca1_addr + 100, 0x49);
+    write_byte_addr(ca1_addr + 101, 0x68);
+    write_byte_addr(ca1_addr + 102, 0xB0);
+    write_byte_addr(ca1_addr + 103, 0xDE);
+    write_byte_addr(ca1_addr + 104, 0xD7);
+    write_byte_addr(ca1_addr + 105, 0xB9);
+    write_byte_addr(ca1_addr + 106, 0x76);
+    write_byte_addr(ca1_addr + 107, 0x38);
+    write_byte_addr(ca1_addr + 108, 0x1D);
+    write_byte_addr(ca1_addr + 109, 0x61);
+    write_byte_addr(ca1_addr + 110, 0x9E);
+    write_byte_addr(ca1_addr + 111, 0xA4);
+    write_byte_addr(ca1_addr + 112, 0xFE);
+    write_byte_addr(ca1_addr + 113, 0x82);
+    write_byte_addr(ca1_addr + 114, 0x36);
+    write_byte_addr(ca1_addr + 115, 0xA5);
+    write_byte_addr(ca1_addr + 116, 0xE5);
+    write_byte_addr(ca1_addr + 117, 0x4A);
+    write_byte_addr(ca1_addr + 118, 0x56);
+    write_byte_addr(ca1_addr + 119, 0xE4);
+    write_byte_addr(ca1_addr + 120, 0x45);
+    write_byte_addr(ca1_addr + 121, 0xE1);
+    write_byte_addr(ca1_addr + 122, 0xF9);
+    write_byte_addr(ca1_addr + 123, 0xFD);
+    write_byte_addr(ca1_addr + 124, 0xB4);
+    write_byte_addr(ca1_addr + 125, 0x16);
+    write_byte_addr(ca1_addr + 126, 0xFA);
+    write_byte_addr(ca1_addr + 127, 0x74);
+    write_byte_addr(ca1_addr + 128, 0xDA);
+    write_byte_addr(ca1_addr + 129, 0x9C);
+    write_byte_addr(ca1_addr + 130, 0x9B);
+    write_byte_addr(ca1_addr + 131, 0x35);
+    write_byte_addr(ca1_addr + 132, 0x39);
+    write_byte_addr(ca1_addr + 133, 0x2F);
+    write_byte_addr(ca1_addr + 134, 0xFA);
+    write_byte_addr(ca1_addr + 135, 0xB0);
+    write_byte_addr(ca1_addr + 136, 0x20);
+    write_byte_addr(ca1_addr + 137, 0x50);
+    write_byte_addr(ca1_addr + 138, 0x06);
+    write_byte_addr(ca1_addr + 139, 0x6C);
+    write_byte_addr(ca1_addr + 140, 0x7A);
+    write_byte_addr(ca1_addr + 141, 0xD0);
+    write_byte_addr(ca1_addr + 142, 0x80);
+    write_byte_addr(ca1_addr + 143, 0xB2);
+    write_byte_addr(ca1_addr + 144, 0xA6);
+    write_byte_addr(ca1_addr + 145, 0xF9);
+    write_byte_addr(ca1_addr + 146, 0xAF);
+    write_byte_addr(ca1_addr + 147, 0xEC);
+    write_byte_addr(ca1_addr + 148, 0x47);
+    write_byte_addr(ca1_addr + 149, 0x19);
+    write_byte_addr(ca1_addr + 150, 0x8F);
+    write_byte_addr(ca1_addr + 151, 0x50);
+    write_byte_addr(ca1_addr + 152, 0x38);
+    write_byte_addr(ca1_addr + 153, 0x07);
+    write_byte_addr(ca1_addr + 154, 0xDC);
+    write_byte_addr(ca1_addr + 155, 0xA2);
+    write_byte_addr(ca1_addr + 156, 0x87);
+    write_byte_addr(ca1_addr + 157, 0x39);
+    write_byte_addr(ca1_addr + 158, 0x58);
+    write_byte_addr(ca1_addr + 159, 0xF8);
+    write_byte_addr(ca1_addr + 160, 0xBA);
+    write_byte_addr(ca1_addr + 161, 0xD5);
+    write_byte_addr(ca1_addr + 162, 0xA9);
+    write_byte_addr(ca1_addr + 163, 0xF9);
+    write_byte_addr(ca1_addr + 164, 0x48);
+    write_byte_addr(ca1_addr + 165, 0x67);
+    write_byte_addr(ca1_addr + 166, 0x30);
+    write_byte_addr(ca1_addr + 167, 0x96);
+    write_byte_addr(ca1_addr + 168, 0xEE);
+    write_byte_addr(ca1_addr + 169, 0x94);
+    write_byte_addr(ca1_addr + 170, 0x78);
+    write_byte_addr(ca1_addr + 171, 0x5E);
+    write_byte_addr(ca1_addr + 172, 0x6F);
+    write_byte_addr(ca1_addr + 173, 0x89);
+    write_byte_addr(ca1_addr + 174, 0xA3);
+    write_byte_addr(ca1_addr + 175, 0x51);
+    write_byte_addr(ca1_addr + 176, 0xC0);
+    write_byte_addr(ca1_addr + 177, 0x30);
+    write_byte_addr(ca1_addr + 178, 0x86);
+    write_byte_addr(ca1_addr + 179, 0x66);
+    write_byte_addr(ca1_addr + 180, 0xA1);
+    write_byte_addr(ca1_addr + 181, 0x45);
+    write_byte_addr(ca1_addr + 182, 0x66);
+    write_byte_addr(ca1_addr + 183, 0xBA);
+    write_byte_addr(ca1_addr + 184, 0x54);
+    write_byte_addr(ca1_addr + 185, 0xEB);
+    write_byte_addr(ca1_addr + 186, 0xA3);
+    write_byte_addr(ca1_addr + 187, 0xC3);
+    write_byte_addr(ca1_addr + 188, 0x91);
+    write_byte_addr(ca1_addr + 189, 0xF9);
+    write_byte_addr(ca1_addr + 190, 0x48);
+    write_byte_addr(ca1_addr + 191, 0xDC);
+    write_byte_addr(ca1_addr + 192, 0xFF);
+    write_byte_addr(ca1_addr + 193, 0xD1);
+    write_byte_addr(ca1_addr + 194, 0xE8);
+    write_byte_addr(ca1_addr + 195, 0x30);
+    write_byte_addr(ca1_addr + 196, 0x2D);
+    write_byte_addr(ca1_addr + 197, 0x7D);
+    write_byte_addr(ca1_addr + 198, 0x2D);
+    write_byte_addr(ca1_addr + 199, 0x74);
+    write_byte_addr(ca1_addr + 200, 0x70);
+    write_byte_addr(ca1_addr + 201, 0x35);
+    write_byte_addr(ca1_addr + 202, 0xD7);
+    write_byte_addr(ca1_addr + 203, 0x88);
+    write_byte_addr(ca1_addr + 204, 0x24);
+    write_byte_addr(ca1_addr + 205, 0xF7);
+    write_byte_addr(ca1_addr + 206, 0x9E);
+    write_byte_addr(ca1_addr + 207, 0xC4);
+    write_byte_addr(ca1_addr + 208, 0x59);
+    write_byte_addr(ca1_addr + 209, 0x6E);
+    write_byte_addr(ca1_addr + 210, 0xBB);
+    write_byte_addr(ca1_addr + 211, 0x73);
+    write_byte_addr(ca1_addr + 212, 0x87);
+    write_byte_addr(ca1_addr + 213, 0x17);
+    write_byte_addr(ca1_addr + 214, 0xF2);
+    write_byte_addr(ca1_addr + 215, 0x32);
+    write_byte_addr(ca1_addr + 216, 0x46);
+    write_byte_addr(ca1_addr + 217, 0x28);
+    write_byte_addr(ca1_addr + 218, 0xB8);
+    write_byte_addr(ca1_addr + 219, 0x43);
+    write_byte_addr(ca1_addr + 220, 0xFA);
+    write_byte_addr(ca1_addr + 221, 0xB7);
+    write_byte_addr(ca1_addr + 222, 0x1D);
+    write_byte_addr(ca1_addr + 223, 0xAA);
+    write_byte_addr(ca1_addr + 224, 0xCA);
+    write_byte_addr(ca1_addr + 225, 0xB4);
+    write_byte_addr(ca1_addr + 226, 0xF2);
+    write_byte_addr(ca1_addr + 227, 0x9F);
+    write_byte_addr(ca1_addr + 228, 0x24);
+    write_byte_addr(ca1_addr + 229, 0x0E);
+    write_byte_addr(ca1_addr + 230, 0x2D);
+    write_byte_addr(ca1_addr + 231, 0x4B);
+    write_byte_addr(ca1_addr + 232, 0xF7);
+    write_byte_addr(ca1_addr + 233, 0x71);
+    write_byte_addr(ca1_addr + 234, 0x5C);
+    write_byte_addr(ca1_addr + 235, 0x5E);
+    write_byte_addr(ca1_addr + 236, 0x69);
+    write_byte_addr(ca1_addr + 237, 0xFF);
+    write_byte_addr(ca1_addr + 238, 0xEA);
+    write_byte_addr(ca1_addr + 239, 0x95);
+    write_byte_addr(ca1_addr + 240, 0x02);
+    write_byte_addr(ca1_addr + 241, 0xCB);
+    write_byte_addr(ca1_addr + 242, 0x38);
+    write_byte_addr(ca1_addr + 243, 0x8A);
+    write_byte_addr(ca1_addr + 244, 0xAE);
+    write_byte_addr(ca1_addr + 245, 0x50);
+    write_byte_addr(ca1_addr + 246, 0x38);
+    write_byte_addr(ca1_addr + 247, 0x6F);
+    write_byte_addr(ca1_addr + 248, 0xDB);
+    write_byte_addr(ca1_addr + 249, 0xFB);
+    write_byte_addr(ca1_addr + 250, 0x2D);
+    write_byte_addr(ca1_addr + 251, 0x62);
+    write_byte_addr(ca1_addr + 252, 0x1B);
+    write_byte_addr(ca1_addr + 253, 0xC5);
+    write_byte_addr(ca1_addr + 254, 0xC7);
+    write_byte_addr(ca1_addr + 255, 0x1E);
+    write_byte_addr(ca1_addr + 256, 0x54);
+    write_byte_addr(ca1_addr + 257, 0xE1);
+    write_byte_addr(ca1_addr + 258, 0x77);
+    write_byte_addr(ca1_addr + 259, 0xE0);
+    write_byte_addr(ca1_addr + 260, 0x67);
+    write_byte_addr(ca1_addr + 261, 0xC8);
+    write_byte_addr(ca1_addr + 262, 0x0F);
+    write_byte_addr(ca1_addr + 263, 0x9C);
+    write_byte_addr(ca1_addr + 264, 0x87);
+    write_byte_addr(ca1_addr + 265, 0x23);
+    write_byte_addr(ca1_addr + 266, 0xD6);
+    write_byte_addr(ca1_addr + 267, 0x3F);
+    write_byte_addr(ca1_addr + 268, 0x40);
+    write_byte_addr(ca1_addr + 269, 0x20);
+    write_byte_addr(ca1_addr + 270, 0x7F);
+    write_byte_addr(ca1_addr + 271, 0x20);
+    write_byte_addr(ca1_addr + 272, 0x80);
+    write_byte_addr(ca1_addr + 273, 0xC4);
+    write_byte_addr(ca1_addr + 274, 0x80);
+    write_byte_addr(ca1_addr + 275, 0x4C);
+    write_byte_addr(ca1_addr + 276, 0x3E);
+    write_byte_addr(ca1_addr + 277, 0x3B);
+    write_byte_addr(ca1_addr + 278, 0x24);
+    write_byte_addr(ca1_addr + 279, 0x26);
+    write_byte_addr(ca1_addr + 280, 0x8E);
+    write_byte_addr(ca1_addr + 281, 0x04);
+    write_byte_addr(ca1_addr + 282, 0xAE);
+    write_byte_addr(ca1_addr + 283, 0x6C);
+    write_byte_addr(ca1_addr + 284, 0x9A);
+    write_byte_addr(ca1_addr + 285, 0xC8);
+    write_byte_addr(ca1_addr + 286, 0xAA);
+    write_byte_addr(ca1_addr + 287, 0x0D);
+
+    // Amazon Root CA 1 exponent: 65537 (at offset 288, stored as u64 little-endian)
+    write_u64_addr(ca1_addr + 288, 65537);
 
     // Mark as initialized
     write_u64_addr(ROOT_CA_INITIALIZED_FLAG, 0x52434153);
@@ -11817,21 +12681,23 @@ fn x509_hash_issuer(cert_addr: i64, cert_len: i64, hash_addr: i64) -> i64 {
 fn root_ca_find_by_issuer(issuer_hash_addr: i64) -> i64 {
     root_ca_store_init();
 
-    // For now, this is a simplified implementation
-    // In production, would compare issuer hash against stored CA issuer hashes
-
-    // Return 0 to indicate "found" for testing purposes
-    // Real implementation would iterate through stored CAs
-
     let mut i: i64 = 0;
     while i < MAX_ROOT_CAS {
         let ca_addr = ROOT_CA_STORE_ADDR + (i * ROOT_CA_ENTRY_SIZE);
-        let marker = read_u64_addr(ca_addr);
 
-        // Check if this entry is valid
-        if marker != 0 {
-            // In full implementation, compare hashes
-            // For now, return first valid entry as "match"
+        // Compare all 32 bytes of the stored Subject DN hash
+        // against the provided issuer hash
+        let mut match_found: i64 = 1;
+        let mut j: i64 = 0;
+        while j < 32 {
+            if read_byte_addr(ca_addr + j) != read_byte_addr(issuer_hash_addr + j) {
+                match_found = 0;
+                j = 32;  // break
+            }
+            j = j + 1;
+        }
+
+        if match_found != 0 {
             return i;
         }
 
@@ -11848,9 +12714,6 @@ fn root_ca_get_pubkey(ca_index: i64, n_addr: i64, n_len_addr: i64, e_addr: i64) 
     }
 
     let ca_addr = ROOT_CA_STORE_ADDR + (ca_index * ROOT_CA_ENTRY_SIZE);
-
-    // In production, copy stored public key
-    // For now, set dummy values for testing
 
     // Copy N (256 bytes for 2048-bit key)
     let mut i: i64 = 0;
@@ -11881,6 +12744,7 @@ fn x509_verify_cert_signature(
 
     let tbs_result = x509_extract_tbs_certificate(cert_addr, cert_len, tbs_start_addr, tbs_len_addr);
     if tbs_result < 0 {
+        serial_out(84); serial_out(66); serial_out(83); serial_out(69); serial_out(82); serial_out(82); serial_newline(); // TBSERR
         return CERT_ERR_PARSE_FAILED;
     }
 
@@ -12048,17 +12912,58 @@ fn x509_validate_chain(
         i = i + 1;
     }
 
-    // 4. Verify last certificate is signed by a trusted root CA
-    let last_cert_addr = read_u64_addr(cert_chain_addr + (chain_count - 1) * 8) as i64;
-    let last_cert_len = read_u64_addr(cert_chain_lens + (chain_count - 1) * 8) as i64;
-
-    // Hash issuer of last certificate
+    // 4. Find trust anchor: walk chain from the end to find a cert whose
+    //    issuer matches a trusted root CA (handles cross-signed chains)
     let issuer_hash_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_HASH;
-    let hash_result = x509_hash_issuer(last_cert_addr, last_cert_len, issuer_hash_addr);
+    let root_n_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_N;
+    let root_n_len_addr = RSA_WORK_ADDR + 4136;
+    let root_e_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_E;
 
-    // Find matching root CA
-    let ca_index = root_ca_find_by_issuer(issuer_hash_addr);
-    if ca_index < 0 {
+    let mut anchor_found: i64 = 0;
+    let mut anchor_idx: i64 = chain_count - 1;
+    while anchor_idx >= 0 {
+        let anchor_cert_addr = read_u64_addr(cert_chain_addr + anchor_idx * 8) as i64;
+        let anchor_cert_len = read_u64_addr(cert_chain_lens + anchor_idx * 8) as i64;
+
+        x509_hash_issuer(anchor_cert_addr, anchor_cert_len, issuer_hash_addr);
+
+        // Debug: show anchor search progress
+        serial_out(65); serial_out(58); // A:
+        serial_print_dec(anchor_idx);
+
+        let ca_index = root_ca_find_by_issuer(issuer_hash_addr);
+        serial_out(67); serial_out(58); // C:
+        serial_print_dec(ca_index);
+        serial_newline();
+
+        if ca_index >= 0 {
+            let get_result = root_ca_get_pubkey(ca_index, root_n_addr, root_n_len_addr, root_e_addr);
+            if get_result >= 0 {
+                let root_n_len = read_u64_addr(root_n_len_addr) as i64;
+                let root_e = read_u64_addr(root_e_addr);
+
+                serial_out(86); serial_out(58); // V:
+                serial_print_dec(anchor_idx);
+
+                let root_sig_result = x509_verify_cert_signature(
+                    anchor_cert_addr, anchor_cert_len,
+                    root_n_addr, root_n_len, root_e
+                );
+
+                serial_out(82); serial_out(58); // R:
+                serial_print_dec(root_sig_result);
+                serial_newline();
+
+                if root_sig_result == CERT_OK {
+                    anchor_found = 1;
+                    anchor_idx = -1;  // break
+                }
+            }
+        }
+        anchor_idx = anchor_idx - 1;
+    }
+
+    if anchor_found == 0 {
         serial_out(78);  // N
         serial_out(79);  // O
         serial_out(67);  // C
@@ -12066,22 +12971,6 @@ fn x509_validate_chain(
         serial_newline();
         return CERT_ERR_UNKNOWN_CA;
     }
-
-    // Get root CA public key and verify signature
-    let root_n_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_N;
-    let root_n_len_addr = RSA_WORK_ADDR + 4136;
-    let root_e_addr = RSA_WORK_ADDR + CERT_WORK_ISSUER_E;
-
-    let get_result = root_ca_get_pubkey(ca_index, root_n_addr, root_n_len_addr, root_e_addr);
-    if get_result < 0 {
-        return CERT_ERR_UNKNOWN_CA;
-    }
-
-    let root_n_len = read_u64_addr(root_n_len_addr) as i64;
-    let root_e = read_u64_addr(root_e_addr);
-
-    // Skip signature verification against root for now (would need actual root CA keys)
-    // In production, verify: x509_verify_cert_signature(last_cert_addr, last_cert_len, ...)
 
     serial_out(67);  // C
     serial_out(72);  // H
@@ -12118,12 +13007,113 @@ fn validation_error_to_alert(error: i64) -> i64 {
     46  // certificate_unknown
 }
 
-// Get current Unix time (seconds since 1970)
-// For now, returns a hardcoded value for testing
-// In production, would read from RTC or NTP
+// CMOS RTC helpers
+
+fn cmos_read_register(reg: i64) -> i64 {
+    outb(0x70, reg);
+    inb(0x71)
+}
+
+fn bcd_to_binary(bcd: i64) -> i64 {
+    ((bcd >> 4) * 10) + (bcd & 0x0F)
+}
+
+fn is_leap_year(year: i64) -> i64 {
+    if year % 400 == 0 { return 1; }
+    if year % 100 == 0 { return 0; }
+    if year % 4 == 0 { return 1; }
+    0
+}
+
+fn days_in_month(month: i64, leap: i64) -> i64 {
+    if month == 1 { return 31; }
+    if month == 2 {
+        if leap != 0 { return 29; }
+        return 28;
+    }
+    if month == 3 { return 31; }
+    if month == 4 { return 30; }
+    if month == 5 { return 31; }
+    if month == 6 { return 30; }
+    if month == 7 { return 31; }
+    if month == 8 { return 31; }
+    if month == 9 { return 30; }
+    if month == 10 { return 31; }
+    if month == 11 { return 30; }
+    31  // month == 12
+}
+
+fn unix_time_from_date(year: i64, month: i64, day: i64, hours: i64, minutes: i64, seconds: i64) -> i64 {
+    let mut total_days: i64 = 0;
+
+    // Count days from 1970 to year-1
+    let mut y: i64 = 1970;
+    while y < year {
+        if is_leap_year(y) != 0 {
+            total_days = total_days + 366;
+        } else {
+            total_days = total_days + 365;
+        }
+        y = y + 1;
+    }
+
+    // Count days from months in current year
+    let leap = is_leap_year(year);
+    let mut m: i64 = 1;
+    while m < month {
+        total_days = total_days + days_in_month(m, leap);
+        m = m + 1;
+    }
+
+    // Add remaining days (day is 1-based)
+    total_days = total_days + (day - 1);
+
+    (total_days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+}
+
+// Get current Unix time (seconds since 1970) by reading CMOS RTC
 fn get_current_unix_time() -> i64 {
-    // January 2025 timestamp for testing
-    1735689600  // 2025-01-01 00:00:00 UTC
+    // Wait for any RTC update to complete
+    while (cmos_read_register(0x0A) & 0x80) != 0 {}
+
+    let raw_seconds = cmos_read_register(0x00);
+    let raw_minutes = cmos_read_register(0x02);
+    let raw_hours = cmos_read_register(0x04);
+    let raw_day = cmos_read_register(0x07);
+    let raw_month = cmos_read_register(0x08);
+    let raw_year = cmos_read_register(0x09);
+    let raw_century = cmos_read_register(0x32);
+
+    let status_b = cmos_read_register(0x0B);
+    let is_bcd = (status_b & 0x04) == 0;
+
+    let mut seconds = raw_seconds;
+    let mut minutes = raw_minutes;
+    let mut hours = raw_hours;
+    let mut day = raw_day;
+    let mut month = raw_month;
+    let mut year_low = raw_year;
+    let mut century = raw_century;
+
+    if is_bcd {
+        seconds = bcd_to_binary(seconds);
+        minutes = bcd_to_binary(minutes);
+        hours = bcd_to_binary(hours);
+        day = bcd_to_binary(day);
+        month = bcd_to_binary(month);
+        year_low = bcd_to_binary(year_low);
+        century = bcd_to_binary(century);
+    }
+
+    // Compute full year
+    let mut year: i64 = 0;
+    if century > 0 {
+        year = (century * 100) + year_low;
+    } else {
+        year = 2000 + year_low;
+    }
+
+    unix_time_from_date(year, month, day, hours, minutes, seconds)
 }
 
 // Send TLS alert
@@ -12147,6 +13137,12 @@ fn tls_send_alert(conn: i64, socket: i64, level: i64, description: i64) -> i64 {
 // ============================================================
 // TLS Handshake Implementation
 // ============================================================
+
+// Handshake accumulation buffers (must be declared before functions that use them)
+const TLS_HANDSHAKE_BUF: i64 = 0x4020000;
+const TLS_HANDSHAKE_BUF_SIZE: i64 = 16384;
+const TLS_HANDSHAKE_MSG_BUF: i64 = 0x4030000;  // Concatenated handshake message bodies (8KB)
+const TLS_HANDSHAKE_MSG_BUF_SIZE: i64 = 8192;
 
 // Build and send ClientHello message
 fn tls_send_client_hello(conn: i64, socket: i64) -> i64 {
@@ -12244,6 +13240,53 @@ fn tls_send_client_hello(conn: i64, socket: i64) -> i64 {
         pos = pos + hostname_len;
     }
 
+    // Signature Algorithms extension (0x000D) - mandatory for TLS 1.2
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x0D);
+    pos = pos + 2;
+    // Extension data length: 2 (list length) + 2*N (algorithms)
+    // Algorithms: rsa_pkcs1_sha256 (0x0401), rsa_pkcs1_sha384 (0x0501), rsa_pkcs1_sha512 (0x0601)
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x08);  // 8 bytes of data
+    pos = pos + 2;
+    // Signature hash algorithms list length
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x06);  // 6 bytes = 3 algorithms
+    pos = pos + 2;
+    // rsa_pkcs1_sha256 (0x0401)
+    write_byte_addr(tx_buf + pos, 0x04);
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+    // rsa_pkcs1_sha384 (0x0501)
+    write_byte_addr(tx_buf + pos, 0x05);
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+    // rsa_pkcs1_sha512 (0x0601)
+    write_byte_addr(tx_buf + pos, 0x06);
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+
+    // Renegotiation Info extension (0xFF01)
+    write_byte_addr(tx_buf + pos, 0xFF);
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+    // Extension data length: 1 byte (empty renegotiated_connection)
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x01);
+    pos = pos + 2;
+    // Renegotiated connection length: 0
+    write_byte_addr(tx_buf + pos, 0x00);
+    pos = pos + 1;
+
+    // Extended Master Secret extension (0x0017)
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x17);
+    pos = pos + 2;
+    // Extension data length: 0
+    write_byte_addr(tx_buf + pos, 0x00);
+    write_byte_addr(tx_buf + pos + 1, 0x00);
+    pos = pos + 2;
+
     // Fill extension length
     let ext_len = pos - ext_start - 2;
     write_byte_addr(tx_buf + ext_start, shr_u64(ext_len as u64, 8) as i64);
@@ -12260,8 +13303,13 @@ fn tls_send_client_hello(conn: i64, socket: i64) -> i64 {
     write_byte_addr(tx_buf + record_len_pos, shr_u64(record_len as u64, 8) as i64);
     write_byte_addr(tx_buf + record_len_pos + 1, record_len as i64);
 
-    // Update handshake hash with ClientHello (excluding record header)
-    sha256_hash(tx_buf + 5, record_len, conn + TLS_OFF_HANDSHAKE_HASH);
+    // Copy ClientHello handshake body to message buffer (excluding TLS record header)
+    let mut j: i64 = 0;
+    while j < record_len {
+        write_byte_addr(TLS_HANDSHAKE_MSG_BUF + j, read_byte_addr(tx_buf + 5 + j));
+        j = j + 1;
+    }
+    write_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE, record_len as u64);
 
     // Debug output
     serial_out(67);  // C
@@ -12275,131 +13323,239 @@ fn tls_send_client_hello(conn: i64, socket: i64) -> i64 {
 }
 
 // Receive and parse ServerHello, Certificate, ServerHelloDone
+// Uses a large accumulation buffer at TLS_HANDSHAKE_BUF (16KB) since
+// amazon.com sends ~5KB of certificates across multiple TCP segments.
 fn tls_recv_server_hello(conn: i64, socket: i64) -> i64 {
-    let rx_buf = conn + TLS_OFF_RX_BUF;
+    let hs_buf = TLS_HANDSHAKE_BUF;
+    let mut total_len: i64 = 0;
+    let mut got_server_hello_done: i64 = 0;
+    let mut attempts: i64 = 0;
 
-    // Receive data
-    let recv_len = syscall_net_recv(socket, rx_buf, 4096);
-    if recv_len <= 0 {
-        serial_out(82);  // R
-        serial_out(88);  // X
-        serial_out(69);  // E
-        serial_out(82);  // R
-        serial_out(82);  // R
-        serial_newline();
-        return -1;
-    }
+    // Poll and accumulate data until we have all handshake messages
+    // Use counter-based timeout (works during early boot before timer interrupts)
+    let max_attempts: i64 = 50000;  // ~10 seconds with busy waits
 
-    serial_out(82);  // R
-    serial_out(88);  // X
-    serial_out(58);  // :
-    serial_hex64(recv_len as u64);
-    serial_newline();
+    while got_server_hello_done == 0 && attempts < max_attempts {
 
-    // Parse TLS records
-    let mut offset: i64 = 0;
-    while offset < recv_len {
-        let content_type = read_byte_addr(rx_buf + offset);
-        let version_major = read_byte_addr(rx_buf + offset + 1);
-        let version_minor = read_byte_addr(rx_buf + offset + 2);
-        let record_len = bit_or(shl_u64(read_byte_addr(rx_buf + offset + 3) as u64, 8), read_byte_addr(rx_buf + offset + 4) as u64) as i64;
+        // Process pending E1000 packets into TCP RX buffer
+        syscall_net_poll();
 
-        if content_type == 0x16 {  // Handshake
-            let hs_type = read_byte_addr(rx_buf + offset + 5);
-            let hs_len = bit_or(bit_or(shl_u64(read_byte_addr(rx_buf + offset + 6) as u64, 16),
-                         shl_u64(read_byte_addr(rx_buf + offset + 7) as u64, 8)),
-                          read_byte_addr(rx_buf + offset + 8) as u64) as i64;
+        // Try to receive data
+        let space = TLS_HANDSHAKE_BUF_SIZE - total_len;
+        if space <= 0 {
+            serial_out(79);  // O
+            serial_out(86);  // V
+            serial_out(70);  // F
+            serial_newline();
+            return -1;  // Buffer overflow
+        }
 
-            serial_out(72);  // H
-            serial_out(83);  // S
+        let recv_len = syscall_net_recv(socket, hs_buf + total_len, space);
+        if recv_len > 0 {
+            total_len = total_len + recv_len;
+
+            serial_out(82);  // R
+            serial_out(88);  // X
             serial_out(58);  // :
-            serial_hex64(hs_type as u64);
+            serial_print_dec(recv_len);
+            serial_out(47);  // /
+            serial_print_dec(total_len);
             serial_newline();
 
-            if hs_type == 2 {  // ServerHello
-                // Extract server random (starts at offset+11)
-                let mut i: i64 = 0;
-                while i < 32 {
-                    write_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i, read_byte_addr(rx_buf + offset + 11 + i));
-                    i = i + 1;
+            // Try to parse what we have so far to check for ServerHelloDone
+            got_server_hello_done = tls_check_server_hello_done(hs_buf, total_len);
+        } else if recv_len < 0 {
+            serial_out(82);  // R
+            serial_out(88);  // X
+            serial_out(69);  // E
+            serial_out(82);  // R
+            serial_out(82);  // R
+            serial_newline();
+            return -1;
+        }
+
+        // Brief busy-wait between polls using pause instruction to prevent optimization
+        if recv_len == 0 {
+            let mut wait: i64 = 0;
+            while wait < 100000 {
+                unsafe { asm!("pause", options(nostack, att_syntax)); }
+                wait = wait + 1;
+            }
+        }
+
+        attempts = attempts + 1;
+    }
+
+    if got_server_hello_done == 0 {
+        serial_out(84);  // T
+        serial_out(77);  // M
+        serial_out(79);  // O
+        serial_newline();
+        return -1;  // Timeout
+    }
+
+    // Extract server handshake message bodies into TLS_HANDSHAKE_MSG_BUF
+    // (appending after the ClientHello body already stored there)
+    let mut msg_len = read_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE) as i64;
+    let mut rec_offset: i64 = 0;
+    while rec_offset + 5 <= total_len {
+        let ct = read_byte_addr(hs_buf + rec_offset);
+        let rl = bit_or(shl_u64(read_byte_addr(hs_buf + rec_offset + 3) as u64, 8),
+                        read_byte_addr(hs_buf + rec_offset + 4) as u64) as i64;
+        if ct == 0x16 {  // Handshake record
+            // Copy record payload (handshake message bytes) to msg buffer
+            let mut k: i64 = 0;
+            while k < rl && msg_len < TLS_HANDSHAKE_MSG_BUF_SIZE {
+                write_byte_addr(TLS_HANDSHAKE_MSG_BUF + msg_len, read_byte_addr(hs_buf + rec_offset + 5 + k));
+                msg_len = msg_len + 1;
+                k = k + 1;
+            }
+        }
+        rec_offset = rec_offset + 5 + rl;
+    }
+    write_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE, msg_len as u64);
+
+    // Now parse all the accumulated TLS records
+    tls_parse_server_hello_records(conn, hs_buf, total_len)
+}
+
+// Check if accumulated data contains a ServerHelloDone message
+fn tls_check_server_hello_done(buf: i64, len: i64) -> i64 {
+    let mut offset: i64 = 0;
+    while offset + 5 <= len {
+        let content_type = read_byte_addr(buf + offset);
+        let record_len = bit_or(shl_u64(read_byte_addr(buf + offset + 3) as u64, 8),
+                                read_byte_addr(buf + offset + 4) as u64) as i64;
+
+        // Check if we have the complete record
+        if offset + 5 + record_len > len {
+            return 0;  // Incomplete record, need more data
+        }
+
+        if content_type == 0x16 {  // Handshake
+            // Scan handshake messages within this record
+            let mut hs_offset = offset + 5;
+            let record_end = offset + 5 + record_len;
+            while hs_offset + 4 <= record_end {
+                let hs_type = read_byte_addr(buf + hs_offset);
+                let hs_len = bit_or(bit_or(
+                    shl_u64(read_byte_addr(buf + hs_offset + 1) as u64, 16),
+                    shl_u64(read_byte_addr(buf + hs_offset + 2) as u64, 8)),
+                    read_byte_addr(buf + hs_offset + 3) as u64) as i64;
+
+                if hs_type == 14 {  // ServerHelloDone
+                    return 1;
                 }
 
-                serial_out(83);  // S
-                serial_out(72);  // H
-                serial_out(79);  // O
-                serial_out(75);  // K
-                serial_newline();
-            }
-
-            if hs_type == 11 {  // Certificate
-                // Certificate message format:
-                // - 3 bytes: handshake header (type + 3-byte length) - already parsed
-                // - 3 bytes: total certificates length
-                // - For each certificate:
-                //   - 3 bytes: certificate length
-                //   - N bytes: certificate DER data
-
-                // Offset to certificate message content (after handshake type and length)
-                let cert_msg_start = offset + 9;  // Skip record header (5) + hs type (1) + hs length (3)
-
-                // Parse total certificates length (3 bytes big-endian)
-                let total_certs_len = bit_or(bit_or(
-                    shl_u64(read_byte_addr(rx_buf + cert_msg_start) as u64, 16),
-                    shl_u64(read_byte_addr(rx_buf + cert_msg_start + 1) as u64, 8)),
-                    read_byte_addr(rx_buf + cert_msg_start + 2) as u64) as i64;
-
-                // Parse entire certificate chain
-                let mut cert_offset = cert_msg_start + 3;
-                let cert_end = cert_msg_start + 3 + total_certs_len;
-                let mut chain_count: i64 = 0;
-
-                while cert_offset < cert_end && chain_count < 4 {
-                    // Parse certificate length (3 bytes big-endian)
-                    let cert_len = bit_or(bit_or(
-                        shl_u64(read_byte_addr(rx_buf + cert_offset) as u64, 16),
-                        shl_u64(read_byte_addr(rx_buf + cert_offset + 1) as u64, 8)),
-                        read_byte_addr(rx_buf + cert_offset + 2) as u64) as i64;
-
-                    // Certificate DER data starts after length field
-                    let cert_data_addr = rx_buf + cert_offset + 3;
-
-                    // Store in chain arrays
-                    write_u64_addr(conn + TLS_OFF_CERT_CHAIN_ADDRS + chain_count * 8, cert_data_addr as u64);
-                    write_u64_addr(conn + TLS_OFF_CERT_CHAIN_LENS + chain_count * 8, cert_len as u64);
-
-                    // Also keep first cert in legacy location
-                    if chain_count == 0 {
-                        write_u64_addr(conn + TLS_OFF_CERT_ADDR, cert_data_addr as u64);
-                        write_u64_addr(conn + TLS_OFF_CERT_LEN, cert_len as u64);
-                    }
-
-                    cert_offset = cert_offset + 3 + cert_len;
-                    chain_count = chain_count + 1;
-                }
-
-                write_u64_addr(conn + TLS_OFF_CERT_CHAIN_COUNT, chain_count as u64);
-
-                serial_out(67);  // C
-                serial_out(69);  // E
-                serial_out(82);  // R
-                serial_out(84);  // T
-                serial_out(83);  // S
-                serial_out(58);  // :
-                serial_print_dec(chain_count);
-                serial_newline();
-            }
-
-            if hs_type == 14 {  // ServerHelloDone
-                serial_out(68);  // D
-                serial_out(79);  // O
-                serial_out(78);  // N
-                serial_out(69);  // E
-                serial_newline();
-                return 0;  // Handshake messages received
+                hs_offset = hs_offset + 4 + hs_len;
             }
         } else if content_type == 0x15 {  // Alert
-            let alert_level = read_byte_addr(rx_buf + offset + 5);
-            let alert_desc = read_byte_addr(rx_buf + offset + 6);
+            return 1;  // Stop accumulating on alert
+        }
+
+        offset = offset + 5 + record_len;
+    }
+
+    0  // Not yet complete
+}
+
+// Parse accumulated TLS server hello records
+fn tls_parse_server_hello_records(conn: i64, buf: i64, total_len: i64) -> i64 {
+    let mut offset: i64 = 0;
+    while offset + 5 <= total_len {
+        let content_type = read_byte_addr(buf + offset);
+        let record_len = bit_or(shl_u64(read_byte_addr(buf + offset + 3) as u64, 8),
+                                read_byte_addr(buf + offset + 4) as u64) as i64;
+
+        if content_type == 0x16 {  // Handshake
+            // Parse handshake messages within this record
+            let mut hs_offset = offset + 5;
+            let record_end = offset + 5 + record_len;
+            while hs_offset + 4 <= record_end {
+                let hs_type = read_byte_addr(buf + hs_offset);
+                let hs_len = bit_or(bit_or(
+                    shl_u64(read_byte_addr(buf + hs_offset + 1) as u64, 16),
+                    shl_u64(read_byte_addr(buf + hs_offset + 2) as u64, 8)),
+                    read_byte_addr(buf + hs_offset + 3) as u64) as i64;
+
+                serial_out(72);  // H
+                serial_out(83);  // S
+                serial_out(58);  // :
+                serial_hex64(hs_type as u64);
+                serial_newline();
+
+                if hs_type == 2 {  // ServerHello
+                    // Extract server random (starts at hs_offset+6: skip type(1)+len(3)+version(2))
+                    let mut i: i64 = 0;
+                    while i < 32 {
+                        write_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i, read_byte_addr(buf + hs_offset + 6 + i));
+                        i = i + 1;
+                    }
+
+                    serial_out(83);  // S
+                    serial_out(72);  // H
+                    serial_out(79);  // O
+                    serial_out(75);  // K
+                    serial_newline();
+                }
+
+                if hs_type == 11 {  // Certificate
+                    let cert_msg_start = hs_offset + 4;  // After hs type(1) + hs length(3)
+
+                    let total_certs_len = bit_or(bit_or(
+                        shl_u64(read_byte_addr(buf + cert_msg_start) as u64, 16),
+                        shl_u64(read_byte_addr(buf + cert_msg_start + 1) as u64, 8)),
+                        read_byte_addr(buf + cert_msg_start + 2) as u64) as i64;
+
+                    let mut cert_offset = cert_msg_start + 3;
+                    let cert_end = cert_msg_start + 3 + total_certs_len;
+                    let mut chain_count: i64 = 0;
+
+                    while cert_offset < cert_end && chain_count < 4 {
+                        let cert_len = bit_or(bit_or(
+                            shl_u64(read_byte_addr(buf + cert_offset) as u64, 16),
+                            shl_u64(read_byte_addr(buf + cert_offset + 1) as u64, 8)),
+                            read_byte_addr(buf + cert_offset + 2) as u64) as i64;
+
+                        let cert_data_addr = buf + cert_offset + 3;
+
+                        write_u64_addr(conn + TLS_OFF_CERT_CHAIN_ADDRS + chain_count * 8, cert_data_addr as u64);
+                        write_u64_addr(conn + TLS_OFF_CERT_CHAIN_LENS + chain_count * 8, cert_len as u64);
+
+                        if chain_count == 0 {
+                            write_u64_addr(conn + TLS_OFF_CERT_ADDR, cert_data_addr as u64);
+                            write_u64_addr(conn + TLS_OFF_CERT_LEN, cert_len as u64);
+                        }
+
+                        cert_offset = cert_offset + 3 + cert_len;
+                        chain_count = chain_count + 1;
+                    }
+
+                    write_u64_addr(conn + TLS_OFF_CERT_CHAIN_COUNT, chain_count as u64);
+
+                    serial_out(67);  // C
+                    serial_out(69);  // E
+                    serial_out(82);  // R
+                    serial_out(84);  // T
+                    serial_out(83);  // S
+                    serial_out(58);  // :
+                    serial_print_dec(chain_count);
+                    serial_newline();
+                }
+
+                if hs_type == 14 {  // ServerHelloDone
+                    serial_out(68);  // D
+                    serial_out(79);  // O
+                    serial_out(78);  // N
+                    serial_out(69);  // E
+                    serial_newline();
+                    return 0;
+                }
+
+                hs_offset = hs_offset + 4 + hs_len;
+            }
+        } else if content_type == 0x15 {  // Alert
+            let alert_desc = read_byte_addr(buf + offset + 6);
             serial_out(65);  // A
             serial_out(76);  // L
             serial_out(69);  // E
@@ -12544,6 +13700,20 @@ fn tls_send_client_key_exchange(conn: i64, socket: i64) -> i64 {
     write_byte_addr(tx_buf + record_len_pos, shr_u64(record_len as u64, 8) as i64);
     write_byte_addr(tx_buf + record_len_pos + 1, record_len as i64);
 
+    // Append CKE handshake body to handshake message buffer
+    let mut msg_len = read_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE) as i64;
+    let cke_body_len = record_len;  // Handshake body = record payload
+    let mut k: i64 = 0;
+    while k < cke_body_len && msg_len < TLS_HANDSHAKE_MSG_BUF_SIZE {
+        write_byte_addr(TLS_HANDSHAKE_MSG_BUF + msg_len, read_byte_addr(tx_buf + 5 + k));
+        msg_len = msg_len + 1;
+        k = k + 1;
+    }
+    write_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE, msg_len as u64);
+
+    // Now compute the handshake hash (SHA-256 of all accumulated handshake messages)
+    sha256_hash(TLS_HANDSHAKE_MSG_BUF, msg_len, conn + TLS_OFF_HANDSHAKE_HASH);
+
     serial_out(67);  // C
     serial_out(75);  // K
     serial_out(69);  // E
@@ -12556,42 +13726,46 @@ fn tls_send_client_key_exchange(conn: i64, socket: i64) -> i64 {
 
 // Derive keys from master secret
 fn tls_derive_keys(conn: i64) {
-    // master_secret = PRF(premaster_secret, "master secret", client_random + server_random)
+    // Extended master secret: PRF(premaster, "extended master secret", session_hash)
+    // session_hash = SHA-256(all handshake messages) already computed in TLS_OFF_HANDSHAKE_HASH
     let label_addr = conn + TLS_OFF_TX_BUF + 1024;
-    // "master secret" = 13 bytes
-    write_byte_addr(label_addr, 109);      // m
-    write_byte_addr(label_addr + 1, 97);   // a
-    write_byte_addr(label_addr + 2, 115);  // s
-    write_byte_addr(label_addr + 3, 116);  // t
-    write_byte_addr(label_addr + 4, 101);  // e
-    write_byte_addr(label_addr + 5, 114);  // r
-    write_byte_addr(label_addr + 6, 32);   // (space)
-    write_byte_addr(label_addr + 7, 115);  // s
-    write_byte_addr(label_addr + 8, 101);  // e
-    write_byte_addr(label_addr + 9, 99);   // c
-    write_byte_addr(label_addr + 10, 114); // r
-    write_byte_addr(label_addr + 11, 101); // e
+    // "extended master secret" = 22 bytes
+    write_byte_addr(label_addr, 101);      // e
+    write_byte_addr(label_addr + 1, 120);  // x
+    write_byte_addr(label_addr + 2, 116);  // t
+    write_byte_addr(label_addr + 3, 101);  // e
+    write_byte_addr(label_addr + 4, 110);  // n
+    write_byte_addr(label_addr + 5, 100);  // d
+    write_byte_addr(label_addr + 6, 101);  // e
+    write_byte_addr(label_addr + 7, 100);  // d
+    write_byte_addr(label_addr + 8, 32);   // (space)
+    write_byte_addr(label_addr + 9, 109);  // m
+    write_byte_addr(label_addr + 10, 97);  // a
+    write_byte_addr(label_addr + 11, 115); // s
     write_byte_addr(label_addr + 12, 116); // t
+    write_byte_addr(label_addr + 13, 101); // e
+    write_byte_addr(label_addr + 14, 114); // r
+    write_byte_addr(label_addr + 15, 32);  // (space)
+    write_byte_addr(label_addr + 16, 115); // s
+    write_byte_addr(label_addr + 17, 101); // e
+    write_byte_addr(label_addr + 18, 99);  // c
+    write_byte_addr(label_addr + 19, 114); // r
+    write_byte_addr(label_addr + 20, 101); // e
+    write_byte_addr(label_addr + 21, 116); // t
 
-    // seed = client_random + server_random (64 bytes)
-    let seed_addr = label_addr + 64;
-    let mut i: i64 = 0;
-    while i < 32 {
-        write_byte_addr(seed_addr + i, read_byte_addr(conn + TLS_OFF_CLIENT_RANDOM + i));
-        write_byte_addr(seed_addr + 32 + i, read_byte_addr(conn + TLS_OFF_SERVER_RANDOM + i));
-        i = i + 1;
-    }
-
+    // seed = session_hash (32 bytes SHA-256)
     // Generate master secret (48 bytes)
-    tls_prf(conn + TLS_OFF_PREMASTER, 48, label_addr, 13, seed_addr, 64, conn + TLS_OFF_MASTER_SECRET, 48);
+    tls_prf(conn + TLS_OFF_PREMASTER, 48, label_addr, 22, conn + TLS_OFF_HANDSHAKE_HASH, 32, conn + TLS_OFF_MASTER_SECRET, 48);
 
     serial_out(77);  // M
     serial_out(83);  // S
-    serial_out(58);  // :
-    serial_hex64(read_byte_addr(conn + TLS_OFF_MASTER_SECRET) as u64);
+    serial_out(79);  // O
+    serial_out(75);  // K
     serial_newline();
 
     // key_block = PRF(master_secret, "key expansion", server_random + client_random)
+    let seed_addr = label_addr + 64;
+    let mut i: i64 = 0;
     // "key expansion" = 13 bytes
     write_byte_addr(label_addr, 107);      // k
     write_byte_addr(label_addr + 1, 101);  // e
@@ -12696,6 +13870,17 @@ fn tls_send_finished(conn: i64, socket: i64) -> i64 {
         i = i + 1;
     }
 
+    // Update handshake hash to include client Finished (for server Finished verification)
+    let mut msg_len = read_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE) as i64;
+    i = 0;
+    while i < 16 && msg_len < TLS_HANDSHAKE_MSG_BUF_SIZE {
+        write_byte_addr(TLS_HANDSHAKE_MSG_BUF + msg_len, read_byte_addr(finished_msg_addr + i));
+        msg_len = msg_len + 1;
+        i = i + 1;
+    }
+    write_u64_addr(TLS_HANDSHAKE_MSG_BUF + TLS_HANDSHAKE_MSG_BUF_SIZE, msg_len as u64);
+    sha256_hash(TLS_HANDSHAKE_MSG_BUF, msg_len, conn + TLS_OFF_HANDSHAKE_HASH);
+
     // Build IV for encryption (implicit IV + explicit nonce)
     let iv_addr = finished_msg_addr + 32;
     // First 4 bytes from client_write_IV
@@ -12783,10 +13968,58 @@ fn tls_send_finished(conn: i64, socket: i64) -> i64 {
 fn tls_recv_server_finished(conn: i64, socket: i64) -> i64 {
     let rx_buf = conn + TLS_OFF_RX_BUF;
 
-    let recv_len = syscall_net_recv(socket, rx_buf, 4096);
-    if recv_len <= 0 {
-        return -1;
+    // Accumulate data until we have CCS + full Finished record
+    let mut total_len: i64 = 0;
+    let mut need_more: i64 = 1;
+    let mut attempts: i64 = 0;
+    let max_attempts: i64 = 200;
+
+    while need_more == 1 && attempts < max_attempts {
+        syscall_net_poll();
+        let chunk = syscall_net_recv(socket, rx_buf + total_len, 4096 - total_len);
+        if chunk < 0 {
+            return -1;
+        }
+        if chunk > 0 {
+            total_len = total_len + chunk;
+            // Need at least 11 bytes (6 CCS + 5 record header) to know full length
+            if total_len >= 11 {
+                let ccs_len = (read_byte_addr(rx_buf + 3) * 256) + read_byte_addr(rx_buf + 4);
+                let fin_start = 5 + ccs_len;
+                if total_len >= fin_start + 5 {
+                    let fin_rec_len = (read_byte_addr(rx_buf + fin_start + 3) * 256) + read_byte_addr(rx_buf + fin_start + 4);
+                    if total_len >= fin_start + 5 + fin_rec_len {
+                        need_more = 0;
+                    }
+                }
+            }
+        }
+        // Wait between attempts - must be long enough for QEMU to deliver next packet
+        if need_more == 1 {
+            let mut wait: i64 = 0;
+            while wait < 500000 {
+                unsafe { asm!("pause", options(nostack, att_syntax)); }
+                wait = wait + 1;
+            }
+        }
+        attempts = attempts + 1;
     }
+
+    if need_more == 1 {
+        serial_out(83); serial_out(70); serial_out(84); serial_out(79); // SFTO
+        serial_out(58); serial_print_dec(total_len); serial_newline();
+        // Dump first few received bytes
+        let mut d: i64 = 0;
+        while d < total_len && d < 8 {
+            serial_print_dec(read_byte_addr(rx_buf + d));
+            serial_out(32);
+            d = d + 1;
+        }
+        serial_newline();
+        return -1;  // Timeout
+    }
+
+    let recv_len = total_len;
 
     serial_out(83);  // S
     serial_out(70);  // F
@@ -12796,14 +14029,126 @@ fn tls_recv_server_finished(conn: i64, socket: i64) -> i64 {
     serial_hex64(recv_len as u64);
     serial_newline();
 
-    // Parse and verify server's Finished
-    // For now, just accept it (TODO: proper verification)
+    // Parse ChangeCipherSpec record (type=0x14)
+    let mut offset: i64 = 0;
+    if read_byte_addr(rx_buf + offset) != 0x14 {
+        return -2;  // Expected ChangeCipherSpec
+    }
+    // Skip version (2 bytes) + length (2 bytes) + payload (1 byte)
+    let ccs_len = (read_byte_addr(rx_buf + offset + 3) * 256) + read_byte_addr(rx_buf + offset + 4);
+    offset = offset + 5 + ccs_len;
+
+    // Parse encrypted Finished record (type=0x16)
+    if read_byte_addr(rx_buf + offset) != 0x16 {
+        return -4;  // Expected Handshake
+    }
+    let fin_rec_len = (read_byte_addr(rx_buf + offset + 3) * 256) + read_byte_addr(rx_buf + offset + 4);
+    offset = offset + 5;
+
+    // Extract explicit nonce (8 bytes)
+    let nonce_offset = offset;
+    offset = offset + 8;
+
+    // Ciphertext length = total - 8 (nonce) - 16 (tag)
+    let ciphertext_len = fin_rec_len - 8 - 16;
+    if ciphertext_len <= 0 {
+        return -5;  // Invalid record length
+    }
+    let ciphertext_offset = offset;
+    offset = offset + ciphertext_len;
+
+    // GCM tag (16 bytes)
+    let tag_offset = offset;
+
+    // Build IV: server_write_IV (4 bytes) + explicit nonce (8 bytes)
+    let work_addr = conn + TLS_OFF_TX_BUF + 1024;
+    let iv_addr = work_addr;
+    let mut i: i64 = 0;
+    while i < 4 {
+        write_byte_addr(iv_addr + i, read_byte_addr(conn + TLS_OFF_AES_KEYS + 356 + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        write_byte_addr(iv_addr + 4 + i, read_byte_addr(rx_buf + nonce_offset + i));
+        i = i + 1;
+    }
+
+    // Build AAD: seq_num (8 bytes) + type (1) + version (2) + plaintext_len (2)
+    let aad_addr = iv_addr + 16;
+    i = 0;
+    while i < 8 {
+        write_byte_addr(aad_addr + i, read_byte_addr(conn + TLS_OFF_SERVER_SEQ + i));
+        i = i + 1;
+    }
+    write_byte_addr(aad_addr + 8, 0x16);   // Handshake
+    write_byte_addr(aad_addr + 9, 0x03);   // TLS 1.2
+    write_byte_addr(aad_addr + 10, 0x03);
+    write_byte_addr(aad_addr + 11, (ciphertext_len >> 8) as i64);
+    write_byte_addr(aad_addr + 12, (ciphertext_len & 0xFF) as i64);
+
+    // Decrypt with AES-GCM using server write key
+    let plaintext_addr = aad_addr + 32;
+    let result = aes_gcm_decrypt(
+        iv_addr, rx_buf + ciphertext_offset, ciphertext_len,
+        aad_addr, 13, plaintext_addr, rx_buf + tag_offset,
+        conn + TLS_OFF_AES_KEYS + 176
+    );
+    if result != 0 {
+        return -6;  // GCM authentication failed
+    }
+
+    // Increment server sequence number
+    tls_inc_seq(conn + TLS_OFF_SERVER_SEQ);
+
+    // Verify Finished handshake type (0x14 = 20)
+    if read_byte_addr(plaintext_addr) != 20 {
+        return -7;  // Not a Finished message
+    }
+
+    // Extract verify_data (12 bytes at offset 4)
+    // Compute expected: PRF(master_secret, "server finished", handshake_hash)
+    let label_addr = plaintext_addr + 64;
+    // "server finished" = 15 bytes
+    write_byte_addr(label_addr, 115);      // s
+    write_byte_addr(label_addr + 1, 101);  // e
+    write_byte_addr(label_addr + 2, 114);  // r
+    write_byte_addr(label_addr + 3, 118);  // v
+    write_byte_addr(label_addr + 4, 101);  // e
+    write_byte_addr(label_addr + 5, 114);  // r
+    write_byte_addr(label_addr + 6, 32);   // (space)
+    write_byte_addr(label_addr + 7, 102);  // f
+    write_byte_addr(label_addr + 8, 105);  // i
+    write_byte_addr(label_addr + 9, 110);  // n
+    write_byte_addr(label_addr + 10, 105); // i
+    write_byte_addr(label_addr + 11, 115); // s
+    write_byte_addr(label_addr + 12, 104); // h
+    write_byte_addr(label_addr + 13, 101); // e
+    write_byte_addr(label_addr + 14, 100); // d
+
+    let expected_addr = label_addr + 32;
+    tls_prf(conn + TLS_OFF_MASTER_SECRET, 48, label_addr, 15, conn + TLS_OFF_HANDSHAKE_HASH, 32, expected_addr, 12);
+
+    // Compare verify_data (12 bytes)
+    i = 0;
+    while i < 12 {
+        if read_byte_addr(plaintext_addr + 4 + i) != read_byte_addr(expected_addr + i) {
+            return -8;  // Verify data mismatch
+        }
+        i = i + 1;
+    }
+
+    serial_out(83);  // S
+    serial_out(70);  // F
+    serial_out(79);  // O
+    serial_out(75);  // K
+    serial_newline();
 
     0
 }
 
 // ============================================================
-// TLS Syscall Handlers (Stubs - Full implementation needed)
+// TLS Syscall Handlers
 // ============================================================
 
 // SYS_TLS_CONNECT - Perform TLS handshake on socket
@@ -13101,7 +14446,8 @@ fn syscall_tls_recv(socket: i64, data_addr: i64, max_len: i64) -> i64 {
     let rx_buf = conn + TLS_OFF_RX_BUF;
     let work_addr = TLS_STATE_BASE + TLS_MAX_CONNECTIONS * TLS_CONN_SIZE + 10000;
 
-    // Receive TLS record
+    // Poll E1000 and receive TLS record
+    syscall_net_poll();
     let recv_len = syscall_net_recv(socket, rx_buf, 4096);
     if recv_len <= 0 {
         return recv_len;
@@ -13199,7 +14545,8 @@ fn syscall_tls_close(socket: i64) -> i64 {
         return 0;  // Already closed
     }
 
-    // TODO: Send close_notify alert
+    // Send close_notify alert (warning level=1, description=0)
+    tls_send_alert(conn, socket, 1, 0);
 
     tls_free_conn(conn);
     0
@@ -14911,6 +16258,48 @@ fn test_rsa_unit() {
     serial_out(84);  // T
     serial_newline();
 
+    // Test mul32_64 first
+    let m32_result = mul32_64(0xFFFFFFFF, 0xFFFFFFFF);
+    // Expected: 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001
+    serial_out(77); serial_out(51); serial_out(50); serial_out(58); // M32:
+    serial_hex64(m32_result);
+    if m32_result == 0xFFFFFFFE00000001 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+    }
+    serial_newline();
+
+    // Test mul64_128
+    let lo_temp = RSA_WORK_ADDR + 7800;
+    let m64_hi = mul64_128(0xFFFFFFFFFFFFFFFF, 2, lo_temp);
+    let m64_lo = read_u64_addr(lo_temp);
+    // Expected: 0xFFFFFFFFFFFFFFFF * 2 = 0x1FFFFFFFFFFFFFFFE
+    // hi = 1, lo = 0xFFFFFFFFFFFFFFFE
+    serial_out(77); serial_out(54); serial_out(52); serial_out(58); // M64:
+    serial_hex64(m64_hi); serial_out(47);
+    serial_hex64(m64_lo);
+    if m64_hi == 1 && m64_lo == 0xFFFFFFFFFFFFFFFE {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+    }
+    serial_newline();
+
+    // Test mul64_128 with real RSA value (base[0]^2)
+    // 0xCF8F692785AF7CA6 * 0xCF8F692785AF7CA6 = 0xA8493C648F8A9765 : 0xAAFBF66423A53BA4
+    let m64b_hi = mul64_128(0xCF8F692785AF7CA6, 0xCF8F692785AF7CA6, lo_temp);
+    let m64b_lo = read_u64_addr(lo_temp);
+    serial_out(77); serial_out(66); serial_out(58); // MB:
+    serial_hex64(m64b_hi); serial_out(47);
+    serial_hex64(m64b_lo);
+    if m64b_hi == 0xA8493C648F8A9765 && m64b_lo == 0xAAFBF66423A53BA4 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+    }
+    serial_newline();
+
     // Test big integer operations with small numbers
     let a_addr = RSA_WORK_ADDR + 8000;
     let b_addr = RSA_WORK_ADDR + 8256;
@@ -14949,7 +16338,7 @@ fn test_rsa_unit() {
     bigint_zero(b_addr);
     write_u64_addr(a_addr, 12345);
     write_u64_addr(b_addr, 67890);
-    bigint_mulmod(c_addr, a_addr, b_addr, a_addr);  // For small numbers, no mod needed
+    bigint_mulmod(c_addr, a_addr, b_addr, a_addr);
     // 12345 * 67890 = 838102050
     let result = read_u64_addr(c_addr);
 
@@ -15027,6 +16416,96 @@ fn test_rsa_unit() {
     }
     serial_newline();
 
+    // Test 5: Unsigned comparison test (critical for RSA-2048)
+    // Test u64_gt with high-bit values
+    serial_out(85); serial_out(54); serial_out(52); serial_out(58); // U64:
+    let test_high: u64 = 0x8000000000000000;
+    let test_low: u64 = 1;
+    if u64_gt(test_high, test_low) == 1 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+    }
+    serial_newline();
+
+    // Test 6: bigint_cmp with high-bit word (simulates RSA modulus)
+    serial_out(66); serial_out(67); serial_out(77); serial_out(80); serial_out(58); // BCMP:
+    bigint_zero(a_addr);
+    bigint_zero(b_addr);
+    // Set word 31 of a to high-bit value (like RSA-2048 modulus)
+    write_u64_addr(a_addr + 31 * 8, 0xC03B4567DEADBEEF);
+    write_u64_addr(a_addr, 0x1234);
+    // Set b to a small number
+    write_u64_addr(b_addr, 0x5678);
+    let cmp_result = bigint_cmp(a_addr, b_addr);
+    if cmp_result == 1 {
+        serial_out(79); serial_out(75); // OK (a > b)
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+        serial_out(32);
+        serial_print_dec(cmp_result);
+    }
+    serial_newline();
+
+    // Test 7: bigint_sub borrow detection with high-bit values
+    serial_out(66); serial_out(83); serial_out(85); serial_out(66); serial_out(58); // BSUB:
+    bigint_zero(a_addr);
+    bigint_zero(b_addr);
+    write_u64_addr(a_addr, 5);  // a = 5
+    write_u64_addr(b_addr, 7);  // b = 7
+    let borrow = bigint_sub(c_addr, a_addr, b_addr);  // c = 5 - 7, should borrow
+    if borrow == 1 {
+        serial_out(79); serial_out(75); // OK (borrow detected)
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+        serial_out(32);
+        serial_print_dec(borrow);
+    }
+    serial_newline();
+
+    // Test 8: Modular exponentiation with large modulus (high bit set in top word)
+    // Use a 2-word modulus: N = 0xC000000000000000_0000000000000007
+    // This tests that modular reduction works with unsigned comparison
+    serial_out(76); serial_out(77); serial_out(79); serial_out(68); serial_out(58); // LMOD:
+    bigint_zero(a_addr);   // base = 3
+    bigint_zero(b_addr);   // exp = 5
+    bigint_zero(c_addr);   // modulus
+    write_u64_addr(a_addr, 3);
+    write_u64_addr(b_addr, 5);
+    // N uses word 1 with high bit set
+    write_u64_addr(c_addr, 7);
+    write_u64_addr(c_addr + 8, 0xC000000000000000);
+    // 3^5 = 243. Since 243 < N (which is very large), result should be 243
+    bigint_modexp(result_addr, a_addr, b_addr, c_addr);
+    let lmod_result = read_u64_addr(result_addr);
+    if lmod_result == 243 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+        serial_out(32);
+        serial_hex64(lmod_result);
+    }
+    serial_newline();
+
+    // Test 9: bigint_add carry detection with max values
+    serial_out(67); serial_out(65); serial_out(82); serial_out(82); serial_out(89); serial_out(58); // CARRY:
+    bigint_zero(a_addr);
+    bigint_zero(b_addr);
+    write_u64_addr(a_addr, 0xFFFFFFFFFFFFFFFF);  // max u64
+    write_u64_addr(b_addr, 1);
+    let add_carry = bigint_add(c_addr, a_addr, b_addr);
+    let c_w0 = read_u64_addr(c_addr);
+    let c_w1 = read_u64_addr(c_addr + 8);
+    // Expected: 0xFFFFFFFFFFFFFFFF + 1 = 0x10000000000000000 → word0=0, word1=1
+    if c_w0 == 0 && c_w1 == 1 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+        serial_out(32);
+        serial_hex64(c_w0); serial_out(47); serial_hex64(c_w1);
+    }
+    serial_newline();
+
     serial_out(82);  // R
     serial_out(83);  // S
     serial_out(65);  // A
@@ -15035,6 +16514,583 @@ fn test_rsa_unit() {
     serial_out(79);  // O
     serial_out(78);  // N
     serial_out(69);  // E
+    serial_newline();
+}
+
+// Hardcoded RSA-2048 verification test using real Amazon/DigiCert certificate data
+fn test_rsa_2048_verify() {
+    // Print test header: RSA2K:
+    serial_out(82); serial_out(83); serial_out(65); serial_out(50); serial_out(75); serial_out(58);
+    serial_newline();
+
+    // Test data addresses (beyond RSA working area)
+    let test_n_addr: i64 = 51380224;
+    let test_s_addr: i64 = 51380480;
+    let test_h_addr: i64 = 51380736;
+
+    // Write issuer modulus N (256 bytes) - DigiCert Global CA G2
+    write_byte_addr(test_n_addr + 0, 211);
+    write_byte_addr(test_n_addr + 1, 72);
+    write_byte_addr(test_n_addr + 2, 124);
+    write_byte_addr(test_n_addr + 3, 190);
+    write_byte_addr(test_n_addr + 4, 243);
+    write_byte_addr(test_n_addr + 5, 5);
+    write_byte_addr(test_n_addr + 6, 134);
+    write_byte_addr(test_n_addr + 7, 93);
+    write_byte_addr(test_n_addr + 8, 91);
+    write_byte_addr(test_n_addr + 9, 213);
+    write_byte_addr(test_n_addr + 10, 47);
+    write_byte_addr(test_n_addr + 11, 133);
+    write_byte_addr(test_n_addr + 12, 78);
+    write_byte_addr(test_n_addr + 13, 75);
+    write_byte_addr(test_n_addr + 14, 224);
+    write_byte_addr(test_n_addr + 15, 134);
+    write_byte_addr(test_n_addr + 16, 173);
+    write_byte_addr(test_n_addr + 17, 21);
+    write_byte_addr(test_n_addr + 18, 172);
+    write_byte_addr(test_n_addr + 19, 97);
+    write_byte_addr(test_n_addr + 20, 207);
+    write_byte_addr(test_n_addr + 21, 91);
+    write_byte_addr(test_n_addr + 22, 175);
+    write_byte_addr(test_n_addr + 23, 62);
+    write_byte_addr(test_n_addr + 24, 106);
+    write_byte_addr(test_n_addr + 25, 10);
+    write_byte_addr(test_n_addr + 26, 71);
+    write_byte_addr(test_n_addr + 27, 251);
+    write_byte_addr(test_n_addr + 28, 154);
+    write_byte_addr(test_n_addr + 29, 118);
+    write_byte_addr(test_n_addr + 30, 145);
+    write_byte_addr(test_n_addr + 31, 96);
+    write_byte_addr(test_n_addr + 32, 11);
+    write_byte_addr(test_n_addr + 33, 138);
+    write_byte_addr(test_n_addr + 34, 107);
+    write_byte_addr(test_n_addr + 35, 205);
+    write_byte_addr(test_n_addr + 36, 207);
+    write_byte_addr(test_n_addr + 37, 220);
+    write_byte_addr(test_n_addr + 38, 87);
+    write_byte_addr(test_n_addr + 39, 126);
+    write_byte_addr(test_n_addr + 40, 96);
+    write_byte_addr(test_n_addr + 41, 152);
+    write_byte_addr(test_n_addr + 42, 11);
+    write_byte_addr(test_n_addr + 43, 228);
+    write_byte_addr(test_n_addr + 44, 84);
+    write_byte_addr(test_n_addr + 45, 217);
+    write_byte_addr(test_n_addr + 46, 86);
+    write_byte_addr(test_n_addr + 47, 237);
+    write_byte_addr(test_n_addr + 48, 33);
+    write_byte_addr(test_n_addr + 49, 204);
+    write_byte_addr(test_n_addr + 50, 2);
+    write_byte_addr(test_n_addr + 51, 182);
+    write_byte_addr(test_n_addr + 52, 90);
+    write_byte_addr(test_n_addr + 53, 129);
+    write_byte_addr(test_n_addr + 54, 95);
+    write_byte_addr(test_n_addr + 55, 151);
+    write_byte_addr(test_n_addr + 56, 106);
+    write_byte_addr(test_n_addr + 57, 238);
+    write_byte_addr(test_n_addr + 58, 2);
+    write_byte_addr(test_n_addr + 59, 47);
+    write_byte_addr(test_n_addr + 60, 35);
+    write_byte_addr(test_n_addr + 61, 39);
+    write_byte_addr(test_n_addr + 62, 184);
+    write_byte_addr(test_n_addr + 63, 109);
+    write_byte_addr(test_n_addr + 64, 212);
+    write_byte_addr(test_n_addr + 65, 176);
+    write_byte_addr(test_n_addr + 66, 231);
+    write_byte_addr(test_n_addr + 67, 6);
+    write_byte_addr(test_n_addr + 68, 2);
+    write_byte_addr(test_n_addr + 69, 120);
+    write_byte_addr(test_n_addr + 70, 11);
+    write_byte_addr(test_n_addr + 71, 31);
+    write_byte_addr(test_n_addr + 72, 92);
+    write_byte_addr(test_n_addr + 73, 169);
+    write_byte_addr(test_n_addr + 74, 153);
+    write_byte_addr(test_n_addr + 75, 54);
+    write_byte_addr(test_n_addr + 76, 254);
+    write_byte_addr(test_n_addr + 77, 187);
+    write_byte_addr(test_n_addr + 78, 172);
+    write_byte_addr(test_n_addr + 79, 27);
+    write_byte_addr(test_n_addr + 80, 5);
+    write_byte_addr(test_n_addr + 81, 250);
+    write_byte_addr(test_n_addr + 82, 87);
+    write_byte_addr(test_n_addr + 83, 205);
+    write_byte_addr(test_n_addr + 84, 129);
+    write_byte_addr(test_n_addr + 85, 16);
+    write_byte_addr(test_n_addr + 86, 64);
+    write_byte_addr(test_n_addr + 87, 103);
+    write_byte_addr(test_n_addr + 88, 214);
+    write_byte_addr(test_n_addr + 89, 48);
+    write_byte_addr(test_n_addr + 90, 139);
+    write_byte_addr(test_n_addr + 91, 88);
+    write_byte_addr(test_n_addr + 92, 53);
+    write_byte_addr(test_n_addr + 93, 212);
+    write_byte_addr(test_n_addr + 94, 150);
+    write_byte_addr(test_n_addr + 95, 97);
+    write_byte_addr(test_n_addr + 96, 190);
+    write_byte_addr(test_n_addr + 97, 208);
+    write_byte_addr(test_n_addr + 98, 140);
+    write_byte_addr(test_n_addr + 99, 122);
+    write_byte_addr(test_n_addr + 100, 151);
+    write_byte_addr(test_n_addr + 101, 159);
+    write_byte_addr(test_n_addr + 102, 26);
+    write_byte_addr(test_n_addr + 103, 249);
+    write_byte_addr(test_n_addr + 104, 34);
+    write_byte_addr(test_n_addr + 105, 230);
+    write_byte_addr(test_n_addr + 106, 20);
+    write_byte_addr(test_n_addr + 107, 47);
+    write_byte_addr(test_n_addr + 108, 169);
+    write_byte_addr(test_n_addr + 109, 198);
+    write_byte_addr(test_n_addr + 110, 232);
+    write_byte_addr(test_n_addr + 111, 1);
+    write_byte_addr(test_n_addr + 112, 31);
+    write_byte_addr(test_n_addr + 113, 171);
+    write_byte_addr(test_n_addr + 114, 248);
+    write_byte_addr(test_n_addr + 115, 38);
+    write_byte_addr(test_n_addr + 116, 15);
+    write_byte_addr(test_n_addr + 117, 172);
+    write_byte_addr(test_n_addr + 118, 142);
+    write_byte_addr(test_n_addr + 119, 77);
+    write_byte_addr(test_n_addr + 120, 44);
+    write_byte_addr(test_n_addr + 121, 50);
+    write_byte_addr(test_n_addr + 122, 57);
+    write_byte_addr(test_n_addr + 123, 29);
+    write_byte_addr(test_n_addr + 124, 129);
+    write_byte_addr(test_n_addr + 125, 155);
+    write_byte_addr(test_n_addr + 126, 141);
+    write_byte_addr(test_n_addr + 127, 28);
+    write_byte_addr(test_n_addr + 128, 101);
+    write_byte_addr(test_n_addr + 129, 178);
+    write_byte_addr(test_n_addr + 130, 28);
+    write_byte_addr(test_n_addr + 131, 219);
+    write_byte_addr(test_n_addr + 132, 97);
+    write_byte_addr(test_n_addr + 133, 168);
+    write_byte_addr(test_n_addr + 134, 137);
+    write_byte_addr(test_n_addr + 135, 47);
+    write_byte_addr(test_n_addr + 136, 96);
+    write_byte_addr(test_n_addr + 137, 231);
+    write_byte_addr(test_n_addr + 138, 235);
+    write_byte_addr(test_n_addr + 139, 194);
+    write_byte_addr(test_n_addr + 140, 74);
+    write_byte_addr(test_n_addr + 141, 24);
+    write_byte_addr(test_n_addr + 142, 196);
+    write_byte_addr(test_n_addr + 143, 111);
+    write_byte_addr(test_n_addr + 144, 42);
+    write_byte_addr(test_n_addr + 145, 233);
+    write_byte_addr(test_n_addr + 146, 16);
+    write_byte_addr(test_n_addr + 147, 146);
+    write_byte_addr(test_n_addr + 148, 9);
+    write_byte_addr(test_n_addr + 149, 237);
+    write_byte_addr(test_n_addr + 150, 23);
+    write_byte_addr(test_n_addr + 151, 209);
+    write_byte_addr(test_n_addr + 152, 0);
+    write_byte_addr(test_n_addr + 153, 43);
+    write_byte_addr(test_n_addr + 154, 230);
+    write_byte_addr(test_n_addr + 155, 125);
+    write_byte_addr(test_n_addr + 156, 239);
+    write_byte_addr(test_n_addr + 157, 4);
+    write_byte_addr(test_n_addr + 158, 137);
+    write_byte_addr(test_n_addr + 159, 20);
+    write_byte_addr(test_n_addr + 160, 78);
+    write_byte_addr(test_n_addr + 161, 51);
+    write_byte_addr(test_n_addr + 162, 161);
+    write_byte_addr(test_n_addr + 163, 178);
+    write_byte_addr(test_n_addr + 164, 15);
+    write_byte_addr(test_n_addr + 165, 151);
+    write_byte_addr(test_n_addr + 166, 135);
+    write_byte_addr(test_n_addr + 167, 159);
+    write_byte_addr(test_n_addr + 168, 179);
+    write_byte_addr(test_n_addr + 169, 160);
+    write_byte_addr(test_n_addr + 170, 205);
+    write_byte_addr(test_n_addr + 171, 47);
+    write_byte_addr(test_n_addr + 172, 188);
+    write_byte_addr(test_n_addr + 173, 44);
+    write_byte_addr(test_n_addr + 174, 236);
+    write_byte_addr(test_n_addr + 175, 184);
+    write_byte_addr(test_n_addr + 176, 131);
+    write_byte_addr(test_n_addr + 177, 104);
+    write_byte_addr(test_n_addr + 178, 49);
+    write_byte_addr(test_n_addr + 179, 61);
+    write_byte_addr(test_n_addr + 180, 31);
+    write_byte_addr(test_n_addr + 181, 213);
+    write_byte_addr(test_n_addr + 182, 74);
+    write_byte_addr(test_n_addr + 183, 144);
+    write_byte_addr(test_n_addr + 184, 16);
+    write_byte_addr(test_n_addr + 185, 25);
+    write_byte_addr(test_n_addr + 186, 11);
+    write_byte_addr(test_n_addr + 187, 129);
+    write_byte_addr(test_n_addr + 188, 149);
+    write_byte_addr(test_n_addr + 189, 214);
+    write_byte_addr(test_n_addr + 190, 41);
+    write_byte_addr(test_n_addr + 191, 118);
+    write_byte_addr(test_n_addr + 192, 81);
+    write_byte_addr(test_n_addr + 193, 249);
+    write_byte_addr(test_n_addr + 194, 54);
+    write_byte_addr(test_n_addr + 195, 118);
+    write_byte_addr(test_n_addr + 196, 208);
+    write_byte_addr(test_n_addr + 197, 183);
+    write_byte_addr(test_n_addr + 198, 9);
+    write_byte_addr(test_n_addr + 199, 122);
+    write_byte_addr(test_n_addr + 200, 56);
+    write_byte_addr(test_n_addr + 201, 74);
+    write_byte_addr(test_n_addr + 202, 215);
+    write_byte_addr(test_n_addr + 203, 111);
+    write_byte_addr(test_n_addr + 204, 140);
+    write_byte_addr(test_n_addr + 205, 191);
+    write_byte_addr(test_n_addr + 206, 19);
+    write_byte_addr(test_n_addr + 207, 124);
+    write_byte_addr(test_n_addr + 208, 57);
+    write_byte_addr(test_n_addr + 209, 237);
+    write_byte_addr(test_n_addr + 210, 186);
+    write_byte_addr(test_n_addr + 211, 174);
+    write_byte_addr(test_n_addr + 212, 144);
+    write_byte_addr(test_n_addr + 213, 252);
+    write_byte_addr(test_n_addr + 214, 149);
+    write_byte_addr(test_n_addr + 215, 247);
+    write_byte_addr(test_n_addr + 216, 123);
+    write_byte_addr(test_n_addr + 217, 120);
+    write_byte_addr(test_n_addr + 218, 9);
+    write_byte_addr(test_n_addr + 219, 54);
+    write_byte_addr(test_n_addr + 220, 94);
+    write_byte_addr(test_n_addr + 221, 116);
+    write_byte_addr(test_n_addr + 222, 147);
+    write_byte_addr(test_n_addr + 223, 30);
+    write_byte_addr(test_n_addr + 224, 37);
+    write_byte_addr(test_n_addr + 225, 240);
+    write_byte_addr(test_n_addr + 226, 255);
+    write_byte_addr(test_n_addr + 227, 212);
+    write_byte_addr(test_n_addr + 228, 173);
+    write_byte_addr(test_n_addr + 229, 174);
+    write_byte_addr(test_n_addr + 230, 104);
+    write_byte_addr(test_n_addr + 231, 107);
+    write_byte_addr(test_n_addr + 232, 198);
+    write_byte_addr(test_n_addr + 233, 255);
+    write_byte_addr(test_n_addr + 234, 15);
+    write_byte_addr(test_n_addr + 235, 213);
+    write_byte_addr(test_n_addr + 236, 53);
+    write_byte_addr(test_n_addr + 237, 241);
+    write_byte_addr(test_n_addr + 238, 85);
+    write_byte_addr(test_n_addr + 239, 110);
+    write_byte_addr(test_n_addr + 240, 72);
+    write_byte_addr(test_n_addr + 241, 73);
+    write_byte_addr(test_n_addr + 242, 248);
+    write_byte_addr(test_n_addr + 243, 248);
+    write_byte_addr(test_n_addr + 244, 184);
+    write_byte_addr(test_n_addr + 245, 239);
+    write_byte_addr(test_n_addr + 246, 136);
+    write_byte_addr(test_n_addr + 247, 248);
+    write_byte_addr(test_n_addr + 248, 241);
+    write_byte_addr(test_n_addr + 249, 94);
+    write_byte_addr(test_n_addr + 250, 17);
+    write_byte_addr(test_n_addr + 251, 119);
+    write_byte_addr(test_n_addr + 252, 170);
+    write_byte_addr(test_n_addr + 253, 223);
+    write_byte_addr(test_n_addr + 254, 2);
+    write_byte_addr(test_n_addr + 255, 179);
+
+    // Write leaf signature S (256 bytes)
+    write_byte_addr(test_s_addr + 0, 39);
+    write_byte_addr(test_s_addr + 1, 36);
+    write_byte_addr(test_s_addr + 2, 197);
+    write_byte_addr(test_s_addr + 3, 147);
+    write_byte_addr(test_s_addr + 4, 60);
+    write_byte_addr(test_s_addr + 5, 250);
+    write_byte_addr(test_s_addr + 6, 64);
+    write_byte_addr(test_s_addr + 7, 183);
+    write_byte_addr(test_s_addr + 8, 12);
+    write_byte_addr(test_s_addr + 9, 53);
+    write_byte_addr(test_s_addr + 10, 114);
+    write_byte_addr(test_s_addr + 11, 133);
+    write_byte_addr(test_s_addr + 12, 116);
+    write_byte_addr(test_s_addr + 13, 61);
+    write_byte_addr(test_s_addr + 14, 251);
+    write_byte_addr(test_s_addr + 15, 157);
+    write_byte_addr(test_s_addr + 16, 163);
+    write_byte_addr(test_s_addr + 17, 157);
+    write_byte_addr(test_s_addr + 18, 35);
+    write_byte_addr(test_s_addr + 19, 239);
+    write_byte_addr(test_s_addr + 20, 247);
+    write_byte_addr(test_s_addr + 21, 203);
+    write_byte_addr(test_s_addr + 22, 157);
+    write_byte_addr(test_s_addr + 23, 250);
+    write_byte_addr(test_s_addr + 24, 213);
+    write_byte_addr(test_s_addr + 25, 182);
+    write_byte_addr(test_s_addr + 26, 132);
+    write_byte_addr(test_s_addr + 27, 214);
+    write_byte_addr(test_s_addr + 28, 30);
+    write_byte_addr(test_s_addr + 29, 128);
+    write_byte_addr(test_s_addr + 30, 248);
+    write_byte_addr(test_s_addr + 31, 112);
+    write_byte_addr(test_s_addr + 32, 134);
+    write_byte_addr(test_s_addr + 33, 72);
+    write_byte_addr(test_s_addr + 34, 150);
+    write_byte_addr(test_s_addr + 35, 57);
+    write_byte_addr(test_s_addr + 36, 245);
+    write_byte_addr(test_s_addr + 37, 61);
+    write_byte_addr(test_s_addr + 38, 7);
+    write_byte_addr(test_s_addr + 39, 186);
+    write_byte_addr(test_s_addr + 40, 55);
+    write_byte_addr(test_s_addr + 41, 95);
+    write_byte_addr(test_s_addr + 42, 226);
+    write_byte_addr(test_s_addr + 43, 35);
+    write_byte_addr(test_s_addr + 44, 66);
+    write_byte_addr(test_s_addr + 45, 185);
+    write_byte_addr(test_s_addr + 46, 187);
+    write_byte_addr(test_s_addr + 47, 168);
+    write_byte_addr(test_s_addr + 48, 45);
+    write_byte_addr(test_s_addr + 49, 239);
+    write_byte_addr(test_s_addr + 50, 191);
+    write_byte_addr(test_s_addr + 51, 105);
+    write_byte_addr(test_s_addr + 52, 85);
+    write_byte_addr(test_s_addr + 53, 27);
+    write_byte_addr(test_s_addr + 54, 41);
+    write_byte_addr(test_s_addr + 55, 35);
+    write_byte_addr(test_s_addr + 56, 115);
+    write_byte_addr(test_s_addr + 57, 145);
+    write_byte_addr(test_s_addr + 58, 189);
+    write_byte_addr(test_s_addr + 59, 33);
+    write_byte_addr(test_s_addr + 60, 236);
+    write_byte_addr(test_s_addr + 61, 163);
+    write_byte_addr(test_s_addr + 62, 148);
+    write_byte_addr(test_s_addr + 63, 65);
+    write_byte_addr(test_s_addr + 64, 76);
+    write_byte_addr(test_s_addr + 65, 225);
+    write_byte_addr(test_s_addr + 66, 100);
+    write_byte_addr(test_s_addr + 67, 41);
+    write_byte_addr(test_s_addr + 68, 151);
+    write_byte_addr(test_s_addr + 69, 60);
+    write_byte_addr(test_s_addr + 70, 48);
+    write_byte_addr(test_s_addr + 71, 118);
+    write_byte_addr(test_s_addr + 72, 252);
+    write_byte_addr(test_s_addr + 73, 199);
+    write_byte_addr(test_s_addr + 74, 211);
+    write_byte_addr(test_s_addr + 75, 210);
+    write_byte_addr(test_s_addr + 76, 27);
+    write_byte_addr(test_s_addr + 77, 62);
+    write_byte_addr(test_s_addr + 78, 142);
+    write_byte_addr(test_s_addr + 79, 248);
+    write_byte_addr(test_s_addr + 80, 173);
+    write_byte_addr(test_s_addr + 81, 55);
+    write_byte_addr(test_s_addr + 82, 128);
+    write_byte_addr(test_s_addr + 83, 178);
+    write_byte_addr(test_s_addr + 84, 32);
+    write_byte_addr(test_s_addr + 85, 99);
+    write_byte_addr(test_s_addr + 86, 158);
+    write_byte_addr(test_s_addr + 87, 63);
+    write_byte_addr(test_s_addr + 88, 53);
+    write_byte_addr(test_s_addr + 89, 88);
+    write_byte_addr(test_s_addr + 90, 198);
+    write_byte_addr(test_s_addr + 91, 197);
+    write_byte_addr(test_s_addr + 92, 159);
+    write_byte_addr(test_s_addr + 93, 168);
+    write_byte_addr(test_s_addr + 94, 57);
+    write_byte_addr(test_s_addr + 95, 121);
+    write_byte_addr(test_s_addr + 96, 80);
+    write_byte_addr(test_s_addr + 97, 68);
+    write_byte_addr(test_s_addr + 98, 90);
+    write_byte_addr(test_s_addr + 99, 174);
+    write_byte_addr(test_s_addr + 100, 165);
+    write_byte_addr(test_s_addr + 101, 18);
+    write_byte_addr(test_s_addr + 102, 105);
+    write_byte_addr(test_s_addr + 103, 133);
+    write_byte_addr(test_s_addr + 104, 147);
+    write_byte_addr(test_s_addr + 105, 135);
+    write_byte_addr(test_s_addr + 106, 234);
+    write_byte_addr(test_s_addr + 107, 190);
+    write_byte_addr(test_s_addr + 108, 188);
+    write_byte_addr(test_s_addr + 109, 71);
+    write_byte_addr(test_s_addr + 110, 4);
+    write_byte_addr(test_s_addr + 111, 174);
+    write_byte_addr(test_s_addr + 112, 62);
+    write_byte_addr(test_s_addr + 113, 86);
+    write_byte_addr(test_s_addr + 114, 194);
+    write_byte_addr(test_s_addr + 115, 213);
+    write_byte_addr(test_s_addr + 116, 244);
+    write_byte_addr(test_s_addr + 117, 165);
+    write_byte_addr(test_s_addr + 118, 45);
+    write_byte_addr(test_s_addr + 119, 157);
+    write_byte_addr(test_s_addr + 120, 43);
+    write_byte_addr(test_s_addr + 121, 154);
+    write_byte_addr(test_s_addr + 122, 187);
+    write_byte_addr(test_s_addr + 123, 16);
+    write_byte_addr(test_s_addr + 124, 253);
+    write_byte_addr(test_s_addr + 125, 151);
+    write_byte_addr(test_s_addr + 126, 85);
+    write_byte_addr(test_s_addr + 127, 30);
+    write_byte_addr(test_s_addr + 128, 87);
+    write_byte_addr(test_s_addr + 129, 180);
+    write_byte_addr(test_s_addr + 130, 98);
+    write_byte_addr(test_s_addr + 131, 175);
+    write_byte_addr(test_s_addr + 132, 49);
+    write_byte_addr(test_s_addr + 133, 220);
+    write_byte_addr(test_s_addr + 134, 58);
+    write_byte_addr(test_s_addr + 135, 211);
+    write_byte_addr(test_s_addr + 136, 234);
+    write_byte_addr(test_s_addr + 137, 59);
+    write_byte_addr(test_s_addr + 138, 41);
+    write_byte_addr(test_s_addr + 139, 133);
+    write_byte_addr(test_s_addr + 140, 165);
+    write_byte_addr(test_s_addr + 141, 11);
+    write_byte_addr(test_s_addr + 142, 220);
+    write_byte_addr(test_s_addr + 143, 201);
+    write_byte_addr(test_s_addr + 144, 74);
+    write_byte_addr(test_s_addr + 145, 0);
+    write_byte_addr(test_s_addr + 146, 116);
+    write_byte_addr(test_s_addr + 147, 116);
+    write_byte_addr(test_s_addr + 148, 84);
+    write_byte_addr(test_s_addr + 149, 15);
+    write_byte_addr(test_s_addr + 150, 205);
+    write_byte_addr(test_s_addr + 151, 55);
+    write_byte_addr(test_s_addr + 152, 111);
+    write_byte_addr(test_s_addr + 153, 3);
+    write_byte_addr(test_s_addr + 154, 216);
+    write_byte_addr(test_s_addr + 155, 93);
+    write_byte_addr(test_s_addr + 156, 125);
+    write_byte_addr(test_s_addr + 157, 99);
+    write_byte_addr(test_s_addr + 158, 196);
+    write_byte_addr(test_s_addr + 159, 70);
+    write_byte_addr(test_s_addr + 160, 152);
+    write_byte_addr(test_s_addr + 161, 157);
+    write_byte_addr(test_s_addr + 162, 145);
+    write_byte_addr(test_s_addr + 163, 160);
+    write_byte_addr(test_s_addr + 164, 89);
+    write_byte_addr(test_s_addr + 165, 116);
+    write_byte_addr(test_s_addr + 166, 206);
+    write_byte_addr(test_s_addr + 167, 128);
+    write_byte_addr(test_s_addr + 168, 11);
+    write_byte_addr(test_s_addr + 169, 77);
+    write_byte_addr(test_s_addr + 170, 251);
+    write_byte_addr(test_s_addr + 171, 148);
+    write_byte_addr(test_s_addr + 172, 22);
+    write_byte_addr(test_s_addr + 173, 121);
+    write_byte_addr(test_s_addr + 174, 19);
+    write_byte_addr(test_s_addr + 175, 27);
+    write_byte_addr(test_s_addr + 176, 141);
+    write_byte_addr(test_s_addr + 177, 28);
+    write_byte_addr(test_s_addr + 178, 111);
+    write_byte_addr(test_s_addr + 179, 209);
+    write_byte_addr(test_s_addr + 180, 252);
+    write_byte_addr(test_s_addr + 181, 111);
+    write_byte_addr(test_s_addr + 182, 199);
+    write_byte_addr(test_s_addr + 183, 5);
+    write_byte_addr(test_s_addr + 184, 80);
+    write_byte_addr(test_s_addr + 185, 69);
+    write_byte_addr(test_s_addr + 186, 112);
+    write_byte_addr(test_s_addr + 187, 231);
+    write_byte_addr(test_s_addr + 188, 243);
+    write_byte_addr(test_s_addr + 189, 24);
+    write_byte_addr(test_s_addr + 190, 187);
+    write_byte_addr(test_s_addr + 191, 97);
+    write_byte_addr(test_s_addr + 192, 78);
+    write_byte_addr(test_s_addr + 193, 134);
+    write_byte_addr(test_s_addr + 194, 246);
+    write_byte_addr(test_s_addr + 195, 163);
+    write_byte_addr(test_s_addr + 196, 40);
+    write_byte_addr(test_s_addr + 197, 97);
+    write_byte_addr(test_s_addr + 198, 220);
+    write_byte_addr(test_s_addr + 199, 135);
+    write_byte_addr(test_s_addr + 200, 182);
+    write_byte_addr(test_s_addr + 201, 105);
+    write_byte_addr(test_s_addr + 202, 41);
+    write_byte_addr(test_s_addr + 203, 92);
+    write_byte_addr(test_s_addr + 204, 232);
+    write_byte_addr(test_s_addr + 205, 82);
+    write_byte_addr(test_s_addr + 206, 0);
+    write_byte_addr(test_s_addr + 207, 184);
+    write_byte_addr(test_s_addr + 208, 33);
+    write_byte_addr(test_s_addr + 209, 158);
+    write_byte_addr(test_s_addr + 210, 62);
+    write_byte_addr(test_s_addr + 211, 111);
+    write_byte_addr(test_s_addr + 212, 77);
+    write_byte_addr(test_s_addr + 213, 92);
+    write_byte_addr(test_s_addr + 214, 124);
+    write_byte_addr(test_s_addr + 215, 118);
+    write_byte_addr(test_s_addr + 216, 225);
+    write_byte_addr(test_s_addr + 217, 166);
+    write_byte_addr(test_s_addr + 218, 75);
+    write_byte_addr(test_s_addr + 219, 161);
+    write_byte_addr(test_s_addr + 220, 221);
+    write_byte_addr(test_s_addr + 221, 94);
+    write_byte_addr(test_s_addr + 222, 19);
+    write_byte_addr(test_s_addr + 223, 167);
+    write_byte_addr(test_s_addr + 224, 79);
+    write_byte_addr(test_s_addr + 225, 146);
+    write_byte_addr(test_s_addr + 226, 131);
+    write_byte_addr(test_s_addr + 227, 167);
+    write_byte_addr(test_s_addr + 228, 163);
+    write_byte_addr(test_s_addr + 229, 132);
+    write_byte_addr(test_s_addr + 230, 72);
+    write_byte_addr(test_s_addr + 231, 238);
+    write_byte_addr(test_s_addr + 232, 199);
+    write_byte_addr(test_s_addr + 233, 230);
+    write_byte_addr(test_s_addr + 234, 107);
+    write_byte_addr(test_s_addr + 235, 232);
+    write_byte_addr(test_s_addr + 236, 44);
+    write_byte_addr(test_s_addr + 237, 65);
+    write_byte_addr(test_s_addr + 238, 23);
+    write_byte_addr(test_s_addr + 239, 169);
+    write_byte_addr(test_s_addr + 240, 49);
+    write_byte_addr(test_s_addr + 241, 157);
+    write_byte_addr(test_s_addr + 242, 234);
+    write_byte_addr(test_s_addr + 243, 251);
+    write_byte_addr(test_s_addr + 244, 179);
+    write_byte_addr(test_s_addr + 245, 24);
+    write_byte_addr(test_s_addr + 246, 96);
+    write_byte_addr(test_s_addr + 247, 142);
+    write_byte_addr(test_s_addr + 248, 207);
+    write_byte_addr(test_s_addr + 249, 143);
+    write_byte_addr(test_s_addr + 250, 105);
+    write_byte_addr(test_s_addr + 251, 39);
+    write_byte_addr(test_s_addr + 252, 133);
+    write_byte_addr(test_s_addr + 253, 175);
+    write_byte_addr(test_s_addr + 254, 124);
+    write_byte_addr(test_s_addr + 255, 166);
+
+    // Write expected TBS SHA-256 hash (32 bytes)
+    write_byte_addr(test_h_addr + 0, 226);
+    write_byte_addr(test_h_addr + 1, 174);
+    write_byte_addr(test_h_addr + 2, 124);
+    write_byte_addr(test_h_addr + 3, 249);
+    write_byte_addr(test_h_addr + 4, 152);
+    write_byte_addr(test_h_addr + 5, 131);
+    write_byte_addr(test_h_addr + 6, 45);
+    write_byte_addr(test_h_addr + 7, 94);
+    write_byte_addr(test_h_addr + 8, 113);
+    write_byte_addr(test_h_addr + 9, 134);
+    write_byte_addr(test_h_addr + 10, 226);
+    write_byte_addr(test_h_addr + 11, 6);
+    write_byte_addr(test_h_addr + 12, 28);
+    write_byte_addr(test_h_addr + 13, 91);
+    write_byte_addr(test_h_addr + 14, 58);
+    write_byte_addr(test_h_addr + 15, 235);
+    write_byte_addr(test_h_addr + 16, 176);
+    write_byte_addr(test_h_addr + 17, 81);
+    write_byte_addr(test_h_addr + 18, 64);
+    write_byte_addr(test_h_addr + 19, 197);
+    write_byte_addr(test_h_addr + 20, 40);
+    write_byte_addr(test_h_addr + 21, 30);
+    write_byte_addr(test_h_addr + 22, 231);
+    write_byte_addr(test_h_addr + 23, 196);
+    write_byte_addr(test_h_addr + 24, 4);
+    write_byte_addr(test_h_addr + 25, 0);
+    write_byte_addr(test_h_addr + 26, 1);
+    write_byte_addr(test_h_addr + 27, 88);
+    write_byte_addr(test_h_addr + 28, 113);
+    write_byte_addr(test_h_addr + 29, 4);
+    write_byte_addr(test_h_addr + 30, 248);
+    write_byte_addr(test_h_addr + 31, 201);
+
+    // Call rsa_verify_signature with real certificate data
+    // e = 65537 (0x10001)
+    let result = rsa_verify_signature(test_s_addr, 256, test_n_addr, 256, 0x10001, test_h_addr, 32);
+
+    // Print result
+    serial_out(82); serial_out(50); serial_out(75); serial_out(58); // R2K:
+    if result == 0 {
+        serial_out(79); serial_out(75); // OK
+    } else {
+        serial_out(70); serial_out(65); serial_out(73); serial_out(76); // FAIL
+        serial_out(58);
+        serial_print_dec(result);
+    }
     serial_newline();
 }
 
@@ -15052,6 +17108,19 @@ fn test_tls_connection() {
 
     // Configure network
     net::net_tcp_configure_qemu();
+
+    // Wait for QEMU network to stabilize (busy wait ~2 seconds)
+    serial_out(87);  // W - waiting
+    let mut wait_i: i64 = 0;
+    while wait_i < 1000000000 {
+        wait_i = wait_i + 1;
+        // Poll network periodically to process ARP
+        if wait_i % 10000000 == 0 {
+            syscall_net_poll();
+        }
+    }
+    serial_out(82);  // R - ready
+    serial_newline();
 
     // Create socket
     let sock = net::net_socket_create(2, 1, 0);
@@ -15079,10 +17148,11 @@ fn test_tls_connection() {
     let desc_addr = 0xD3A000 + (sock * 32);
     let proto_id = read_u32_at(desc_addr, 4) as i64;
 
-    // Connect to example.com (93.184.216.34) port 443
-    // 93.184.216.34 = (93 << 24) | (184 << 16) | (216 << 8) | 34 = 1572395042
-    let server_ip: i64 = 1572395042;
-    let port: i64 = 443;
+    // Connect to amazon.com via socat proxy on gateway 10.0.2.2:4443
+    // 10.0.2.2 = (10 << 24) | (0 << 16) | (2 << 8) | 2 = 167772674
+    // Chain: *.peg.a2z.com -> DigiCert Global CA G2 -> DigiCert Global Root G2
+    let server_ip: i64 = 167772674;
+    let port: i64 = 4443;
 
     serial_out(67);  // C
     serial_out(79);  // O
@@ -15117,21 +17187,20 @@ fn test_tls_connection() {
     serial_newline();
 
     // Now do TLS handshake
-    // Hostname: "example.com" = 11 bytes
+    // Hostname: "amazon.com" = 10 bytes
     let hostname_addr = RSA_WORK_ADDR + 6000;
-    write_byte_addr(hostname_addr, 101);      // e
-    write_byte_addr(hostname_addr + 1, 120);  // x
+    write_byte_addr(hostname_addr, 97);       // a
+    write_byte_addr(hostname_addr + 1, 109);  // m
     write_byte_addr(hostname_addr + 2, 97);   // a
-    write_byte_addr(hostname_addr + 3, 109);  // m
-    write_byte_addr(hostname_addr + 4, 112);  // p
-    write_byte_addr(hostname_addr + 5, 108);  // l
-    write_byte_addr(hostname_addr + 6, 101);  // e
-    write_byte_addr(hostname_addr + 7, 46);   // .
-    write_byte_addr(hostname_addr + 8, 99);   // c
-    write_byte_addr(hostname_addr + 9, 111);  // o
-    write_byte_addr(hostname_addr + 10, 109); // m
+    write_byte_addr(hostname_addr + 3, 122);  // z
+    write_byte_addr(hostname_addr + 4, 111);  // o
+    write_byte_addr(hostname_addr + 5, 110);  // n
+    write_byte_addr(hostname_addr + 6, 46);   // .
+    write_byte_addr(hostname_addr + 7, 99);   // c
+    write_byte_addr(hostname_addr + 8, 111);  // o
+    write_byte_addr(hostname_addr + 9, 109);  // m
 
-    let tls_result = syscall_tls_connect(sock, hostname_addr, 11);
+    let tls_result = syscall_tls_connect(sock, hostname_addr, 10);
 
     serial_out(84);  // T
     serial_out(76);  // L
@@ -15259,6 +17328,9 @@ fn _start() {
 
     // Test RSA unit operations
     test_rsa_unit();
+
+    // Test RSA-2048 with real certificate data
+    test_rsa_2048_verify();
 
     // Test TLS/HTTPS with RSA
     test_tls_connection();

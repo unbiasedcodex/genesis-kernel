@@ -35,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18 llvm-18-dev libpolly-18-dev clang-18 libzstd-dev zlib1g-dev \
-            nasm grub-pc-bin xorriso mtools qemu-system-x86
+            nasm grub-pc-bin xorriso mtools qemu-system-x86 socat imagemagick
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -59,13 +59,33 @@ jobs:
         run: |
           make -C genesis-kernel iso GLC="$GITHUB_WORKSPACE/genesis-lang/target/release/glc" 2>&1 | tee /tmp/ci-logs/kernel-build.log
 
-      - name: Boot in QEMU (45s, serial capture)
+      - name: Boot in QEMU (serial capture, keystrokes, screenshots)
         run: |
           cd genesis-kernel
-          timeout 45 qemu-system-x86_64 -cdrom genesis.iso -serial stdio -display none -m 128M -no-reboot \
-            > /tmp/ci-logs/serial.log 2>&1 || true
+          qemu-system-x86_64 -cdrom genesis.iso -m 128M -no-reboot \
+            -serial file:/tmp/ci-logs/serial.log \
+            -display none \
+            -monitor unix:/tmp/mon.sock,server,nowait &
+          QEMU_PID=$!
+          mon() { echo "$1" | socat - UNIX-CONNECT:/tmp/mon.sock > /dev/null 2>&1 || true; }
+          # Wait for kernel startup tests and userspace services to settle
+          sleep 55
+          mon "screendump /tmp/ci-logs/screen-boot.ppm"
+          sleep 1
+          # Type "geb" + Enter into the shell (PS/2 keyboard via monitor)
+          for k in g e b ret; do mon "sendkey $k"; sleep 1; done
+          sleep 10
+          mon "screendump /tmp/ci-logs/screen-geb.ppm"
+          sleep 1
+          mon "quit"
+          sleep 2
+          kill $QEMU_PID 2>/dev/null || true
+          for f in /tmp/ci-logs/screen-boot /tmp/ci-logs/screen-geb; do
+            [ -f "$f.ppm" ] && convert "$f.ppm" "$f.png" && rm "$f.ppm"
+          done
           echo "=== serial.log (first 200 lines) ==="
           head -200 /tmp/ci-logs/serial.log
+          ls -la /tmp/ci-logs/
 
       - name: Check boot markers
         run: |

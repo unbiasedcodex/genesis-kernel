@@ -61,10 +61,19 @@ jobs:
         run: |
           make -C genesis-kernel iso GLC="$GITHUB_WORKSPACE/genesis-lang/target/release/glc" 2>&1 | tee /tmp/ci-logs/kernel-build.log
 
+      - name: Start TCP/TLS targets for guest
+        run: |
+          # slirp forwards guest TCP to 10.0.2.2:P to the host's 127.0.0.1:P.
+          python3 -m http.server 8080 --bind 127.0.0.1 > /dev/null 2>&1 &
+          # TCP-level proxy so the kernel TLS test reaches a real TLS endpoint.
+          socat TCP-LISTEN:4443,reuseaddr,fork TCP:amazon.com:443 &
+          sleep 1
+
       - name: Boot in QEMU (serial capture, keystrokes, screenshots)
         run: |
           cd genesis-kernel
           qemu-system-x86_64 -cdrom genesis.iso -m 128M -no-reboot \
+            -netdev user,id=net0 -device e1000,netdev=net0 \
             -serial file:/tmp/ci-logs/serial.log \
             -display none \
             -monitor unix:/tmp/mon.sock,server,nowait &

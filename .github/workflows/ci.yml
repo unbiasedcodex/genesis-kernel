@@ -23,12 +23,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: unbiasedcodex/genesis-lang
+          ref: ci
           path: genesis-lang
 
       - name: Checkout genesis-runtime
         uses: actions/checkout@v4
         with:
           repository: unbiasedcodex/genesis-runtime
+          ref: ci
           path: genesis-runtime
 
       - name: Install dependencies

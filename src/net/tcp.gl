@@ -631,11 +631,10 @@ pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i
             tcp_debug_char(46);  // '.'
         }
 
-        // Busy wait loop - longer for real TCP connections
-        let mut wait: i64 = 0;
-        while wait < 1000000 {
-            wait = wait + 1;
-        }
+        // Pace with the TSC (~0.3-1ms per attempt): counted busy-loops are
+        // deleted by glc's IR optimizations, and 10000 near-instant attempts
+        // would expire the connect timeout in well under a second.
+        tcp_spin_cycles(1000000);
 
         // Read ICR to clear any pending interrupts and "wake up" hardware
         let base = tcp_read_u64(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_MMIO_BASE) as i64;
@@ -1935,6 +1934,33 @@ fn tcp_debug_gw() {
     tcp_debug_char(10);  // '\n'
 }
 
+// Read the CPU timestamp counter (rdtsc -> edx:eax). Works pre-IDT:
+// no PIT/IRQ needed, unlike the tick counter at 0x412000.
+fn tcp_rdtsc() -> i64 {
+    let mut lo: i64 = 0;
+    let mut hi: i64 = 0;
+    unsafe {
+        asm!(
+            "rdtsc",
+            lateout("eax") lo,
+            lateout("edx") hi,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    (hi * 4294967296) + lo
+}
+
+// Spin for at least `cycles` TSC cycles. Counted busy-loops are deleted
+// by glc's IR optimizations; the asm-based TSC reads cannot be, so this
+// gives a real-time lower bound (3M cycles ~= 0.6-3ms on 1-5 GHz hosts).
+fn tcp_spin_cycles(cycles: i64) {
+    let start = tcp_rdtsc();
+    let mut now = tcp_rdtsc();
+    while now - start < cycles {
+        now = tcp_rdtsc();
+    }
+}
+
 fn tcp_get_ticks() -> i64 {
     tcp_read_u64(0x412000) as i64
 }
@@ -3185,17 +3211,19 @@ fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i6
         // are host-speed dependent, so the poll window must be large enough
         // to outlast 1s of virtual time on any host.
         while attempts < 3000 {
-            // Resend ARP request periodically to "wake up" QEMU's network stack
-            if attempts % 20 == 0 && attempts > 0 {
+            // Resend ARP sparingly: every 500 attempts (~0.5s), max 6 total.
+            // Resending every 20 attempts flooded the 32-slot RX ring with
+            // ~150 replies once QEMU's flush timer expired (RDH ran to 31,
+            // MPC counted the 119 drops).
+            if attempts % 500 == 0 && attempts > 0 {
                 tcp_debug_char(65);  // 'A' - resend ARP
                 tcp_arp_send_request(next_hop);
             }
 
-            // Wait a bit - longer delay for QEMU network stack
-            let mut wait: i64 = 0;
-            while wait < 2000000 {  // Increased further
-                wait = wait + 1;
-            }
+            // Pace with the TSC (~1ms per attempt). Counted busy-loops are
+            // deleted by glc's IR optimizations, which made all 3000
+            // attempts finish inside QEMU's 1s flush-timer embargo.
+            tcp_spin_cycles(3000000);
 
             // Kick RDT: an RDT write makes QEMU retry delivery of frames it
             // queued while its post-RCTL flush_queue_timer was pending.

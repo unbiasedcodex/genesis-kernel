@@ -1471,6 +1471,18 @@ fn tcp_handle_syn_sent(socket_id: i64, seq: u64, ack: u64, flags: i64) {
 
     let sock = tcp_get_socket_addr(socket_id);
 
+    // RST in SYN_SENT = connection refused (RFC 793).
+    // QEMU slirp sends RST+ACK (flags 0x14) when nothing listens on the
+    // target port; without this check the socket stays in SYN_SENT and
+    // connect() burns the full 10000-attempt timeout instead of failing fast.
+    if (flags % 8) / 4 == 1 {  // RST set
+        tcp_debug_char(82);  // 'R' - refused
+        tcp_debug_char(70);  // 'F'
+        tcp_debug_char(10);
+        tcp_write_byte(sock + TCP_SOCK_STATE, TCP_STATE_CLOSED);
+        return;
+    }
+
     // Expect SYN+ACK
     if (flags % 4) / 2 != 1 {  // SYN not set
         tcp_debug_char(78);  // 'N' - no SYN

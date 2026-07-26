@@ -5436,8 +5436,8 @@ fn syscall_sleep(ticks: i64) -> i64 {
 // Returns: 0 on success, -1 on error
 fn syscall_vga_putchar(x: i64, y: i64, ch: i64, frame_ptr: i64) -> i64 {
     // Read arg4 (color) from r10 saved on stack
-    // r10 is at offset 80 in our interrupt frame
-    let color = read_u64_addr(frame_ptr + 80) as i64;
+    // r10 is at offset 48 in our interrupt frame (offset 80 is RDI)
+    let color = read_u64_addr(frame_ptr + 48) as i64;
 
     if x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT {
         return -1;

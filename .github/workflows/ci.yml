@@ -13,6 +13,9 @@ env:
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout genesis-kernel
         uses: actions/checkout@v4
@@ -92,7 +95,7 @@ jobs:
           sleep 2
           kill $QEMU_PID 2>/dev/null || true
           for f in /tmp/ci-logs/screen-boot /tmp/ci-logs/screen-geb; do
-            [ -f "$f.ppm" ] && convert "$f.ppm" "$f.png" && rm "$f.ppm"
+            if [ -f "$f.ppm" ]; then convert "$f.ppm" "$f.png" && rm "$f.ppm"; fi
           done
           echo "=== serial.log (first 200 lines) ==="
           head -200 /tmp/ci-logs/serial.log

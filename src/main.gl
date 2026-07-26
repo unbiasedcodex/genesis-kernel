@@ -16215,10 +16215,12 @@ fn test_tcp_connection() {
         let desc_addr = 0xD3A000 + (sock * 32);
         let proto_id = read_u32_at(desc_addr, 4) as i64;
 
-        // Connect to gateway 10.0.2.2:80 (QEMU user mode gateway)
+        // Connect to gateway 10.0.2.2:8080 (QEMU user mode gateway).
+        // In slirp, TCP to 10.0.2.2:P is forwarded to the host's 127.0.0.1:P,
+        // so CI runs an unprivileged listener on port 8080 (no root needed).
         // 10.0.2.2 = (10 * 16777216) + (0 * 65536) + (2 * 256) + 2 = 167772674
         let gateway_ip: i64 = 167772674;
-        let port: i64 = 80;
+        let port: i64 = 8080;
 
         serial_out(67);  // C
         serial_out(79);  // O

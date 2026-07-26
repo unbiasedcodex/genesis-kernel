@@ -3337,13 +3337,13 @@ fn handle_syscall(num: i64, arg1: i64, arg2: i64, arg3: i64, frame_ptr: i64) -> 
         // Graphics syscalls (70-78)
         70 => syscall_fb_info(arg1),                 // SYS_FB_INFO
         71 => syscall_fb_pixel(arg1, arg2, arg3),    // SYS_FB_PIXEL
-        72 => syscall_fb_rect(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_RECT (5 args)
+        72 => syscall_fb_rect(arg1, arg2, arg3, read_stack_u64(frame_ptr, 64) as i64, read_stack_u64(frame_ptr, 56) as i64), // SYS_FB_RECT (5 args: R8=h, R9=color)
         73 => syscall_fb_swap(),                     // SYS_FB_SWAP
         74 => syscall_fb_clear(arg1),                // SYS_FB_CLEAR
-        75 => syscall_fb_blit(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64, read_stack_u64(frame_ptr, 48) as i64), // SYS_FB_BLIT
+        75 => syscall_fb_blit(arg1, arg2, arg3, read_stack_u64(frame_ptr, 64) as i64, read_stack_u64(frame_ptr, 56) as i64), // SYS_FB_BLIT (R8=arg4, R9=arg5)
         76 => syscall_fb_map(),                      // SYS_FB_MAP
-        77 => syscall_fb_char(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64), // SYS_FB_CHAR (x, y, char, color)
-        78 => syscall_fb_text(arg1, arg2, arg3, read_stack_u64(frame_ptr, 40) as i64), // SYS_FB_TEXT (x, y, text_addr, color)
+        77 => syscall_fb_char(arg1, arg2, arg3, read_stack_u64(frame_ptr, 64) as i64), // SYS_FB_CHAR (x, y, char, color in R8)
+        78 => syscall_fb_text(arg1, arg2, arg3, read_stack_u64(frame_ptr, 64) as i64), // SYS_FB_TEXT (x, y, text_addr, color in R8)
         // TLS syscalls (80-83)
         80 => syscall_tls_connect(arg1, arg2, arg3), // SYS_TLS_CONNECT
         81 => syscall_tls_send(arg1, arg2, arg3),    // SYS_TLS_SEND

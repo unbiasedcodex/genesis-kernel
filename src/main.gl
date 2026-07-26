@@ -156,13 +156,13 @@ const VFS_SERVER_PID: i64 = 2;
 const RAMFS_BASE: i64 = 0x700000;           // RAM disk base address
 const RAMFS_SUPERBLOCK: i64 = 0x700000;     // Superblock (512 bytes)
 const RAMFS_FILE_TABLE: i64 = 0x700200;     // File table (2KB)
-const RAMFS_DATA_BLOCKS: i64 = 0x701000;    // Data blocks start
+const RAMFS_DATA_BLOCKS: i64 = 0x6000000;   // Data blocks start (96MB, identity-mapped)
 
 // RAM Disk limits
 const RAMFS_MAX_FILES: i64 = 32;            // Maximum number of files
 const RAMFS_FILE_ENTRY_SIZE: i64 = 64;      // Size of file table entry
 const RAMFS_BLOCK_SIZE: i64 = 65536;        // Data block size (64KB per file)
-const RAMFS_MAX_BLOCKS: i64 = 8;            // Maximum data blocks (512KB total)
+const RAMFS_MAX_BLOCKS: i64 = 512;          // Maximum data blocks (32MB total)
 const RAMFS_NAME_MAX: i64 = 15;             // Max filename length
 
 // Superblock offsets (512 bytes total)
@@ -2613,8 +2613,9 @@ fn copy_module_to_ramfs(src_addr: i64, size: i64) {
         offset = offset + 1;
     }
 
-    // Set file size
+    // Set file size and reserve blocks it spans
     ramfs_set_file_size(file_idx, size);
+    ramfs_reserve_blocks(file_idx, size);
 
     // Print confirmation
     serial_out(73);  // I
@@ -2654,8 +2655,9 @@ fn copy_vfs_module_to_ramfs(src_addr: i64, size: i64) {
         offset = offset + 1;
     }
 
-    // Set file size
+    // Set file size and reserve blocks it spans
     ramfs_set_file_size(file_idx, size);
+    ramfs_reserve_blocks(file_idx, size);
 
     // Print confirmation
     serial_out(86);  // V
@@ -2694,8 +2696,9 @@ fn copy_console_module_to_ramfs(src_addr: i64, size: i64) {
         offset = offset + 1;
     }
 
-    // Set file size
+    // Set file size and reserve blocks it spans
     ramfs_set_file_size(file_idx, size);
+    ramfs_reserve_blocks(file_idx, size);
 
     // Print confirmation
     serial_out(67);  // C
@@ -2734,8 +2737,9 @@ fn copy_shell_module_to_ramfs(src_addr: i64, size: i64) {
         offset = offset + 1;
     }
 
-    // Set file size
+    // Set file size and reserve blocks it spans
     ramfs_set_file_size(file_idx, size);
+    ramfs_reserve_blocks(file_idx, size);
 
     // Print confirmation
     serial_out(83);  // S
@@ -6112,6 +6116,22 @@ fn ramfs_write_8bytes(file_idx: i64, offset: i64, b0: i64, b1: i64, b2: i64, b3:
 fn ramfs_set_file_size(file_idx: i64, size: i64) {
     let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
     write_u64_addr(entry_addr + FE_SIZE, size as u64);
+}
+
+// Helper: reserve enough data blocks for a file of the given size
+// Files get one block at creation; large files span additional
+// contiguous blocks, so mark them used to keep the block allocator
+// from handing them to the next created file
+fn ramfs_reserve_blocks(file_idx: i64, size: i64) {
+    let blocks_needed = (size + RAMFS_BLOCK_SIZE - 1) / RAMFS_BLOCK_SIZE;
+    if blocks_needed > 1 {
+        let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+        write_u64_addr(entry_addr + FE_BLOCKS, blocks_needed as u64);
+
+        // First block was already taken at creation
+        let free_blocks = read_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS) as i64;
+        write_u64_addr(RAMFS_SUPERBLOCK + SB_FREE_BLOCKS, (free_blocks - (blocks_needed - 1)) as u64);
+    }
 }
 
 // Create test ELF binary (189 bytes)

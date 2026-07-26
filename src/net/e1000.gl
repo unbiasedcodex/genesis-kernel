@@ -911,10 +911,11 @@ fn e1000_recv_advance() {
     // Clear descriptor status
     write_byte_addr(desc_addr + 12, 0);
 
-    // Update tail to make this descriptor available again
-    // CRITICAL: Don't let RDT == RDH (ring empty)
-    // Always keep RDT at max to ensure descriptors are available
-    e1000_write_reg(E1000_RDT, E1000_NUM_RX_DESC - 1);
+    // Return the just-consumed descriptor to the hardware: RDT = rx_cur
+    // (the index we consumed), which trails the new rx_cur by one - the
+    // same scheme as tcp_e1000_rx_advance. A fixed max value makes
+    // RDT == RDH once the ring wraps and wedges RX permanently.
+    e1000_write_reg(E1000_RDT, rx_cur);
 
     // Move to next descriptor
     let next_rx = (rx_cur + 1) % E1000_NUM_RX_DESC;

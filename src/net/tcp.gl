@@ -368,8 +368,10 @@ pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i
     tcp_debug_char(93);  // ']'
     // NOTE: Don't sync rx_cur here - let precheck loop handle pending packets
 
-    // Reset RDT to make all descriptors available
-    tcp_e1000_write_reg(TCP_E1000_RDT, 31);
+    // Re-arm RDT one slot behind rx_cur (trailing tail). A fixed RDT=31
+    // equals RDH once the ring has wrapped (RDH=31) and tells the hardware
+    // it has zero free descriptors, wedging RX permanently.
+    tcp_e1000_write_reg(TCP_E1000_RDT, (drain_rx_cur + 31) % 32);
     // Verify RDT was set
     let rdt_verify = tcp_e1000_read_reg(TCP_E1000_RDT);
     tcp_debug_char(33);  // '!' - RX reset
@@ -507,8 +509,10 @@ pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i
     tcp_debug_hex_byte(existing_status);
     tcp_debug_char(10);  // newline
 
-    // Ensure RDT is at 31 (all descriptors available)
-    tcp_e1000_write_reg(TCP_E1000_RDT, 31);
+    // Re-arm RDT one slot behind rx_cur (old_rx_cur == RDH after the
+    // precheck loop). Never write a fixed 31: it wedges the ring once RDH
+    // itself reaches 31.
+    tcp_e1000_write_reg(TCP_E1000_RDT, (old_rx_cur + 31) % 32);
 
     // NOTE: DO NOT write to RCTL here!
     // RCTL was already configured during e1000_init_rx().
@@ -739,9 +743,12 @@ pub fn tcp_socket_connect(socket_id: i64, remote_ip: i64, remote_port: i64) -> i
             tcp_debug_char(93);  // ']'
         }
 
-        // Keep RDT at 31 using direct ASM (compiler bug workaround)
+        // Keep RDT trailing one slot behind rx_cur using direct ASM
+        // (compiler bug workaround). A fixed 31 becomes RDT == RDH once
+        // the ring wraps, starving the hardware of descriptors.
         let rdt_wr_addr = base + 0x2818;
-        let rdt_val: i64 = 31;
+        let rdt_trail_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+        let rdt_val: i64 = (rdt_trail_cur + 31) % 32;
         unsafe {
             asm!(
                 "mfence
@@ -3225,9 +3232,12 @@ fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i6
             // attempts finish inside QEMU's 1s flush-timer embargo.
             tcp_spin_cycles(3000000);
 
-            // Kick RDT: an RDT write makes QEMU retry delivery of frames it
-            // queued while its post-RCTL flush_queue_timer was pending.
-            tcp_e1000_write_reg(TCP_E1000_RDT, 31);
+            // Kick RDT with a TRAILING value (one slot behind rx_cur): the
+            // write makes QEMU retry delivery of queued frames, but a fixed
+            // 31 becomes RDT == RDH once the ring wraps, telling the
+            // hardware it has zero free descriptors (permanent RX wedge).
+            let kick_cur = tcp_read_u32(TCP_E1000_STATE_ADDR + TCP_E1000_STATE_RX_CUR) as i64;
+            tcp_e1000_write_reg(TCP_E1000_RDT, (kick_cur + 31) % 32);
 
             // Check for received packet and process ARP replies
             tcp_poll_arp_reply();

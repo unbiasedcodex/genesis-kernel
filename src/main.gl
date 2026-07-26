@@ -361,6 +361,7 @@ const PF_R: i64 = 4;                           // Read
 // ELF Loader memory region
 const ELF_LOAD_BASE: i64 = 0x800000;           // Base address for loaded ELF
 const ELF_LOAD_SIZE: i64 = 0x100000;           // 1MB max per ELF
+const ELF_NATIVE_BASE: i64 = 0x5000000;        // ELFs linked at/above this load at their native address
 
 // ELF Loader errors
 const ELF_OK: i64 = 0;
@@ -2583,6 +2584,11 @@ fn load_multiboot_modules(mb_info_addr: i64) {
             copy_shell_module_to_ramfs(mod_start, mod_size);
         }
 
+        // Store fifth module as geb browser
+        if i == 4 {
+            copy_geb_module_to_ramfs(mod_start, mod_size);
+        }
+
         i = i + 1;
     }
 }
@@ -2745,6 +2751,47 @@ fn copy_shell_module_to_ramfs(src_addr: i64, size: i64) {
     serial_out(83);  // S
     serial_out(72);  // H
     serial_out(76);  // L
+    serial_out(58);  // :
+    serial_out(32);  // space
+    serial_print_dec(size);
+    serial_out(66);  // B
+    serial_newline();
+}
+
+// Copy module bytes to RAMFS file named "geb"
+fn copy_geb_module_to_ramfs(src_addr: i64, size: i64) {
+    // Create "geb" file in RAMFS
+    // "geb" = 103, 101, 98
+    let file_idx = ramfs_create_file_internal(103, 101, 98, 0, 0, 0, 0, 0);
+    if file_idx < 0 {
+        serial_out(69);  // E
+        serial_out(82);  // R
+        serial_out(82);  // R
+        serial_newline();
+        return;
+    }
+
+    // Get data block address for this file
+    let entry_addr = RAMFS_FILE_TABLE + (file_idx * RAMFS_FILE_ENTRY_SIZE);
+    let block_idx = read_u64_addr(entry_addr + FE_BLOCK) as i64;
+    let dest_addr = RAMFS_DATA_BLOCKS + (block_idx * RAMFS_BLOCK_SIZE);
+
+    // Copy bytes from module to RAMFS
+    let mut offset: i64 = 0;
+    while offset < size {
+        let byte = read_byte_addr(src_addr + offset);
+        write_byte_addr(dest_addr + offset, byte);
+        offset = offset + 1;
+    }
+
+    // Set file size and reserve blocks it spans
+    ramfs_set_file_size(file_idx, size);
+    ramfs_reserve_blocks(file_idx, size);
+
+    // Print confirmation
+    serial_out(71);  // G
+    serial_out(69);  // E
+    serial_out(66);  // B
     serial_out(58);  // :
     serial_out(32);  // space
     serial_print_dec(size);
@@ -6922,6 +6969,93 @@ fn elf_load_segments_mmap(file_idx: i64, load_base: i64, pid: i64) -> i64 {
     load_base + (entry % ELF_LOAD_SIZE)
 }
 
+// Load a single LOAD segment at its native virtual address (no slot relocation)
+// Used for large ELFs linked at/above ELF_NATIVE_BASE
+// Returns 0 on success, negative error on failure
+fn elf_load_segment_mmap_native(file_idx: i64, ph_offset: i64, pid: i64) -> i64 {
+    // Read segment type
+    let seg_type = elf_read_u32(file_idx, ph_offset + PH_TYPE);
+    if seg_type != PT_LOAD {
+        // Not a LOAD segment, skip
+        return 0;
+    }
+
+    // Read segment info
+    let file_offset = elf_read_u64(file_idx, ph_offset + PH_OFFSET);
+    let vaddr = elf_read_u64(file_idx, ph_offset + PH_VADDR);
+    let filesz = elf_read_u64(file_idx, ph_offset + PH_FILESZ);
+    let memsz = elf_read_u64(file_idx, ph_offset + PH_MEMSZ);
+    let pflags = elf_read_u32(file_idx, ph_offset + PH_FLAGS);
+
+    // Destination is the segment's own virtual address
+    let dest_addr = vaddr;
+
+    // Debug output
+    serial_out(78);  // N
+    serial_out(76);  // L
+    serial_out(79);  // O
+    serial_out(65);  // A
+    serial_out(68);  // D
+    serial_out(58);  // :
+    serial_hex32(dest_addr as u64);
+    serial_out(32);  // space
+    serial_hex32(memsz as u64);
+    serial_newline();
+
+    // Convert ELF flags to mmap flags
+    let mut mmap_flags: i64 = MMAP_FLAG_READ;  // Always readable
+    if ((pflags / 2) % 2) != 0 {  // PF_W (bit 1)
+        mmap_flags = mmap_flags + MMAP_FLAG_WRITE;
+    }
+    if (pflags % 2) != 0 {  // PF_X (bit 0)
+        mmap_flags = mmap_flags + MMAP_FLAG_EXEC;
+    }
+
+    // Create memory mapping for this segment
+    // The actual data will be loaded on page fault
+    let result = mmap_create(dest_addr, memsz, file_idx, file_offset, mmap_flags, pid);
+    if result < 0 {
+        serial_out(77);  // M
+        serial_out(69);  // E (Mmap Error)
+        serial_newline();
+        return -1;
+    }
+
+    // For BSS section (memsz > filesz), we need to handle zero-fill
+    // This is handled in mmap_handle_fault when reading past file end
+
+    0
+}
+
+// Load all LOAD segments at their native virtual addresses
+// Returns entry point address on success, negative error on failure
+fn elf_load_segments_mmap_native(file_idx: i64, pid: i64) -> i64 {
+    let phoff = elf_get_phoff(file_idx);
+    let phnum = elf_get_phnum(file_idx);
+    let phentsize = elf_get_phentsize(file_idx);
+
+    serial_out(78);  // N
+    serial_out(80);  // P
+    serial_out(72);  // H
+    serial_out(58);  // :
+    serial_out(48 + phnum);
+    serial_newline();
+
+    // Create mappings for each program header
+    let mut i: i64 = 0;
+    while i < phnum {
+        let ph_offset = phoff + (i * phentsize);
+        let result = elf_load_segment_mmap_native(file_idx, ph_offset, pid);
+        if result < 0 {
+            return ELF_ERR_LOAD_FAIL;
+        }
+        i = i + 1;
+    }
+
+    // Return entry point (native address, no adjustment)
+    elf_get_entry(file_idx)
+}
+
 // Execute an ELF file using memory-mapped loading (demand paging)
 // Creates a new user process with lazy loading of ELF segments
 // Returns new PID on success, negative error on failure
@@ -6965,6 +7099,36 @@ fn elf_exec_mmap(name_lo: u64) -> i64 {
     // We need to create the process FIRST so we have a PID for the mappings
     // Get entry point from ELF header
     let entry_raw = elf_get_entry(file_idx);
+
+    // Native-base ELFs (linked at/above ELF_NATIVE_BASE) load at their
+    // own virtual addresses instead of a relocated per-process slot
+    if entry_raw >= ELF_NATIVE_BASE {
+        // Create user process with the native entry point
+        let native_pid = elf_create_process(entry_raw);
+        if native_pid < 0 {
+            return native_pid;
+        }
+
+        // Create memory mappings at the segments' native addresses
+        let native_entry = elf_load_segments_mmap_native(file_idx, native_pid);
+        if native_entry < 0 {
+            // Failed to create mappings - clean up process
+            // Note: ideally we'd have a proc_destroy here, but for now just mark unused
+            mmap_remove_process(native_pid);
+            return native_entry;
+        }
+
+        serial_out(78);  // N
+        serial_out(69);  // E
+        serial_out(78);  // N
+        serial_out(84);  // T (NENT = Native ENTry)
+        serial_out(58);  // :
+        serial_hex32(entry_raw as u64);
+        serial_newline();
+
+        return native_pid;
+    }
+
     let entry = load_base + (entry_raw % ELF_LOAD_SIZE);
 
     // Create user process with entry point

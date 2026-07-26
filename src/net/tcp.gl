@@ -3179,7 +3179,12 @@ fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i6
         tcp_debug_char(10);
 
         let mut attempts: i64 = 0;
-        while attempts < 100 {  // Increased from 20 - QEMU SLIRP has latency
+        // QEMU e1000 arms a 1-second flush_queue_timer on every RCTL write
+        // (the last one happens in e1000 init). While pending, the device
+        // queues incoming frames and GPRC stays 0. Iteration-counted delays
+        // are host-speed dependent, so the poll window must be large enough
+        // to outlast 1s of virtual time on any host.
+        while attempts < 3000 {
             // Resend ARP request periodically to "wake up" QEMU's network stack
             if attempts % 20 == 0 && attempts > 0 {
                 tcp_debug_char(65);  // 'A' - resend ARP
@@ -3191,6 +3196,10 @@ fn tcp_ip_send(dst_ip: i64, protocol: i64, payload: i64, payload_len: i64) -> i6
             while wait < 2000000 {  // Increased further
                 wait = wait + 1;
             }
+
+            // Kick RDT: an RDT write makes QEMU retry delivery of frames it
+            // queued while its post-RCTL flush_queue_timer was pending.
+            tcp_e1000_write_reg(TCP_E1000_RDT, 31);
 
             // Check for received packet and process ARP replies
             tcp_poll_arp_reply();

@@ -1944,17 +1944,21 @@ fn tcp_debug_gw() {
 // Read the CPU timestamp counter (rdtsc -> edx:eax). Works pre-IDT:
 // no PIT/IRQ needed, unlike the tick counter at 0x412000.
 fn tcp_rdtsc() -> i64 {
-    let mut lo: i64 = 0;
-    let mut hi: i64 = 0;
+    // Single-output form: glc's LLVM lowering panics on asm! with two
+    // outputs, so combine edx:eax in asm and preserve rdx manually.
+    let mut result: i64 = 0;
     unsafe {
         asm!(
-            "rdtsc",
-            lateout("eax") lo,
-            lateout("edx") hi,
-            options(nomem, nostack, att_syntax)
+            "pushq %rdx
+             rdtsc
+             shlq $$32, %rdx
+             orq %rdx, %rax
+             popq %rdx",
+            lateout("rax") result,
+            options(nomem, att_syntax)
         );
     }
-    (hi * 4294967296) + lo
+    result
 }
 
 // Spin for at least `cycles` TSC cycles. Counted busy-loops are deleted

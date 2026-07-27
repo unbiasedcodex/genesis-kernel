@@ -1,0 +1,381 @@
+make: Entering directory '/home/runner/work/genesis-kernel/genesis-kernel/genesis-runtime'
+mkdir -p build
+cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release -- build src/init/main.gl --freestanding --emit-obj -o build/init.o
+warning: value assigned to `nested_base_path` is never read
+    --> src/parser.rs:4454:44
+     |
+4454 |                 let mut nested_base_path = base_path.to_path_buf();
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+4463 |                     nested_base_path = base_path.to_path_buf();
+     |                     ---------------- `nested_base_path` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vtypes`
+    --> src/typeck/infer.rs:2222:41
+     |
+2222 | ...                   for (vname, vtypes) in variants {
+     |                                   ^^^^^^ help: if this is intentional, prefix it with an underscore: `_vtypes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expect_value`
+    --> src/typeck/infer.rs:3114:60
+     |
+3114 |     fn infer_block_with_expected(&mut self, block: &Block, expect_value: bool) -> TypeResult<Ty> {
+     |                                                            ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expect_value`
+
+warning: unreachable pattern
+    --> src/typeck/infer.rs:3396:13
+     |
+3396 |             _ => Ok(()),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src/typeck/infer.rs:3396:13
+     |
+3225 |             PatternKind::Wildcard => Ok(()),
+     |             --------------------- matches some of the same values
+3226 |             PatternKind::Ident { name, mutable } => {
+     |             ------------------------------------ matches some of the same values
+...
+3230 |             PatternKind::Tuple(patterns) => {
+     |             ---------------------------- matches some of the same values
+...
+3250 |             PatternKind::Enum { path, fields } => {
+     |             ---------------------------------- matches some of the same values
+...
+3396 |             _ => Ok(()),
+     |             ^ ...and 5 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `can_stack_alloc_for` is never used
+   --> src/ir/lower.rs:450:8
+    |
+155 | impl Lowerer {
+    | ------------ method in this implementation
+...
+450 |     fn can_stack_alloc_for(&self, name: &str) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `genesis-lang` (lib) generated 5 warnings (run `cargo fix --lib -p genesis-lang` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running `/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/init/main.gl --freestanding --emit-obj -o build/init.o`
+Compiling src/init/main.gl...
+
+Type checking successful!
+
+Generating object file: build/init.o
+Successfully compiled to: build/init.o
+Compilation successful!
+nasm -f elf64 -o build/init_start.o src/init/start.asm
+ld -T src/init/userspace.ld -m elf_x86_64 --nostdlib -o build/init.elf build/init_start.o build/init.o
+ld: warning: build/init_start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release -- build src/fs/main.gl --freestanding --emit-obj -o build/vfs.o
+warning: value assigned to `nested_base_path` is never read
+    --> src/parser.rs:4454:44
+     |
+4454 |                 let mut nested_base_path = base_path.to_path_buf();
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+4463 |                     nested_base_path = base_path.to_path_buf();
+     |                     ---------------- `nested_base_path` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vtypes`
+    --> src/typeck/infer.rs:2222:41
+     |
+2222 | ...                   for (vname, vtypes) in variants {
+     |                                   ^^^^^^ help: if this is intentional, prefix it with an underscore: `_vtypes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expect_value`
+    --> src/typeck/infer.rs:3114:60
+     |
+3114 |     fn infer_block_with_expected(&mut self, block: &Block, expect_value: bool) -> TypeResult<Ty> {
+     |                                                            ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expect_value`
+
+warning: unreachable pattern
+    --> src/typeck/infer.rs:3396:13
+     |
+3396 |             _ => Ok(()),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src/typeck/infer.rs:3396:13
+     |
+3225 |             PatternKind::Wildcard => Ok(()),
+     |             --------------------- matches some of the same values
+3226 |             PatternKind::Ident { name, mutable } => {
+     |             ------------------------------------ matches some of the same values
+...
+3230 |             PatternKind::Tuple(patterns) => {
+     |             ---------------------------- matches some of the same values
+...
+3250 |             PatternKind::Enum { path, fields } => {
+     |             ---------------------------------- matches some of the same values
+...
+3396 |             _ => Ok(()),
+     |             ^ ...and 5 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `can_stack_alloc_for` is never used
+   --> src/ir/lower.rs:450:8
+    |
+155 | impl Lowerer {
+    | ------------ method in this implementation
+...
+450 |     fn can_stack_alloc_for(&self, name: &str) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `genesis-lang` (lib) generated 5 warnings (run `cargo fix --lib -p genesis-lang` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/fs/main.gl --freestanding --emit-obj -o build/vfs.o`
+Compiling src/fs/main.gl...
+
+Type checking successful!
+
+Generating object file: build/vfs.o
+Successfully compiled to: build/vfs.o
+Compilation successful!
+nasm -f elf64 -o build/vfs_start.o src/fs/start.asm
+ld -T src/fs/userspace.ld -m elf_x86_64 --nostdlib -o build/vfs.elf build/vfs_start.o build/vfs.o
+ld: warning: build/vfs_start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release -- build src/console/main.gl --freestanding --emit-obj -o build/console.o
+warning: value assigned to `nested_base_path` is never read
+    --> src/parser.rs:4454:44
+     |
+4454 |                 let mut nested_base_path = base_path.to_path_buf();
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+4463 |                     nested_base_path = base_path.to_path_buf();
+     |                     ---------------- `nested_base_path` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vtypes`
+    --> src/typeck/infer.rs:2222:41
+     |
+2222 | ...                   for (vname, vtypes) in variants {
+     |                                   ^^^^^^ help: if this is intentional, prefix it with an underscore: `_vtypes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expect_value`
+    --> src/typeck/infer.rs:3114:60
+     |
+3114 |     fn infer_block_with_expected(&mut self, block: &Block, expect_value: bool) -> TypeResult<Ty> {
+     |                                                            ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expect_value`
+
+warning: unreachable pattern
+    --> src/typeck/infer.rs:3396:13
+     |
+3396 |             _ => Ok(()),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src/typeck/infer.rs:3396:13
+     |
+3225 |             PatternKind::Wildcard => Ok(()),
+     |             --------------------- matches some of the same values
+3226 |             PatternKind::Ident { name, mutable } => {
+     |             ------------------------------------ matches some of the same values
+...
+3230 |             PatternKind::Tuple(patterns) => {
+     |             ---------------------------- matches some of the same values
+...
+3250 |             PatternKind::Enum { path, fields } => {
+     |             ---------------------------------- matches some of the same values
+...
+3396 |             _ => Ok(()),
+     |             ^ ...and 5 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `can_stack_alloc_for` is never used
+   --> src/ir/lower.rs:450:8
+    |
+155 | impl Lowerer {
+    | ------------ method in this implementation
+...
+450 |     fn can_stack_alloc_for(&self, name: &str) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `genesis-lang` (lib) generated 5 warnings (run `cargo fix --lib -p genesis-lang` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/console/main.gl --freestanding --emit-obj -o build/console.o`
+Compiling src/console/main.gl...
+
+Type checking successful!
+
+Generating object file: build/console.o
+Successfully compiled to: build/console.o
+Compilation successful!
+nasm -f elf64 -o build/console_start.o src/console/start.asm
+ld -T src/console/userspace.ld -m elf_x86_64 --nostdlib -o build/console.elf build/console_start.o build/console.o
+ld: warning: build/console_start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release -- build src/shell/main.gl --freestanding --emit-obj -o build/shell.o
+warning: value assigned to `nested_base_path` is never read
+    --> src/parser.rs:4454:44
+     |
+4454 |                 let mut nested_base_path = base_path.to_path_buf();
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+4463 |                     nested_base_path = base_path.to_path_buf();
+     |                     ---------------- `nested_base_path` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vtypes`
+    --> src/typeck/infer.rs:2222:41
+     |
+2222 | ...                   for (vname, vtypes) in variants {
+     |                                   ^^^^^^ help: if this is intentional, prefix it with an underscore: `_vtypes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expect_value`
+    --> src/typeck/infer.rs:3114:60
+     |
+3114 |     fn infer_block_with_expected(&mut self, block: &Block, expect_value: bool) -> TypeResult<Ty> {
+     |                                                            ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expect_value`
+
+warning: unreachable pattern
+    --> src/typeck/infer.rs:3396:13
+     |
+3396 |             _ => Ok(()),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src/typeck/infer.rs:3396:13
+     |
+3225 |             PatternKind::Wildcard => Ok(()),
+     |             --------------------- matches some of the same values
+3226 |             PatternKind::Ident { name, mutable } => {
+     |             ------------------------------------ matches some of the same values
+...
+3230 |             PatternKind::Tuple(patterns) => {
+     |             ---------------------------- matches some of the same values
+...
+3250 |             PatternKind::Enum { path, fields } => {
+     |             ---------------------------------- matches some of the same values
+...
+3396 |             _ => Ok(()),
+     |             ^ ...and 5 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `can_stack_alloc_for` is never used
+   --> src/ir/lower.rs:450:8
+    |
+155 | impl Lowerer {
+    | ------------ method in this implementation
+...
+450 |     fn can_stack_alloc_for(&self, name: &str) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `genesis-lang` (lib) generated 5 warnings (run `cargo fix --lib -p genesis-lang` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running `/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/shell/main.gl --freestanding --emit-obj -o build/shell.o`
+Compiling src/shell/main.gl...
+
+Type checking successful!
+
+Generating object file: build/shell.o
+Successfully compiled to: build/shell.o
+Compilation successful!
+nasm -f elf64 -o build/shell_start.o src/shell/start.asm
+ld -T src/shell/userspace.ld -m elf_x86_64 --nostdlib -o build/shell.elf build/shell_start.o build/shell.o
+ld: warning: build/shell_start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release -- build src/geb.gl --freestanding --emit-obj -o build/geb.o
+warning: value assigned to `nested_base_path` is never read
+    --> src/parser.rs:4454:44
+     |
+4454 |                 let mut nested_base_path = base_path.to_path_buf();
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+4463 |                     nested_base_path = base_path.to_path_buf();
+     |                     ---------------- `nested_base_path` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vtypes`
+    --> src/typeck/infer.rs:2222:41
+     |
+2222 | ...                   for (vname, vtypes) in variants {
+     |                                   ^^^^^^ help: if this is intentional, prefix it with an underscore: `_vtypes`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expect_value`
+    --> src/typeck/infer.rs:3114:60
+     |
+3114 |     fn infer_block_with_expected(&mut self, block: &Block, expect_value: bool) -> TypeResult<Ty> {
+     |                                                            ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expect_value`
+
+warning: unreachable pattern
+    --> src/typeck/infer.rs:3396:13
+     |
+3396 |             _ => Ok(()),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src/typeck/infer.rs:3396:13
+     |
+3225 |             PatternKind::Wildcard => Ok(()),
+     |             --------------------- matches some of the same values
+3226 |             PatternKind::Ident { name, mutable } => {
+     |             ------------------------------------ matches some of the same values
+...
+3230 |             PatternKind::Tuple(patterns) => {
+     |             ---------------------------- matches some of the same values
+...
+3250 |             PatternKind::Enum { path, fields } => {
+     |             ---------------------------------- matches some of the same values
+...
+3396 |             _ => Ok(()),
+     |             ^ ...and 5 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `can_stack_alloc_for` is never used
+   --> src/ir/lower.rs:450:8
+    |
+155 | impl Lowerer {
+    | ------------ method in this implementation
+...
+450 |     fn can_stack_alloc_for(&self, name: &str) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `genesis-lang` (lib) generated 5 warnings (run `cargo fix --lib -p genesis-lang` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/geb.gl --freestanding --emit-obj -o build/geb.o`
+Compiling src/geb.gl...
+
+Type checking successful!
+
+Generating object file: build/geb.o
+Successfully compiled to: build/geb.o
+Compilation successful!
+nasm -f elf64 -o build/geb_start.o src/browser/start.asm
+ld -T src/browser/userspace.ld -m elf_x86_64 --nostdlib -o build/geb.elf build/geb_start.o build/geb.o
+cp build/init.elf ../genesis-kernel/iso/boot/
+cp build/vfs.elf ../genesis-kernel/iso/boot/
+cp build/console.elf ../genesis-kernel/iso/boot/
+cp build/shell.elf ../genesis-kernel/iso/boot/
+cp build/geb.elf ../genesis-kernel/iso/boot/
+make: Leaving directory '/home/runner/work/genesis-kernel/genesis-kernel/genesis-runtime'

@@ -1,0 +1,19 @@
+make: Entering directory '/home/runner/work/genesis-kernel/genesis-kernel/genesis-kernel'
+nasm -f elf64 arch/x86_64/boot.asm -o arch/x86_64/boot.o
+nasm -f elf64 arch/x86_64/isr.asm -o arch/x86_64/isr.o
+nasm -f elf64 arch/x86_64/context.asm -o arch/x86_64/context.o
+nasm -f elf64 arch/x86_64/alloc.asm -o arch/x86_64/alloc.o
+/home/runner/work/genesis-kernel/genesis-kernel/genesis-lang/target/release/glc build src/main.gl --freestanding --emit-obj -o kernel.o
+Compiling src/main.gl...
+
+Type checking successful!
+
+Generating object file: kernel.o
+Successfully compiled to: kernel.o
+Compilation successful!
+ld -T linker/kernel.ld -m elf_x86_64 --nostdlib -o kernel64.elf arch/x86_64/boot.o arch/x86_64/isr.o arch/x86_64/context.o arch/x86_64/alloc.o kernel.o
+objcopy -O elf32-i386 kernel64.elf kernel.elf
+cp kernel.elf iso/boot/kernel.elf
+cp iso/boot/grub/grub.cfg iso/boot/grub/grub.cfg 2>/dev/null || true
+grub-mkrescue -o genesis.iso iso 2>/dev/null
+make: Leaving directory '/home/runner/work/genesis-kernel/genesis-kernel/genesis-kernel'
